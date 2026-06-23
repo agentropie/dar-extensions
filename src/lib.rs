@@ -143,7 +143,16 @@ async fn run(
     let mut offset: i64 = 0;
     let mut sessions: HashMap<i64, ChatConn> = HashMap::new();
 
-    tracing::info!("telegram channel started");
+    runner_core::log_ev("-", "telegram", "extension enabled; connecting to Telegram bot API");
+
+    match get_me(&client, &base).await {
+        Ok(username) => runner_core::log_ev(
+            "-",
+            "telegram",
+            &format!("connected as @{username}"),
+        ),
+        Err(err) => tracing::warn!(error = %err, "telegram getMe failed; continuing to poll"),
+    }
 
     loop {
         tokio::select! {
@@ -170,6 +179,15 @@ async fn run(
                         let _ = send_message(&client, &base, chat_id, "Not authorized.").await;
                         continue;
                     }
+                    runner_core::log_ev(
+                        "-",
+                        "telegram",
+                        &format!(
+                            "message from chat {} (user {})",
+                            chat_id,
+                            user_id.map(|u| u.to_string()).unwrap_or_else(|| "?".into()),
+                        ),
+                    );
                     let reply = run_turn(
                         ctx,
                         shutdown,
@@ -347,9 +365,29 @@ struct TgChat {
     id: i64,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct TgUser {
     id: i64,
+    #[serde(default)]
+    username: Option<String>,
+}
+
+/// Confirm the bot token by calling `getMe`; returns the bot's username.
+async fn get_me(client: &reqwest::Client, base: &str) -> Result<String> {
+    let body: TgResponse<TgUser> = client
+        .post(format!("{base}/getMe"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    if !body.ok {
+        bail!("telegram getMe error: {}", body.description.unwrap_or_default());
+    }
+    Ok(body
+        .result
+        .and_then(|u| u.username)
+        .unwrap_or_default())
 }
 
 async fn poll_updates(client: &reqwest::Client, base: &str, offset: i64) -> Result<Vec<Update>> {
