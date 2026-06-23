@@ -89,28 +89,70 @@ pub fn classify(pm: &PrivMsg, bot_nick: &str) -> (Verdict, Conversation) {
     }
 }
 
-/// True if `text` addresses `bot_nick` with a leading `nick:` or `nick,` prefix
-/// (case-insensitive, allowing leading whitespace).
-pub fn is_mention(text: &str, bot_nick: &str) -> bool {
-    let t = text.trim_start();
-    let lower = t.to_ascii_lowercase();
-    let nick = bot_nick.to_ascii_lowercase();
-    if !lower.starts_with(&nick) {
-        return false;
-    }
-    // Next char after the nick must be a `:` or `,` separator.
-    matches!(t[bot_nick.len()..].chars().next(), Some(':') | Some(','))
+/// True if `c` is an ASCII alphanumeric character (used for word-boundary checks).
+fn is_nick_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
 }
 
-/// Strip a leading `nick:`/`nick,` address from a mention so the turn sees just
-/// the user's request.
+/// True if `text` mentions `bot_nick` as a whole word anywhere in the text
+/// (case-insensitive). A "whole word" means the characters immediately before
+/// and after the matched nick are NOT ASCII-alphanumeric (start/end of string
+/// also count as boundaries).
+pub fn is_mention(text: &str, bot_nick: &str) -> bool {
+    if bot_nick.is_empty() {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    let nick = bot_nick.to_ascii_lowercase();
+    let nick_len = nick.len();
+    let bytes = lower.as_bytes();
+
+    let mut start = 0;
+    while start + nick_len <= bytes.len() {
+        if let Some(pos) = lower[start..].find(&nick[..]) {
+            let abs = start + pos;
+            // Check boundary before the match.
+            let before_ok = abs == 0
+                || !is_nick_char(bytes[abs - 1] as char);
+            // Check boundary after the match.
+            let after = abs + nick_len;
+            let after_ok = after >= bytes.len()
+                || !is_nick_char(bytes[after] as char);
+            if before_ok && after_ok {
+                return true;
+            }
+            start = abs + 1;
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+/// Strip a leading address prefix from a mention so the turn sees just the
+/// user's request. Handles:
+///   `nick: text`  →  `text`
+///   `nick, text`  →  `text`
+///   `@nick: text` →  `text`
+///   `@nick text`  →  `text`
+///
+/// If the nick is NOT at the very start (e.g. inline mention), the text is
+/// returned unchanged.
 pub fn strip_mention<'a>(text: &'a str, bot_nick: &str) -> &'a str {
     let t = text.trim_start();
-    if is_mention(t, bot_nick) {
-        t[bot_nick.len() + 1..].trim_start()
-    } else {
-        t
+    // Strip optional leading `@`.
+    let after_at = t.strip_prefix('@').unwrap_or(t);
+    // Check if the nick matches at the start (case-insensitive).
+    if after_at.len() < bot_nick.len() {
+        return t;
     }
+    let (candidate, rest) = after_at.split_at(bot_nick.len());
+    if !candidate.eq_ignore_ascii_case(bot_nick) {
+        return t;
+    }
+    // After the nick: optional `:` or `,`, then trim whitespace.
+    let rest = rest.strip_prefix(':').or_else(|| rest.strip_prefix(',')).unwrap_or(rest);
+    rest.trim_start()
 }
 
 #[cfg(test)]
@@ -177,6 +219,37 @@ mod tests {
         assert_eq!(strip_mention("darbot: do it", "darbot"), "do it");
         assert_eq!(strip_mention("darbot, please", "darbot"), "please");
         assert_eq!(strip_mention("no address here", "darbot"), "no address here");
+    }
+
+    #[test]
+    fn at_nick_leading_is_a_mention() {
+        // `@dale you here?` is a mention of `dale`.
+        assert!(is_mention("@dale you here?", "dale"));
+        // `@darbot` alone is a mention of `darbot`.
+        assert!(is_mention("@darbot", "darbot"));
+    }
+
+    #[test]
+    fn inline_nick_is_a_mention() {
+        // Nick appearing mid-sentence as a whole word.
+        assert!(is_mention("yo dale you here?", "dale"));
+        assert!(is_mention("hey darbot can you help", "darbot"));
+    }
+
+    #[test]
+    fn inline_nick_substring_is_not_a_mention() {
+        // "darbotic" must not count as addressing "darbot".
+        assert!(!is_mention("darbotic things", "darbot"));
+    }
+
+    #[test]
+    fn strip_mention_at_prefix_forms() {
+        // `@dale: do it` → `do it`
+        assert_eq!(strip_mention("@dale: do it", "dale"), "do it");
+        // `@dale do it` → `do it`
+        assert_eq!(strip_mention("@dale do it", "dale"), "do it");
+        // Inline nick: text is unchanged.
+        assert_eq!(strip_mention("yo dale you here?", "dale"), "yo dale you here?");
     }
 
     #[test]
