@@ -128,7 +128,17 @@ async fn run(
         guard: LoopGuard::new(cfg.effective_max_bot_turns()),
     };
 
-    tracing::info!("irc channel started");
+    runner_core::log_ev(
+        "-",
+        "irc",
+        &format!(
+            "extension enabled; connecting to {}:{} (tls={}) as {}",
+            cfg.server.as_deref().unwrap_or(""),
+            cfg.effective_port(),
+            cfg.tls(),
+            cfg.nick.as_deref().unwrap_or(""),
+        ),
+    );
 
     loop {
         if shutdown.is_cancelled() {
@@ -151,6 +161,15 @@ async fn run(
         };
         // Connected: reset backoff and serve until the link drops.
         backoff = BACKOFF_MIN;
+        runner_core::log_ev(
+            "-",
+            "irc",
+            &format!(
+                "connected to {}; joined {}",
+                cfg.server.as_deref().unwrap_or(""),
+                cfg.channels.join(" "),
+            ),
+        );
         match serve(ctx, shutdown, cfg, session_dir, &mut state, conn).await {
             Ok(true) => break, // graceful shutdown
             Ok(false) => {
@@ -234,6 +253,11 @@ async fn serve(
                     continue;
                 }
 
+                runner_core::log_ev(
+                    "-",
+                    "irc",
+                    &format!("message from {} in {}", pm.sender, guard_key),
+                );
                 let prompt = build_prompt(state, &conv, &pm, &bot_nick);
                 let reply =
                     run_turn(ctx, shutdown, state, session_dir, cfg.backend.as_deref(), &conv, prompt)
