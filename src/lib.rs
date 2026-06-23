@@ -8,12 +8,11 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use cap_chat::{
-    ChatBackend, ChatEvent, ChatRole, ChatSession, ChatSessionParams, CHAT_FALLBACK_BACKEND,
-};
+use cap_chat::{ChatBackend, ChatEvent, ChatRole, ChatSession, ChatSessionParams};
 use host_api::{ConfigStore, Extension, RegisterCtx, ShutdownToken, StartCtx};
 use orchestrator_api::{RunSnapshot, RUN_SNAPSHOT_TOPIC};
 use serde::Deserialize;
@@ -21,6 +20,10 @@ use tokio::sync::mpsc;
 
 /// Telegram caps a single message at 4096 characters.
 const TELEGRAM_MAX_CHARS: usize = 4096;
+/// Backend id under which we register our own bundled `pi` chat backend, so the
+/// channel works under the default `foreground: logs` (where the stock `chat-*`
+/// backends are not composed in). Unique id => never conflicts with `chat-pi`.
+const SELF_BACKEND_ID: &str = "telegram-pi";
 /// Long-poll timeout (seconds) the Telegram server holds an empty `getUpdates`.
 const POLL_TIMEOUT_SECS: u64 = 30;
 
@@ -31,7 +34,7 @@ struct TelegramConfig {
     bot_token: Option<String>,
     /// Whitelist of Telegram user ids; empty means allow everyone.
     allowed_users: Vec<i64>,
-    /// Chat backend service id to drive; defaults to `CHAT_FALLBACK_BACKEND`.
+    /// Chat backend service id to drive; defaults to the bundled `telegram-pi`.
     backend: Option<String>,
 }
 
@@ -55,6 +58,8 @@ impl Extension for TelegramExtension {
                      agent.yaml or the TELEGRAM_BOT_TOKEN environment variable"
                 );
             }
+            ctx.services
+                .service::<dyn ChatBackend>(SELF_BACKEND_ID, Arc::new(chat_pi::PiChatBackend))?;
             Ok(())
         })
     }
@@ -255,16 +260,19 @@ async fn run_turn(
     }
 }
 
-/// Pick the chat backend id, mirroring the TUI: explicit config override wins,
-/// else follow the orchestrator's selected runner when it is registered as a
-/// chat backend, else fall back to the default backend.
+/// Pick the chat backend id, mirroring the TUI: an explicit, *registered*
+/// config override wins; else follow the orchestrator's selected runner when it
+/// is registered as a chat backend; else fall back to the bundled backend
+/// (`SELF_BACKEND_ID`), which is always registered. A configured-but-unregistered
+/// id (e.g. `pi` under `foreground: logs`, where stock `chat-*` are not composed
+/// in) falls through to the bundled backend rather than failing every message.
 fn resolve_backend(configured: Option<&str>, ctx: &StartCtx) -> String {
+    let registered = |id: &str| ctx.host.services.get::<dyn ChatBackend>(id).is_ok();
     if let Some(id) = configured {
-        if !id.is_empty() {
+        if !id.is_empty() && registered(id) {
             return id.to_string();
         }
     }
-    let registered = |id: &str| ctx.host.services.get::<dyn ChatBackend>(id).is_ok();
     let runner = ctx
         .host
         .bus
@@ -278,7 +286,7 @@ fn resolve_backend(configured: Option<&str>, ctx: &StartCtx) -> String {
             return runner;
         }
     }
-    CHAT_FALLBACK_BACKEND.to_string()
+    SELF_BACKEND_ID.to_string()
 }
 
 async fn open_session(ctx: &StartCtx, session_dir: &Path, configured: Option<&str>) -> Result<ChatConn> {
@@ -301,7 +309,7 @@ async fn open_session(ctx: &StartCtx, session_dir: &Path, configured: Option<&st
     let params = ChatSessionParams::builder("", ctx.paths.root(), session_dir)
         .model(model)
         .provider(provider)
-        .host_tool_bridge(None)
+        .host_tool_bridge(runner_core::host_tool_bridge(&ctx.host.services, ctx.paths.root()))
         .build();
 
     let (tx, rx) = mpsc::channel(256);
