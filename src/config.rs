@@ -1,6 +1,8 @@
 //! IRC connection configuration, parsed from `extensions.irc` in `agent.yaml`
 //! with per-field fallback to `IRC_*` environment variables.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 
 /// Default secure IRC port (TLS).
@@ -9,6 +11,15 @@ pub const DEFAULT_PORT: u16 = 6697;
 pub const DEFAULT_MAX_BOT_TURNS: u32 = 4;
 /// Default number of ambient (context-only) messages retained per conversation.
 pub const DEFAULT_CONTEXT_WINDOW: usize = 30;
+
+/// A channel entry: the name to JOIN and an optional per-channel mention-gating
+/// override. When `mention_required` is `None` the global default (or `true`)
+/// applies.
+#[derive(Clone, Debug, Default)]
+pub struct ChannelEntry {
+    pub name: String,
+    pub mention_required: Option<bool>,
+}
 
 /// Connection + behaviour settings for the IRC channel extension.
 ///
@@ -39,8 +50,16 @@ pub struct IrcConfig {
     pub server_password: Option<String>,
     /// NickServ password for `IDENTIFY`. Falls back to `IRC_NICKSERV_PASSWORD`.
     pub nickserv_password: Option<String>,
-    /// Channels to join. Falls back to `IRC_CHANNELS` (comma-separated).
-    pub channels: Vec<String>,
+    /// Channels to join, with optional per-channel mention-gating. Accepts a
+    /// list of channel names (every channel inherits the global default) or a
+    /// map of `channel -> { mention_required: bool }` for per-channel overrides.
+    /// Falls back to `IRC_CHANNELS` (comma-separated list form).
+    #[serde(default, deserialize_with = "deserialize_channels")]
+    pub channels: Vec<ChannelEntry>,
+    /// Global default for whether a channel mention is required before the bot
+    /// replies. Per-channel `mention_required` overrides this. Resolved default
+    /// is `true` (fail-safe to quiet). Falls back to `IRC_MENTION_REQUIRED`.
+    pub(crate) mention_required: Option<bool>,
     /// DM nick allowlist (case-insensitive); empty = anyone. Falls back to
     /// `IRC_ALLOWED_USERS` (comma-separated). Strictly a DM authorization gate;
     /// never used to classify channel humans vs. bots (see `humans`).
@@ -79,6 +98,41 @@ fn env_list(key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn deserialize_channels<'de, D>(deserializer: D) -> Result<Vec<ChannelEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize, Default)]
+    struct ChannelSettings {
+        #[serde(default)]
+        mention_required: Option<bool>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum ChannelList {
+        List(Vec<String>),
+        Map(BTreeMap<String, ChannelSettings>),
+    }
+
+    match ChannelList::deserialize(deserializer)? {
+        ChannelList::List(names) => Ok(names
+            .into_iter()
+            .map(|name| ChannelEntry {
+                name,
+                mention_required: None,
+            })
+            .collect()),
+        ChannelList::Map(map) => Ok(map
+            .into_iter()
+            .map(|(name, settings)| ChannelEntry {
+                name,
+                mention_required: settings.mention_required,
+            })
+            .collect()),
+    }
+}
+
 impl IrcConfig {
     /// Apply `IRC_*` env-var fallbacks to any field left unset by `agent.yaml`.
     pub fn with_env_fallbacks(mut self) -> Self {
@@ -107,7 +161,17 @@ impl IrcConfig {
             self.nickserv_password = env_opt("IRC_NICKSERV_PASSWORD");
         }
         if self.channels.is_empty() {
-            self.channels = env_list("IRC_CHANNELS");
+            self.channels = env_list("IRC_CHANNELS")
+                .into_iter()
+                .map(|name| ChannelEntry {
+                    name,
+                    mention_required: None,
+                })
+                .collect();
+        }
+        if self.mention_required.is_none() {
+            self.mention_required =
+                env_opt("IRC_MENTION_REQUIRED").and_then(|v| v.parse().ok());
         }
         if self.allowed_users.is_empty() {
             self.allowed_users = env_list("IRC_ALLOWED_USERS");
@@ -164,6 +228,22 @@ impl IrcConfig {
             .or_else(|| self.nick.clone())
             .unwrap_or_default()
     }
+
+    /// Resolved mention-gating for `channel`: the channel's own setting, else the
+    /// top-level default, else true (fail-safe to quiet).
+    pub fn mention_required_for(&self, channel: &str) -> bool {
+        self.channels
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case(channel))
+            .and_then(|e| e.mention_required)
+            .or(self.mention_required)
+            .unwrap_or(true)
+    }
+
+    /// Channel names to JOIN, in config order.
+    pub fn channel_names(&self) -> impl Iterator<Item = &str> {
+        self.channels.iter().map(|e| e.name.as_str())
+    }
 }
 
 /// True if `nick` may DM the bot given the allowlist (case-insensitive;
@@ -178,6 +258,7 @@ pub fn dm_authorized(nick: &str, allowed: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn empty_allowlist_permits_anyone() {
@@ -257,5 +338,53 @@ mod tests {
         };
         assert_eq!(cfg.effective_username(), "darbot");
         assert_eq!(cfg.effective_realname(), "darbot");
+    }
+
+    #[test]
+    fn channels_list_form_parses() {
+        let cfg: IrcConfig =
+            serde_json::from_value(json!({"channels": ["#a", "#b"]})).unwrap();
+        assert_eq!(cfg.channels.len(), 2);
+        assert_eq!(cfg.channels[0].name, "#a");
+        assert!(cfg.channels[0].mention_required.is_none());
+        assert_eq!(cfg.channels[1].name, "#b");
+        assert!(cfg.channels[1].mention_required.is_none());
+        // unset per-channel => falls back to global default => true
+        assert!(cfg.mention_required_for("#a"));
+    }
+
+    #[test]
+    fn channels_map_form_parses_and_overrides() {
+        let cfg: IrcConfig = serde_json::from_value(json!({
+            "mention_required": true,
+            "channels": {
+                "#team": {},
+                "#public": { "mention_required": false }
+            }
+        }))
+        .unwrap();
+        assert!(cfg.mention_required_for("#team"));
+        assert!(!cfg.mention_required_for("#public"));
+        // case-insensitive lookup
+        assert!(!cfg.mention_required_for("#PUBLIC"));
+    }
+
+    #[test]
+    fn global_default_applies_to_unknown_and_map_channels() {
+        let cfg: IrcConfig = serde_json::from_value(json!({
+            "mention_required": false,
+            "channels": { "#x": {} }
+        }))
+        .unwrap();
+        // channel with no override inherits global false
+        assert!(!cfg.mention_required_for("#x"));
+        // completely unknown channel also gets global false
+        assert!(!cfg.mention_required_for("#nope"));
+    }
+
+    #[test]
+    fn unset_default_resolves_to_true() {
+        let cfg = IrcConfig::default();
+        assert!(cfg.mention_required_for("#any"));
     }
 }

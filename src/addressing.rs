@@ -65,7 +65,11 @@ pub fn is_channel(target: &str) -> bool {
 
 /// Classify a `PRIVMSG` for the bot identified by `bot_nick`. Returns the
 /// verdict plus the conversation it belongs to.
-pub fn classify(pm: &PrivMsg, bot_nick: &str) -> (Verdict, Conversation) {
+///
+/// `mention_required` controls whether a channel message must address the bot
+/// by nick to get a `Reply` verdict. When `false`, every channel message (not
+/// just mentions) returns `Reply`. Self-ignore and DM branches are unaffected.
+pub fn classify(pm: &PrivMsg, bot_nick: &str, mention_required: bool) -> (Verdict, Conversation) {
     if pm.sender.eq_ignore_ascii_case(bot_nick) {
         // Never react to our own messages. Key is best-effort.
         let conv = if is_channel(&pm.target) {
@@ -78,7 +82,7 @@ pub fn classify(pm: &PrivMsg, bot_nick: &str) -> (Verdict, Conversation) {
 
     if is_channel(&pm.target) {
         let conv = Conversation::Channel(pm.target.clone());
-        if is_mention(&pm.text, bot_nick) {
+        if !mention_required || is_mention(&pm.text, bot_nick) {
             (Verdict::Reply, conv)
         } else {
             (Verdict::ContextOnly, conv)
@@ -169,49 +173,62 @@ mod tests {
 
     #[test]
     fn dm_is_reply() {
-        let (v, conv) = classify(&pm("alice", "darbot", "hello"), "darbot");
+        let (v, conv) = classify(&pm("alice", "darbot", "hello"), "darbot", true);
         assert_eq!(v, Verdict::Reply);
         assert_eq!(conv, Conversation::Dm("alice".into()));
     }
 
     #[test]
     fn channel_without_mention_is_context_only() {
-        let (v, conv) = classify(&pm("alice", "#room", "just chatting"), "darbot");
+        let (v, conv) = classify(&pm("alice", "#room", "just chatting"), "darbot", true);
         assert_eq!(v, Verdict::ContextOnly);
         assert_eq!(conv, Conversation::Channel("#room".into()));
     }
 
     #[test]
     fn channel_with_colon_mention_is_reply() {
-        let (v, _) = classify(&pm("alice", "#room", "darbot: do the thing"), "darbot");
+        let (v, _) = classify(&pm("alice", "#room", "darbot: do the thing"), "darbot", true);
         assert_eq!(v, Verdict::Reply);
     }
 
     #[test]
     fn channel_with_comma_mention_is_reply() {
-        let (v, _) = classify(&pm("alice", "#room", "darbot, hi"), "darbot");
+        let (v, _) = classify(&pm("alice", "#room", "darbot, hi"), "darbot", true);
         assert_eq!(v, Verdict::Reply);
     }
 
     #[test]
     fn mention_is_case_insensitive() {
-        let (v, _) = classify(&pm("alice", "#room", "DARBOT: hey"), "darbot");
+        let (v, _) = classify(&pm("alice", "#room", "DARBOT: hey"), "darbot", true);
         assert_eq!(v, Verdict::Reply);
     }
 
     #[test]
     fn substring_nick_is_not_a_mention() {
         // "darbotic" must not count as addressing "darbot".
-        let (v, _) = classify(&pm("alice", "#room", "darbotic things"), "darbot");
+        let (v, _) = classify(&pm("alice", "#room", "darbotic things"), "darbot", true);
         assert_eq!(v, Verdict::ContextOnly);
     }
 
     #[test]
     fn self_authored_is_ignored() {
-        let (v, _) = classify(&pm("darbot", "#room", "darbot: my own message"), "darbot");
+        let (v, _) = classify(&pm("darbot", "#room", "darbot: my own message"), "darbot", true);
         assert_eq!(v, Verdict::Ignore);
-        let (v2, _) = classify(&pm("DarBot", "#room", "hi"), "darbot");
+        let (v2, _) = classify(&pm("DarBot", "#room", "hi"), "darbot", true);
         assert_eq!(v2, Verdict::Ignore);
+    }
+
+    #[test]
+    fn channel_without_mention_and_gate_off_is_reply() {
+        let (v, conv) = classify(&pm("alice", "#room", "just chatting"), "darbot", false);
+        assert_eq!(v, Verdict::Reply);
+        assert_eq!(conv, Conversation::Channel("#room".into()));
+    }
+
+    #[test]
+    fn channel_without_mention_and_gate_on_is_context_only() {
+        let (v, _) = classify(&pm("alice", "#room", "just chatting"), "darbot", true);
+        assert_eq!(v, Verdict::ContextOnly);
     }
 
     #[test]

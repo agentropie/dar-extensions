@@ -5,7 +5,7 @@ A standalone agentropy/dar extension that makes an agent reachable over IRC — 
 ## How it works
 
 - Connects to an IRC server over TCP (TLS by default), registers (`PASS`/`NICK`/`USER`), optionally `IDENTIFY`s to NickServ, retries the nick with a suffix on a `433` collision, and `JOIN`s the configured channels. `PING` is answered transparently; a dropped link auto-reconnects with exponential backoff.
-- **Mention-gating in channels:** in a channel the agent replies only when addressed by nick (`nick: ...` or `nick, ...`, case-insensitive). Unaddressed channel traffic is ingested as bounded ambient context so the reply reflects the real discussion. DMs are always answered.
+- **Mention-gating in channels:** configurable per-channel (default: true). When enabled the agent replies only when addressed by nick (`nick: ...` or `nick, ...`, case-insensitive); when disabled it replies to every channel message. Unaddressed channel traffic is still ingested as bounded ambient context. DMs are always answered.
 - **Bot-to-bot loop guard:** a hard per-channel cap on consecutive bot-authored turns with no intervening human message. Once the cap is hit the agent stays silent in that channel until a human speaks again. Per-channel isolated; DMs are never gated. This is the non-negotiable backstop against runaway token cost in agent-to-agent exchanges. The guard is **fail-closed**: senders not on the `humans` list always count as bots, so with an empty `humans` list (the default) every sender — including real people — counts toward the cap. Operators who want uncapped human-driven exchanges must list their humans explicitly in `humans`.
 - For each addressed message, opens (or reuses) a `ChatBackend` session keyed by conversation (channel name, or sender nick for DMs), sends the turn, accumulates the assistant `Delta` events until `TurnFinished`, then markdown-strips and splits the reply into IRC-safe lines (~450 chars / 400 bytes, on word boundaries, multibyte-safe) and sends them paced to avoid flood kicks.
 - CTCP `ACTION` (`/me`) messages are normalized to plain text context.
@@ -33,7 +33,13 @@ extensions:
     # username/realname optional; default to nick
     # server_password can be omitted here and supplied via IRC_SERVER_PASSWORD
     # nickserv_password supplied via IRC_NICKSERV_PASSWORD keeps it out of yaml
-    channels: ["#team", "#agents"]
+    channels: ["#team", "#agents"]   # list form: each channel inherits mention_required default
+    # or map form for per-channel control:
+    # channels:
+    #   "#team": {}                       # inherits global mention_required
+    #   "#public":
+    #     mention_required: false         # always engage, even without a mention
+    mention_required: true          # optional, default true; per-channel overrides this
     # optional DM nick allowlist (case-insensitive, empty/omitted = anyone)
     allowed_users: ["alice", "bob"]
     # optional channel human nicks for the loop-guard: senders NOT listed count
@@ -72,7 +78,8 @@ IRC_HUMANS=alice,bob
 | `realname` | string | nick | USER realname (or `IRC_REALNAME`) |
 | `server_password` | string | none | server `PASS` (or `IRC_SERVER_PASSWORD`) |
 | `nickserv_password` | string | none | NickServ `IDENTIFY` password (or `IRC_NICKSERV_PASSWORD`) |
-| `channels` | list of string | `[]` | channels to join (or `IRC_CHANNELS`, comma-separated) |
+| `channels` | list of strings **or** map `channel → {mention_required}` | `[]` | channels to join; list form inherits global default, map form allows per-channel `mention_required` (or `IRC_CHANNELS`, comma-separated) |
+| `mention_required` | bool | `true` | global default for mention-gating; per-channel value overrides (or `IRC_MENTION_REQUIRED`) |
 | `allowed_users` | list of string | `[]` (everyone) | DM nick allowlist, case-insensitive (or `IRC_ALLOWED_USERS`) |
 | `humans` | list of string | `[]` (none) | channel human nicks for the loop-guard; unlisted senders count as bots toward the cap (or `IRC_HUMANS`) |
 | `backend` | string | auto-follow runner, else `irc-pi` | cap-chat backend service id; unregistered id falls back to `irc-pi` |

@@ -29,7 +29,7 @@ use host_api::{ConfigStore, Extension, RegisterCtx, ShutdownToken, StartCtx};
 use orchestrator_api::{RunSnapshot, RUN_SNAPSHOT_TOPIC};
 use tokio::sync::mpsc;
 
-use addressing::{classify, strip_mention, Conversation, Verdict};
+use addressing::{classify, is_channel, strip_mention, Conversation, Verdict};
 use config::{dm_authorized, IrcConfig};
 use conn::{connect_and_register, Connection, SEND_PACING};
 use loop_guard::LoopGuard;
@@ -167,7 +167,7 @@ async fn run(
             &format!(
                 "connected to {}; joined {}",
                 cfg.server.as_deref().unwrap_or(""),
-                cfg.channels.join(" "),
+                cfg.channel_names().collect::<Vec<_>>().join(" "),
             ),
         );
         match serve(ctx, shutdown, cfg, session_dir, &mut state, conn).await {
@@ -214,7 +214,12 @@ async fn serve(
         let Some(pm) = PrivMsg::from_message(&msg) else {
             continue;
         };
-        let (verdict, conv) = classify(&pm, &bot_nick);
+        let mention_required = if is_channel(&pm.target) {
+            cfg.mention_required_for(&pm.target)
+        } else {
+            true
+        };
+        let (verdict, conv) = classify(&pm, &bot_nick, mention_required);
 
         match verdict {
             Verdict::Ignore => continue,
@@ -526,7 +531,7 @@ mod tests {
                 target: "#agents".into(),
                 text: format!("{bot_nick}: your turn"),
             };
-            let (verdict, conv) = classify(&pm, bot_nick);
+            let (verdict, conv) = classify(&pm, bot_nick, true);
             assert_eq!(verdict, Verdict::Reply);
             let Conversation::Channel(ch) = &conv else {
                 panic!("expected channel conversation");
@@ -559,7 +564,7 @@ mod tests {
                 target: bot_nick.into(),
                 text: "keep going".into(),
             };
-            let (verdict, conv) = classify(&pm, bot_nick);
+            let (verdict, conv) = classify(&pm, bot_nick, true);
             assert_eq!(verdict, Verdict::Reply);
             let Conversation::Dm(_) = &conv else {
                 panic!("expected DM conversation");

@@ -173,7 +173,7 @@ pub async fn connect_and_register(cfg: &IrcConfig) -> Result<Connection> {
     }
 
     // Join channels.
-    for channel in &cfg.channels {
+    for channel in cfg.channel_names() {
         conn.sender().send_raw(&format!("JOIN {channel}")).await?;
         tracing::info!(channel, "irc joining channel");
     }
