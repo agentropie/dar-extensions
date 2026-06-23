@@ -15,12 +15,12 @@ anyhow = "1"
 # host-api + cap-chat (capability) + chat-pi (bundled stock backend so the channel
 # works under the default `foreground: logs` without a tui) + runner-core (host-tool
 # bridge helper); orchestrator-api is a shared bus-payload crate.
-cap-chat = { git = "https://github.com/tobalsan/dar.git", rev = "33e552f4533e35449d3dc4a8dc75ab78b254eba6" }
-chat-pi = { git = "https://github.com/tobalsan/dar.git", rev = "33e552f4533e35449d3dc4a8dc75ab78b254eba6" }
-host-api = { git = "https://github.com/tobalsan/dar.git", rev = "33e552f4533e35449d3dc4a8dc75ab78b254eba6" }
-orchestrator-api = { git = "https://github.com/tobalsan/dar.git", rev = "33e552f4533e35449d3dc4a8dc75ab78b254eba6" }
+cap-chat = { git = "https://github.com/tobalsan/dar.git", rev = "3d084a12aba033a7631614531c93ff16699cc727" }
+chat-pi = { git = "https://github.com/tobalsan/dar.git", rev = "3d084a12aba033a7631614531c93ff16699cc727" }
+host-api = { git = "https://github.com/tobalsan/dar.git", rev = "3d084a12aba033a7631614531c93ff16699cc727" }
+orchestrator-api = { git = "https://github.com/tobalsan/dar.git", rev = "3d084a12aba033a7631614531c93ff16699cc727" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-runner-core = { git = "https://github.com/tobalsan/dar.git", rev = "33e552f4533e35449d3dc4a8dc75ab78b254eba6" }
+runner-core = { git = "https://github.com/tobalsan/dar.git", rev = "3d084a12aba033a7631614531c93ff16699cc727" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.43", features = ["macros", "rt", "sync", "time"] }

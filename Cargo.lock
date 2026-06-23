@@ -213,7 +213,7 @@ checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
 [[package]]
 name = "cap-chat"
 version = "0.2.0"
-source = "git+https://github.com/tobalsan/dar.git?rev=33e552f4533e35449d3dc4a8dc75ab78b254eba6#33e552f4533e35449d3dc4a8dc75ab78b254eba6"
+source = "git+https://github.com/tobalsan/dar.git?rev=3d084a12aba033a7631614531c93ff16699cc727#3d084a12aba033a7631614531c93ff16699cc727"
 dependencies = [
  "anyhow",
  "cap-runner",
@@ -223,7 +223,7 @@ dependencies = [
 [[package]]
 name = "cap-runner"
 version = "0.2.0"
-source = "git+https://github.com/tobalsan/dar.git?rev=33e552f4533e35449d3dc4a8dc75ab78b254eba6#33e552f4533e35449d3dc4a8dc75ab78b254eba6"
+source = "git+https://github.com/tobalsan/dar.git?rev=3d084a12aba033a7631614531c93ff16699cc727#3d084a12aba033a7631614531c93ff16699cc727"
 dependencies = [
  "anyhow",
  "chrono",
@@ -257,7 +257,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 [[package]]
 name = "chat-pi"
 version = "0.2.0"
-source = "git+https://github.com/tobalsan/dar.git?rev=33e552f4533e35449d3dc4a8dc75ab78b254eba6#33e552f4533e35449d3dc4a8dc75ab78b254eba6"
+source = "git+https://github.com/tobalsan/dar.git?rev=3d084a12aba033a7631614531c93ff16699cc727#3d084a12aba033a7631614531c93ff16699cc727"
 dependencies = [
  "anyhow",
  "cap-chat",
@@ -481,7 +481,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 [[package]]
 name = "host-api"
 version = "0.2.0"
-source = "git+https://github.com/tobalsan/dar.git?rev=33e552f4533e35449d3dc4a8dc75ab78b254eba6#33e552f4533e35449d3dc4a8dc75ab78b254eba6"
+source = "git+https://github.com/tobalsan/dar.git?rev=3d084a12aba033a7631614531c93ff16699cc727#3d084a12aba033a7631614531c93ff16699cc727"
 dependencies = [
  "anyhow",
  "axum",
@@ -978,7 +978,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "orchestrator-api"
 version = "0.2.0"
-source = "git+https://github.com/tobalsan/dar.git?rev=33e552f4533e35449d3dc4a8dc75ab78b254eba6#33e552f4533e35449d3dc4a8dc75ab78b254eba6"
+source = "git+https://github.com/tobalsan/dar.git?rev=3d084a12aba033a7631614531c93ff16699cc727#3d084a12aba033a7631614531c93ff16699cc727"
 dependencies = [
  "chrono",
  "serde",
@@ -1247,7 +1247,7 @@ dependencies = [
 [[package]]
 name = "runner-core"
 version = "0.2.0"
-source = "git+https://github.com/tobalsan/dar.git?rev=33e552f4533e35449d3dc4a8dc75ab78b254eba6#33e552f4533e35449d3dc4a8dc75ab78b254eba6"
+source = "git+https://github.com/tobalsan/dar.git?rev=3d084a12aba033a7631614531c93ff16699cc727#3d084a12aba033a7631614531c93ff16699cc727"
 dependencies = [
  "anyhow",
  "cap-runner",
@@ -1604,7 +1604,7 @@ dependencies = [
 [[package]]
 name = "tool-registry"
 version = "0.1.0"
-source = "git+https://github.com/tobalsan/dar.git?rev=33e552f4533e35449d3dc4a8dc75ab78b254eba6#33e552f4533e35449d3dc4a8dc75ab78b254eba6"
+source = "git+https://github.com/tobalsan/dar.git?rev=3d084a12aba033a7631614531c93ff16699cc727#3d084a12aba033a7631614531c93ff16699cc727"
 dependencies = [
  "anyhow",
  "async-trait",
