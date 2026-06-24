@@ -24,10 +24,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 use cap_chat::{ChatBackend, ChatEvent, ChatRole, ChatSession, ChatSessionParams};
 use host_api::{ConfigStore, Extension, RegisterCtx, ShutdownToken, StartCtx};
 use orchestrator_api::{RunSnapshot, RUN_SNAPSHOT_TOPIC};
+use serde::Deserialize;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use tool_registry::{
+    ToolExecutor, ToolOutcome, ToolRegistryHandle, ToolSpec, TOOL_REGISTRY_SERVICE,
+};
 
 use addressing::{classify, is_channel, strip_mention, Conversation, Verdict};
 use config::{dm_authorized, IrcConfig};
@@ -42,6 +48,9 @@ const SELF_BACKEND_ID: &str = "irc-pi";
 /// Reconnect backoff bounds.
 const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Brief window for a one-shot outbound tool call to observe immediate IRC
+/// rejection numerics after writing PRIVMSG.
+const OUTBOUND_ERROR_WAIT: Duration = Duration::from_millis(750);
 
 pub struct IrcExtension;
 
@@ -71,6 +80,15 @@ impl Extension for IrcExtension {
             }
             ctx.services
                 .service::<dyn ChatBackend>(SELF_BACKEND_ID, Arc::new(chat_pi::PiChatBackend))?;
+            if let Ok(registry) = ctx
+                .services
+                .get_named::<dyn ToolRegistryHandle>(TOOL_REGISTRY_SERVICE)
+            {
+                registry.register_tool(
+                    irc_send_spec(),
+                    Arc::new(IrcSendTool { cfg: cfg.clone() }),
+                )?;
+            }
             Ok(())
         })
     }
@@ -92,6 +110,105 @@ impl Extension for IrcExtension {
             Ok(())
         })
     }
+}
+
+fn irc_send_spec() -> ToolSpec {
+    ToolSpec::new(
+        "irc_send_message",
+        "Send an IRC PRIVMSG to an exact channel or nick through the live IRC connection.",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Exact IRC channel or nick to send to."
+                },
+                "text": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Message text to send."
+                }
+            },
+            "required": ["target", "text"]
+        }),
+    )
+    .writes()
+}
+
+struct IrcSendTool {
+    cfg: IrcConfig,
+}
+
+#[derive(Deserialize)]
+struct IrcSendArgs {
+    target: String,
+    text: String,
+}
+
+#[async_trait]
+impl ToolExecutor for IrcSendTool {
+    async fn execute(&self, args: Value) -> Result<ToolOutcome> {
+        let args: IrcSendArgs = match serde_json::from_value(args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(ToolOutcome::error_code(
+                    "invalid_args",
+                    format!("invalid irc_send_message arguments: {err}"),
+                    None::<String>,
+                ));
+            }
+        };
+        let target = args.target.trim();
+        let text = args.text.trim();
+        if target.is_empty() || text.is_empty() {
+            return Ok(ToolOutcome::error_code(
+                "invalid_args",
+                "irc_send_message requires non-empty 'target' and 'text'",
+                None::<String>,
+            ));
+        }
+        if !valid_irc_target(target) {
+            return Ok(ToolOutcome::error_code(
+                "invalid_args",
+                "irc_send_message target must be a single IRC channel or nick without whitespace or line breaks",
+                None::<String>,
+            ));
+        }
+        let mut conn = match connect_and_register(&self.cfg).await {
+            Ok(conn) => conn,
+            Err(err) => {
+                return Ok(ToolOutcome::error_code(
+                    "connect_failed",
+                    format!("IRC connect/register failed: {err:#}"),
+                    None::<String>,
+                ));
+            }
+        };
+        if let Err(err) = send_reply(&conn.sender(), target, text).await {
+            return Ok(ToolOutcome::error_code(
+                "send_failed",
+                format!("IRC PRIVMSG failed: {err:#}"),
+                None::<String>,
+            ));
+        }
+        if let Err(err) = observe_privmsg_rejection(&mut conn, target).await {
+            return Ok(ToolOutcome::error_code(
+                "send_failed",
+                format!("IRC server rejected PRIVMSG: {err:#}"),
+                None::<String>,
+            ));
+        }
+        Ok(ToolOutcome::ok(format!("sent IRC message to {target}")))
+    }
+}
+
+fn valid_irc_target(target: &str) -> bool {
+    !target.is_empty()
+        && !target
+            .chars()
+            .any(|ch| ch == '\r' || ch == '\n' || ch.is_whitespace())
 }
 
 fn parse_config(config: &ConfigStore, id: &str) -> Result<IrcConfig> {
@@ -231,7 +348,16 @@ async fn serve(
                         state.guard.note_human(ch);
                     }
                 }
-                buffer_ambient(state, &conv, &pm, cfg.effective_context_window(), ctx, session_dir, cfg).await;
+                buffer_ambient(
+                    state,
+                    &conv,
+                    &pm,
+                    cfg.effective_context_window(),
+                    ctx,
+                    session_dir,
+                    cfg,
+                )
+                .await;
             }
             Verdict::Reply => {
                 if let Conversation::Dm(nick) = &conv {
@@ -253,8 +379,16 @@ async fn serve(
                         "irc bot-to-bot cap reached; staying silent"
                     );
                     // Still ingest as context so the bot stays aware.
-                    buffer_ambient(state, &conv, &pm, cfg.effective_context_window(), ctx, session_dir, cfg)
-                        .await;
+                    buffer_ambient(
+                        state,
+                        &conv,
+                        &pm,
+                        cfg.effective_context_window(),
+                        ctx,
+                        session_dir,
+                        cfg,
+                    )
+                    .await;
                     continue;
                 }
 
@@ -264,11 +398,20 @@ async fn serve(
                     &format!("message from {} in {}", pm.sender, guard_key),
                 );
                 let prompt = build_prompt(state, &conv, &pm, &bot_nick);
-                let reply =
-                    run_turn(ctx, shutdown, state, session_dir, cfg.backend.as_deref(), &conv, prompt)
-                        .await;
+                let reply = run_turn(
+                    ctx,
+                    shutdown,
+                    state,
+                    session_dir,
+                    cfg.backend.as_deref(),
+                    &conv,
+                    prompt,
+                )
+                .await;
                 let target = conv.reply_target(&pm.sender);
-                send_reply(&sender, &target, &reply).await;
+                if let Err(err) = send_reply(&sender, &target, &reply).await {
+                    tracing::warn!(error = %err, target, "irc PRIVMSG failed");
+                }
             }
         }
     }
@@ -308,7 +451,8 @@ async fn buffer_ambient(
         return;
     }
     let conn = state.sessions.get_mut(conv).expect("session ensured");
-    conn.ambient.push_back(format!("<{}> {}", pm.sender, pm.text));
+    conn.ambient
+        .push_back(format!("<{}> {}", pm.sender, pm.text));
     while conn.ambient.len() > window {
         conn.ambient.pop_front();
     }
@@ -340,18 +484,56 @@ fn build_prompt(
     }
 }
 
-async fn send_reply(sender: &conn::Sender, target: &str, reply: &str) {
+async fn send_reply(sender: &conn::Sender, target: &str, reply: &str) -> Result<()> {
     let mut first = true;
     for chunk in split::split_message(reply, target) {
         if !first {
             tokio::time::sleep(SEND_PACING).await;
         }
         first = false;
-        if let Err(err) = sender.privmsg(target, &chunk).await {
-            tracing::warn!(error = %err, target, "irc PRIVMSG failed");
-            break;
+        sender.privmsg(target, &chunk).await?;
+    }
+    Ok(())
+}
+
+async fn observe_privmsg_rejection(conn: &mut Connection, target: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + OUTBOUND_ERROR_WAIT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        let next = tokio::time::timeout(remaining, conn.next_message()).await;
+        let msg = match next {
+            Ok(Ok(Some(msg))) => msg,
+            Ok(Ok(None)) | Err(_) => return Ok(()),
+            Ok(Err(err)) => return Err(err),
+        };
+        if is_privmsg_rejection(&msg.command) && message_mentions_target(&msg.params, target) {
+            bail!("{}", msg.params.join(" "));
         }
     }
+}
+
+fn is_privmsg_rejection(command: &str) -> bool {
+    matches!(
+        command,
+        "401" | "403"
+            | "404"
+            | "405"
+            | "407"
+            | "408"
+            | "411"
+            | "412"
+            | "413"
+            | "414"
+            | "442"
+            | "482"
+    )
+}
+
+fn message_mentions_target(params: &[String], target: &str) -> bool {
+    params.iter().any(|param| param.eq_ignore_ascii_case(target))
 }
 
 /// Ensure a session exists for `conv`, creating it (and its on-disk dir) lazily.
@@ -483,7 +665,10 @@ async fn open_session(
     let params = ChatSessionParams::builder("", ctx.paths.root(), session_dir)
         .model(model)
         .provider(provider)
-        .host_tool_bridge(runner_core::host_tool_bridge(&ctx.host.services, ctx.paths.root()))
+        .host_tool_bridge(runner_core::host_tool_bridge(
+            &ctx.host.services,
+            ctx.paths.root(),
+        ))
         .build();
 
     let (tx, rx) = mpsc::channel(256);
@@ -503,6 +688,42 @@ mod tests {
     fn sender_is_bot_with_empty_humans_treats_all_as_bots() {
         // Fail-closed: with no known humans, every sender counts toward the cap.
         assert!(sender_is_bot("anyone", &[]));
+    }
+
+    #[test]
+    fn irc_send_spec_requires_exact_target_and_text() {
+        let spec = irc_send_spec();
+        assert_eq!(spec.name, "irc_send_message");
+        assert_eq!(spec.input_schema["required"], json!(["target", "text"]));
+        assert_eq!(spec.input_schema["properties"]["target"]["type"], "string");
+    }
+
+    #[test]
+    fn irc_send_rejects_line_injection_targets() {
+        assert!(valid_irc_target("#team"));
+        assert!(valid_irc_target("alice"));
+        assert!(!valid_irc_target("#team\r\nJOIN #other"));
+        assert!(!valid_irc_target("#team other"));
+        assert!(!valid_irc_target(""));
+    }
+
+    #[tokio::test]
+    async fn irc_send_reports_connect_failure() {
+        let tool = IrcSendTool {
+            cfg: IrcConfig {
+                server: Some("127.0.0.1".to_string()),
+                port: Some(1),
+                nick: Some("darbot".to_string()),
+                tls: Some(false),
+                ..IrcConfig::default()
+            },
+        };
+        let out = tool
+            .execute(json!({ "target": "#team", "text": "hello" }))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert_eq!(out.error.as_ref().unwrap().code, "connect_failed");
     }
 
     #[test]

@@ -11,6 +11,7 @@ factory = "telegram::extension"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 # Stock dar crates, pinned to a portable git rev (matches `cargo agentropy new`).
 # host-api + cap-chat (capability) + chat-pi (bundled stock backend so the channel
 # works under the default `foreground: logs` without a tui) + runner-core (host-tool
@@ -24,6 +25,7 @@ runner-core = { git = "https://github.com/tobalsan/dar.git", rev = "3d084a12aba0
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.43", features = ["macros", "rt", "sync", "time"] }
+tool-registry = { git = "https://github.com/tobalsan/dar.git", rev = "3d084a12aba033a7631614531c93ff16699cc727" }
 tracing = "0.1"
 
 [workspace]

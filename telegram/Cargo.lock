@@ -1477,6 +1477,7 @@ name = "telegram"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "cap-chat",
  "chat-pi",
  "host-api",
@@ -1486,6 +1487,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tool-registry",
  "tracing",
 ]
 
