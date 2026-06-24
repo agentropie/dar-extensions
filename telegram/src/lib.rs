@@ -12,11 +12,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 use cap_chat::{ChatBackend, ChatEvent, ChatRole, ChatSession, ChatSessionParams};
 use host_api::{ConfigStore, Extension, RegisterCtx, ShutdownToken, StartCtx};
 use orchestrator_api::{RunSnapshot, RUN_SNAPSHOT_TOPIC};
 use serde::Deserialize;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use tool_registry::{
+    ToolExecutor, ToolOutcome, ToolRegistryHandle, ToolSpec, TOOL_REGISTRY_SERVICE,
+};
 
 /// Telegram caps a single message at 4096 characters.
 const TELEGRAM_MAX_CHARS: usize = 4096;
@@ -60,6 +65,16 @@ impl Extension for TelegramExtension {
             }
             ctx.services
                 .service::<dyn ChatBackend>(SELF_BACKEND_ID, Arc::new(chat_pi::PiChatBackend))?;
+            if let Ok(registry) = ctx
+                .services
+                .get_named::<dyn ToolRegistryHandle>(TOOL_REGISTRY_SERVICE)
+            {
+                let token = resolve_token(&cfg).expect("token checked above");
+                registry.register_tool(
+                    telegram_send_spec(),
+                    Arc::new(TelegramSendTool::new(token)?),
+                )?;
+            }
             Ok(())
         })
     }
@@ -75,14 +90,95 @@ impl Extension for TelegramExtension {
 
             let mut shutdown = ctx.shutdown.clone();
             tokio::spawn(async move {
-                if let Err(err) =
-                    run(&ctx, &mut shutdown, &cfg, &token, &session_dir).await
-                {
+                if let Err(err) = run(&ctx, &mut shutdown, &cfg, &token, &session_dir).await {
                     tracing::error!(error = %err, "telegram channel stopped");
                 }
             });
             Ok(())
         })
+    }
+}
+
+fn telegram_send_spec() -> ToolSpec {
+    ToolSpec::new(
+        "telegram_send_message",
+        "Send a Telegram message to an exact chat id through the configured bot.",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Exact Telegram chat id to send to."
+                },
+                "text": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Message text to send."
+                }
+            },
+            "required": ["chat_id", "text"]
+        }),
+    )
+    .writes()
+}
+
+struct TelegramSendTool {
+    client: reqwest::Client,
+    base: String,
+}
+
+impl TelegramSendTool {
+    fn new(token: String) -> Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()?,
+            base: format!("https://api.telegram.org/bot{token}"),
+        })
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for TelegramSendTool {
+    async fn execute(&self, args: Value) -> Result<ToolOutcome> {
+        let chat_id = match args.get("chat_id").and_then(Value::as_i64) {
+            Some(chat_id) => chat_id,
+            None => {
+                return Ok(ToolOutcome::error_code(
+                    "invalid_args",
+                    "telegram_send_message requires integer 'chat_id'",
+                    None::<String>,
+                ))
+            }
+        };
+        let Some(text) = args.get("text").and_then(Value::as_str).map(str::trim) else {
+            return Ok(ToolOutcome::error_code(
+                "invalid_args",
+                "telegram_send_message requires non-empty string 'text'",
+                None::<String>,
+            ));
+        };
+        if text.is_empty() {
+            return Ok(ToolOutcome::error_code(
+                "invalid_args",
+                "telegram_send_message requires non-empty string 'text'",
+                None::<String>,
+            ));
+        }
+
+        for chunk in split_message(text) {
+            if let Err(err) = send_message(&self.client, &self.base, chat_id, &chunk).await {
+                return Ok(ToolOutcome::error_code(
+                    "send_failed",
+                    format!("Telegram sendMessage failed: {err:#}"),
+                    None::<String>,
+                ));
+            }
+        }
+        Ok(ToolOutcome::ok(format!(
+            "sent Telegram message to chat {chat_id}"
+        )))
     }
 }
 
@@ -94,10 +190,11 @@ fn parse_config(config: &ConfigStore, id: &str) -> Result<TelegramConfig> {
 }
 
 fn resolve_token(cfg: &TelegramConfig) -> Option<String> {
-    cfg.bot_token
-        .clone()
-        .filter(|t| !t.is_empty())
-        .or_else(|| std::env::var("TELEGRAM_BOT_TOKEN").ok().filter(|t| !t.is_empty()))
+    cfg.bot_token.clone().filter(|t| !t.is_empty()).or_else(|| {
+        std::env::var("TELEGRAM_BOT_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+    })
 }
 
 fn authorized(user_id: Option<i64>, allowed: &[i64]) -> bool {
@@ -143,14 +240,14 @@ async fn run(
     let mut offset: i64 = 0;
     let mut sessions: HashMap<i64, ChatConn> = HashMap::new();
 
-    runner_core::log_ev("-", "telegram", "extension enabled; connecting to Telegram bot API");
+    runner_core::log_ev(
+        "-",
+        "telegram",
+        "extension enabled; connecting to Telegram bot API",
+    );
 
     match get_me(&client, &base).await {
-        Ok(username) => runner_core::log_ev(
-            "-",
-            "telegram",
-            &format!("connected as @{username}"),
-        ),
+        Ok(username) => runner_core::log_ev("-", "telegram", &format!("connected as @{username}")),
         Err(err) => tracing::warn!(error = %err, "telegram getMe failed; continuing to poll"),
     }
 
@@ -307,7 +404,11 @@ fn resolve_backend(configured: Option<&str>, ctx: &StartCtx) -> String {
     SELF_BACKEND_ID.to_string()
 }
 
-async fn open_session(ctx: &StartCtx, session_dir: &Path, configured: Option<&str>) -> Result<ChatConn> {
+async fn open_session(
+    ctx: &StartCtx,
+    session_dir: &Path,
+    configured: Option<&str>,
+) -> Result<ChatConn> {
     let backend_id = resolve_backend(configured, ctx);
     let backend = ctx
         .host
@@ -327,7 +428,10 @@ async fn open_session(ctx: &StartCtx, session_dir: &Path, configured: Option<&st
     let params = ChatSessionParams::builder("", ctx.paths.root(), session_dir)
         .model(model)
         .provider(provider)
-        .host_tool_bridge(runner_core::host_tool_bridge(&ctx.host.services, ctx.paths.root()))
+        .host_tool_bridge(runner_core::host_tool_bridge(
+            &ctx.host.services,
+            ctx.paths.root(),
+        ))
         .build();
 
     let (tx, rx) = mpsc::channel(256);
@@ -382,12 +486,12 @@ async fn get_me(client: &reqwest::Client, base: &str) -> Result<String> {
         .json()
         .await?;
     if !body.ok {
-        bail!("telegram getMe error: {}", body.description.unwrap_or_default());
+        bail!(
+            "telegram getMe error: {}",
+            body.description.unwrap_or_default()
+        );
     }
-    Ok(body
-        .result
-        .and_then(|u| u.username)
-        .unwrap_or_default())
+    Ok(body.result.and_then(|u| u.username).unwrap_or_default())
 }
 
 async fn poll_updates(client: &reqwest::Client, base: &str, offset: i64) -> Result<Vec<Update>> {
@@ -404,12 +508,20 @@ async fn poll_updates(client: &reqwest::Client, base: &str, offset: i64) -> Resu
         .json()
         .await?;
     if !body.ok {
-        bail!("telegram getUpdates error: {}", body.description.unwrap_or_default());
+        bail!(
+            "telegram getUpdates error: {}",
+            body.description.unwrap_or_default()
+        );
     }
     Ok(body.result.unwrap_or_default())
 }
 
-async fn send_message(client: &reqwest::Client, base: &str, chat_id: i64, text: &str) -> Result<()> {
+async fn send_message(
+    client: &reqwest::Client,
+    base: &str,
+    chat_id: i64,
+    text: &str,
+) -> Result<()> {
     client
         .post(format!("{base}/sendMessage"))
         .json(&serde_json::json!({ "chat_id": chat_id, "text": text }))
@@ -447,5 +559,27 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].chars().count(), TELEGRAM_MAX_CHARS);
         assert_eq!(chunks[1].chars().count(), 10);
+    }
+
+    #[test]
+    fn telegram_send_spec_requires_exact_chat_id_and_text() {
+        let spec = telegram_send_spec();
+        assert_eq!(spec.name, "telegram_send_message");
+        assert_eq!(spec.input_schema["required"], json!(["chat_id", "text"]));
+        assert_eq!(
+            spec.input_schema["properties"]["chat_id"]["type"],
+            "integer"
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_send_rejects_empty_text() {
+        let tool = TelegramSendTool::new("test-token".to_string()).unwrap();
+        let out = tool
+            .execute(json!({ "chat_id": 123_i64, "text": "   " }))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert_eq!(out.error.as_ref().unwrap().code, "invalid_args");
     }
 }
