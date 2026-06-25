@@ -13,22 +13,21 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use cap_chat::{ChatBackend, ChatEvent, ChatRole, ChatSession, ChatSessionParams};
-use host_api::{ConfigStore, Extension, RegisterCtx, ShutdownToken, StartCtx};
-use orchestrator_api::{RunSnapshot, RUN_SNAPSHOT_TOPIC};
+use dar_extension_sdk::chat::{ChatBackend, ChatEvent, ChatRole, ChatSession, ChatSessionParams};
+use dar_extension_sdk::orchestrator::{RunSnapshot, RUN_SNAPSHOT_TOPIC};
+use dar_extension_sdk::tools::{
+    ToolExecutor, ToolOutcome, ToolRegistryHandle, ToolSpec, TOOL_REGISTRY_SERVICE,
+};
+use dar_extension_sdk::{ConfigStore, Extension, RegisterCtx, ShutdownToken, StartCtx};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tool_registry::{
-    ToolExecutor, ToolOutcome, ToolRegistryHandle, ToolSpec, TOOL_REGISTRY_SERVICE,
-};
 
 /// Telegram caps a single message at 4096 characters.
 const TELEGRAM_MAX_CHARS: usize = 4096;
-/// Backend id under which we register our own bundled `pi` chat backend, so the
-/// channel works under the default `foreground: logs` (where the stock `chat-*`
-/// backends are not composed in). Unique id => never conflicts with `chat-pi`.
-const SELF_BACKEND_ID: &str = "telegram-pi";
+/// Backend id used as the default fallback: the stock "pi" backend composed in
+/// via requires_stock = ["chat-pi"] in [package.metadata.dar].
+const DEFAULT_BACKEND_ID: &str = "pi";
 /// Long-poll timeout (seconds) the Telegram server holds an empty `getUpdates`.
 const POLL_TIMEOUT_SECS: u64 = 30;
 
@@ -39,7 +38,7 @@ struct TelegramConfig {
     bot_token: Option<String>,
     /// Whitelist of Telegram user ids; empty means allow everyone.
     allowed_users: Vec<i64>,
-    /// Chat backend service id to drive; defaults to the bundled `telegram-pi`.
+    /// Chat backend service id to drive; defaults to the stock "pi" backend.
     backend: Option<String>,
 }
 
@@ -54,7 +53,7 @@ impl Extension for TelegramExtension {
         "telegram"
     }
 
-    fn register<'a>(&'a self, ctx: &'a mut RegisterCtx) -> host_api::BoxFuture<'a, Result<()>> {
+    fn register<'a>(&'a self, ctx: &'a mut RegisterCtx) -> dar_extension_sdk::BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let cfg = parse_config(&ctx.config, self.id())?;
             if resolve_token(&cfg).is_none() {
@@ -63,8 +62,6 @@ impl Extension for TelegramExtension {
                      agent.yaml or the TELEGRAM_BOT_TOKEN environment variable"
                 );
             }
-            ctx.services
-                .service::<dyn ChatBackend>(SELF_BACKEND_ID, Arc::new(chat_pi::PiChatBackend))?;
             if let Ok(registry) = ctx
                 .services
                 .get_named::<dyn ToolRegistryHandle>(TOOL_REGISTRY_SERVICE)
@@ -79,7 +76,7 @@ impl Extension for TelegramExtension {
         })
     }
 
-    fn start<'a>(&'a self, ctx: StartCtx) -> host_api::BoxFuture<'a, Result<()>> {
+    fn start<'a>(&'a self, ctx: StartCtx) -> dar_extension_sdk::BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let cfg = parse_config(&ctx.config, self.id())?;
             let token = resolve_token(&cfg).context("telegram bot token missing at start")?;
@@ -240,14 +237,14 @@ async fn run(
     let mut offset: i64 = 0;
     let mut sessions: HashMap<i64, ChatConn> = HashMap::new();
 
-    runner_core::log_ev(
+    dar_extension_sdk::log::event(
         "-",
         "telegram",
         "extension enabled; connecting to Telegram bot API",
     );
 
     match get_me(&client, &base).await {
-        Ok(username) => runner_core::log_ev("-", "telegram", &format!("connected as @{username}")),
+        Ok(username) => dar_extension_sdk::log::event("-", "telegram", &format!("connected as @{username}")),
         Err(err) => tracing::warn!(error = %err, "telegram getMe failed; continuing to poll"),
     }
 
@@ -276,7 +273,7 @@ async fn run(
                         let _ = send_message(&client, &base, chat_id, "Not authorized.").await;
                         continue;
                     }
-                    runner_core::log_ev(
+                    dar_extension_sdk::log::event(
                         "-",
                         "telegram",
                         &format!(
@@ -377,10 +374,8 @@ async fn run_turn(
 
 /// Pick the chat backend id, mirroring the TUI: an explicit, *registered*
 /// config override wins; else follow the orchestrator's selected runner when it
-/// is registered as a chat backend; else fall back to the bundled backend
-/// (`SELF_BACKEND_ID`), which is always registered. A configured-but-unregistered
-/// id (e.g. `pi` under `foreground: logs`, where stock `chat-*` are not composed
-/// in) falls through to the bundled backend rather than failing every message.
+/// is registered as a chat backend; else fall back to the stock "pi" backend
+/// (`DEFAULT_BACKEND_ID`), which is composed in via requires_stock = ["chat-pi"].
 fn resolve_backend(configured: Option<&str>, ctx: &StartCtx) -> String {
     let registered = |id: &str| ctx.host.services.get::<dyn ChatBackend>(id).is_ok();
     if let Some(id) = configured {
@@ -401,7 +396,7 @@ fn resolve_backend(configured: Option<&str>, ctx: &StartCtx) -> String {
             return runner;
         }
     }
-    SELF_BACKEND_ID.to_string()
+    DEFAULT_BACKEND_ID.to_string()
 }
 
 async fn open_session(
@@ -428,7 +423,7 @@ async fn open_session(
     let params = ChatSessionParams::builder("", ctx.paths.root(), session_dir)
         .model(model)
         .provider(provider)
-        .host_tool_bridge(runner_core::host_tool_bridge(
+        .host_tool_bridge(dar_extension_sdk::tools::host_tool_bridge(
             &ctx.host.services,
             ctx.paths.root(),
         ))

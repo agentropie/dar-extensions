@@ -7,9 +7,10 @@
 //! bounded ambient context, and enforces a hard cap on consecutive bot-to-bot
 //! turns so an exchange can never spiral token cost with no human present.
 //!
-//! It mirrors the telegram extension's shape: a background [`host_api::Extension`]
-//! driving the host's `cap-chat` `ChatBackend`, bundling the stock `pi` backend,
-//! wiring the host-tool bridge, with one session per conversation.
+//! It mirrors the telegram extension's shape: a background [`dar_extension_sdk::Extension`]
+//! driving the host's `cap-chat` `ChatBackend`, resolved from the stock "pi" backend
+//! composed via requires_stock, wiring the host-tool bridge, with one session per
+//! conversation.
 
 mod addressing;
 mod config;
@@ -25,15 +26,15 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use cap_chat::{ChatBackend, ChatEvent, ChatRole, ChatSession, ChatSessionParams};
-use host_api::{ConfigStore, Extension, RegisterCtx, ShutdownToken, StartCtx};
-use orchestrator_api::{RunSnapshot, RUN_SNAPSHOT_TOPIC};
+use dar_extension_sdk::chat::{ChatBackend, ChatEvent, ChatRole, ChatSession, ChatSessionParams};
+use dar_extension_sdk::orchestrator::{RunSnapshot, RUN_SNAPSHOT_TOPIC};
+use dar_extension_sdk::tools::{
+    ToolExecutor, ToolOutcome, ToolRegistryHandle, ToolSpec, TOOL_REGISTRY_SERVICE,
+};
+use dar_extension_sdk::{ConfigStore, Extension, RegisterCtx, ShutdownToken, StartCtx};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tool_registry::{
-    ToolExecutor, ToolOutcome, ToolRegistryHandle, ToolSpec, TOOL_REGISTRY_SERVICE,
-};
 
 use addressing::{classify, is_channel, strip_mention, Conversation, Verdict};
 use config::{dm_authorized, IrcConfig};
@@ -41,10 +42,9 @@ use conn::{connect_and_register, Connection, SEND_PACING};
 use loop_guard::LoopGuard;
 use proto::PrivMsg;
 
-/// Backend id under which we register our own bundled `pi` chat backend, so the
-/// channel works under the default `foreground: logs` (where the stock `chat-*`
-/// backends are not composed in). Unique id => never conflicts with `chat-pi`.
-const SELF_BACKEND_ID: &str = "irc-pi";
+/// Backend id used as the default fallback: the stock "pi" backend composed in
+/// via requires_stock = ["chat-pi"] in [package.metadata.dar].
+const DEFAULT_BACKEND_ID: &str = "pi";
 /// Reconnect backoff bounds.
 const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
@@ -63,7 +63,7 @@ impl Extension for IrcExtension {
         "irc"
     }
 
-    fn register<'a>(&'a self, ctx: &'a mut RegisterCtx) -> host_api::BoxFuture<'a, Result<()>> {
+    fn register<'a>(&'a self, ctx: &'a mut RegisterCtx) -> dar_extension_sdk::BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let cfg = parse_config(&ctx.config, self.id())?;
             if cfg.server.is_none() {
@@ -78,8 +78,6 @@ impl Extension for IrcExtension {
                      IRC_NICK environment variable"
                 );
             }
-            ctx.services
-                .service::<dyn ChatBackend>(SELF_BACKEND_ID, Arc::new(chat_pi::PiChatBackend))?;
             if let Ok(registry) = ctx
                 .services
                 .get_named::<dyn ToolRegistryHandle>(TOOL_REGISTRY_SERVICE)
@@ -93,7 +91,7 @@ impl Extension for IrcExtension {
         })
     }
 
-    fn start<'a>(&'a self, ctx: StartCtx) -> host_api::BoxFuture<'a, Result<()>> {
+    fn start<'a>(&'a self, ctx: StartCtx) -> dar_extension_sdk::BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let cfg = parse_config(&ctx.config, self.id())?;
 
@@ -245,7 +243,7 @@ async fn run(
         guard: LoopGuard::new(cfg.effective_max_bot_turns()),
     };
 
-    runner_core::log_ev(
+    dar_extension_sdk::log::event(
         "-",
         "irc",
         &format!(
@@ -278,7 +276,7 @@ async fn run(
         };
         // Connected: reset backoff and serve until the link drops.
         backoff = BACKOFF_MIN;
-        runner_core::log_ev(
+        dar_extension_sdk::log::event(
             "-",
             "irc",
             &format!(
@@ -392,7 +390,7 @@ async fn serve(
                     continue;
                 }
 
-                runner_core::log_ev(
+                dar_extension_sdk::log::event(
                     "-",
                     "irc",
                     &format!("message from {} in {}", pm.sender, guard_key),
@@ -616,8 +614,8 @@ async fn run_turn(
 
 /// Pick the chat backend id, mirroring the TUI: an explicit, *registered* config
 /// override wins; else follow the orchestrator's selected runner when it is
-/// registered as a chat backend; else fall back to the bundled backend
-/// (`SELF_BACKEND_ID`), which is always registered.
+/// registered as a chat backend; else fall back to the stock "pi" backend
+/// (`DEFAULT_BACKEND_ID`), composed in via requires_stock = ["chat-pi"].
 fn resolve_backend(configured: Option<&str>, ctx: &StartCtx) -> String {
     let registered = |id: &str| ctx.host.services.get::<dyn ChatBackend>(id).is_ok();
     if let Some(id) = configured {
@@ -638,7 +636,7 @@ fn resolve_backend(configured: Option<&str>, ctx: &StartCtx) -> String {
             return runner;
         }
     }
-    SELF_BACKEND_ID.to_string()
+    DEFAULT_BACKEND_ID.to_string()
 }
 
 async fn open_session(
@@ -665,7 +663,7 @@ async fn open_session(
     let params = ChatSessionParams::builder("", ctx.paths.root(), session_dir)
         .model(model)
         .provider(provider)
-        .host_tool_bridge(runner_core::host_tool_bridge(
+        .host_tool_bridge(dar_extension_sdk::tools::host_tool_bridge(
             &ctx.host.services,
             ctx.paths.root(),
         ))

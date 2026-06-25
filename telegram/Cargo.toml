@@ -4,28 +4,18 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.83"
 
-# Discovery marker: `agentropy build` finds this crate by its factory metadata
-# when it is dropped into an agent's `extensions/` directory.
-[package.metadata.agentropy]
+[package.metadata.dar]
 factory = "telegram::extension"
+requires_stock = ["chat-pi"]
 
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-# Stock dar crates, pinned to a portable git rev (matches `cargo agentropy new`).
-# host-api + cap-chat (capability) + chat-pi (bundled stock backend so the channel
-# works under the default `foreground: logs` without a tui) + runner-core (host-tool
-# bridge helper); orchestrator-api is a shared bus-payload crate.
-cap-chat = { git = "https://github.com/tobalsan/dar.git", rev = "3d084a12aba033a7631614531c93ff16699cc727" }
-chat-pi = { git = "https://github.com/tobalsan/dar.git", rev = "3d084a12aba033a7631614531c93ff16699cc727" }
-host-api = { git = "https://github.com/tobalsan/dar.git", rev = "3d084a12aba033a7631614531c93ff16699cc727" }
-orchestrator-api = { git = "https://github.com/tobalsan/dar.git", rev = "3d084a12aba033a7631614531c93ff16699cc727" }
+dar-extension-sdk = { path = "../../dar/crates/extension-sdk" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-runner-core = { git = "https://github.com/tobalsan/dar.git", rev = "3d084a12aba033a7631614531c93ff16699cc727" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.43", features = ["macros", "rt", "sync", "time"] }
-tool-registry = { git = "https://github.com/tobalsan/dar.git", rev = "3d084a12aba033a7631614531c93ff16699cc727" }
 tracing = "0.1"
 
 [workspace]
