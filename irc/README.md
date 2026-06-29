@@ -1,6 +1,6 @@
 # irc
 
-A standalone agentropy/dar extension that makes an agent reachable over IRC — primarily in **shared team channels holding both humans and multiple agents**, and over private DMs. It mirrors the `telegram` extension's channel pattern (a background `Extension` driving the host's `cap-chat` `ChatBackend`, bundling the stock `pi` backend, one persistent session per conversation) but speaks the raw IRC socket protocol over TCP/TLS instead of an HTTP bot API.
+A standalone dar extension that makes an agent reachable over IRC — primarily in **shared team channels holding both humans and multiple agents**, and over private DMs. It mirrors the `telegram` extension's channel pattern (a background `Extension` driving the host's `cap-chat` `ChatBackend`, bundling the stock `pi` backend, one persistent session per conversation) but speaks the raw IRC socket protocol over TCP/TLS instead of an HTTP bot API.
 
 ## How it works
 
@@ -17,7 +17,7 @@ A standalone agentropy/dar extension that makes an agent reachable over IRC — 
 
 1. Copy this `irc/` directory into your agent folder's `extensions/` directory (e.g. `my-agent/extensions/irc/`).
 2. Configure (see below).
-3. Run `agentropy build --dir .` then `agentropy run` (or for the monolith build, add it to `dist`).
+3. Run `dar build --dir .` then `dar run` (or for the monolith build, add it to `dist`).
 
 > **Note:** The git `rev` pin in Cargo.toml must match the dar version your agent composes against.
 

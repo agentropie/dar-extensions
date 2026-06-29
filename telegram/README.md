@@ -1,6 +1,6 @@
 # telegram
 
-A standalone agentropy/dar extension that makes an agent reachable for chat over a Telegram bot. It mirrors the channel pattern from nousresearch/hermes-agent (token from BotFather, long-poll updates, route to the agent, reply) but is implemented as a lean Rust `Extension` that drives the host's `cap-chat` `ChatBackend` — the same backend the TUI uses.
+A standalone dar extension that makes an agent reachable for chat over a Telegram bot. It mirrors the channel pattern from nousresearch/hermes-agent (token from BotFather, long-poll updates, route to the agent, reply) but is implemented as a lean Rust `Extension` that drives the host's `cap-chat` `ChatBackend` — the same backend the TUI uses.
 
 ## How it works
 
@@ -15,7 +15,7 @@ A standalone agentropy/dar extension that makes an agent reachable for chat over
 1. Get a bot token from @BotFather.
 2. Copy this `telegram/` directory into your agent folder's `extensions/` directory (e.g. `my-agent/extensions/telegram/`).
 3. Configure (see below).
-4. Run `agentropy build --dir .` then `agentropy run` (or for the monolith build, add it to `dist`).
+4. Run `dar build --dir .` then `dar run` (or for the monolith build, add it to `dist`).
 
 > **Note:** The git `rev` pin in Cargo.toml must match the dar version your agent composes against.
 
