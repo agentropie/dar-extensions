@@ -26,8 +26,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use dar_extension_sdk::chat::{ChatBackend, ChatEvent, ChatRole, ChatSession, ChatSessionParams};
-use dar_extension_sdk::orchestrator::{RunSnapshot, RUN_SNAPSHOT_TOPIC};
+use dar_extension_sdk::chat::{ChatBackend, ChatEvent, ChatRole, ChatSession};
 use dar_extension_sdk::tools::{
     ToolExecutor, ToolOutcome, ToolRegistryHandle, ToolSpec, TOOL_REGISTRY_SERVICE,
 };
@@ -42,9 +41,6 @@ use conn::{connect_and_register, Connection, SEND_PACING};
 use loop_guard::LoopGuard;
 use proto::PrivMsg;
 
-/// Backend id used as the default fallback: the stock "pi" backend composed in
-/// via requires_stock = ["chat-pi"] in [package.metadata.dar].
-const DEFAULT_BACKEND_ID: &str = "pi";
 /// Reconnect backoff bounds.
 const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
@@ -612,62 +608,26 @@ async fn run_turn(
     }
 }
 
-/// Pick the chat backend id, mirroring the TUI: an explicit, *registered* config
-/// override wins; else follow the orchestrator's selected runner when it is
-/// registered as a chat backend; else fall back to the stock "pi" backend
-/// (`DEFAULT_BACKEND_ID`), composed in via requires_stock = ["chat-pi"].
-fn resolve_backend(configured: Option<&str>, ctx: &StartCtx) -> String {
-    let registered = |id: &str| ctx.host.services.get::<dyn ChatBackend>(id).is_ok();
-    if let Some(id) = configured {
-        if !id.is_empty() && registered(id) {
-            return id.to_string();
-        }
-    }
-    let runner = ctx
-        .host
-        .bus
-        .read_retained::<RunSnapshot>(RUN_SNAPSHOT_TOPIC)
-        .ok()
-        .filter(|s| s.version > 0)
-        .map(|s| s.agent.runner)
-        .filter(|r| !r.is_empty());
-    if let Some(runner) = runner {
-        if registered(&runner) {
-            return runner;
-        }
-    }
-    DEFAULT_BACKEND_ID.to_string()
-}
-
 async fn open_session(
     ctx: &StartCtx,
     session_dir: &Path,
     configured: Option<&str>,
 ) -> Result<ChatConn> {
-    let backend_id = resolve_backend(configured, ctx);
+    // Resolve the backend and build params through the shared SDK helpers so
+    // IRC talks to the same agent identity as TUI chat: model/provider from the
+    // retained RunSnapshot, the retained `system.context` as the system prompt,
+    // and the host tool bridge. Keeping this on the SDK path means a new chat
+    // surface inherits the agent's system prompt by default instead of having
+    // to remember to copy it (the bug this fixes: IRC opened sessions without
+    // a system prompt and the provider rejected them).
+    let backend_id = dar_extension_sdk::chat::resolve_agent_backend(ctx, configured);
     let backend = ctx
         .host
         .services
         .get::<dyn ChatBackend>(&backend_id)
         .with_context(|| format!("chat backend '{backend_id}' not registered"))?;
 
-    let snapshot = ctx
-        .host
-        .bus
-        .read_retained::<RunSnapshot>(RUN_SNAPSHOT_TOPIC)
-        .ok()
-        .filter(|s| s.version > 0);
-    let model = snapshot.as_ref().and_then(|s| s.agent.model.clone());
-    let provider = snapshot.as_ref().and_then(|s| s.agent.provider.clone());
-
-    let params = ChatSessionParams::builder("", ctx.paths.root(), session_dir)
-        .model(model)
-        .provider(provider)
-        .host_tool_bridge(dar_extension_sdk::tools::host_tool_bridge(
-            &ctx.host.services,
-            ctx.paths.root(),
-        ))
-        .build();
+    let params = dar_extension_sdk::chat::agent_session_params(ctx, session_dir).build();
 
     let (tx, rx) = mpsc::channel(256);
     let session = backend.open(params, tx).await?;
