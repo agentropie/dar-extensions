@@ -47,6 +47,8 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Brief window for a one-shot outbound tool call to observe immediate IRC
 /// rejection numerics after writing PRIVMSG.
 const OUTBOUND_ERROR_WAIT: Duration = Duration::from_millis(750);
+/// The pickup acknowledgement sent the instant a human's message is picked up.
+const ACK_TEXT: &str = "👀";
 
 pub struct IrcExtension;
 
@@ -391,6 +393,18 @@ async fn serve(
                     "irc",
                     &format!("message from {} in {}", pm.sender, guard_key),
                 );
+                let target = conv.reply_target(&pm.sender);
+                // Pickup ack: the moment a human's message clears every gate
+                // (allowlist, classification, loop guard) and before the agent
+                // turn runs, send an immediate `👀` so the human knows they were
+                // seen. Human-only and post-gate, so the ack is a trustworthy
+                // promise of a reply. Best-effort: a failed send is logged and
+                // swallowed so it can never block or delay the turn.
+                if should_ack(is_bot, cfg.effective_ack()) {
+                    if let Err(err) = send_reply(&sender, &target, ACK_TEXT).await {
+                        tracing::warn!(error = %err, target, "irc pickup ack failed");
+                    }
+                }
                 let prompt = build_prompt(state, &conv, &pm, &bot_nick);
                 let reply = run_turn(
                     ctx,
@@ -402,7 +416,6 @@ async fn serve(
                     prompt,
                 )
                 .await;
-                let target = conv.reply_target(&pm.sender);
                 if let Err(err) = send_reply(&sender, &target, &reply).await {
                     tracing::warn!(error = %err, target, "irc PRIVMSG failed");
                 }
@@ -421,6 +434,16 @@ async fn serve(
 /// independent of `allowed_users`, which is purely a DM authorization gate.
 fn sender_is_bot(sender: &str, humans: &[String]) -> bool {
     !humans.iter().any(|h| h.eq_ignore_ascii_case(sender))
+}
+
+/// Decide whether a picked-up message should get an immediate `👀` pickup ack.
+/// Only known humans are acked, and only when the ack is enabled. Bots are never
+/// acked: this single rule keeps the ack off bot-to-bot traffic and keeps it
+/// aligned with the loop guard, which only ever stays silent on bots. The caller
+/// invokes this post-gate (after the loop guard) so a `true` here implies a reply
+/// will follow.
+fn should_ack(sender_is_bot: bool, ack_enabled: bool) -> bool {
+    ack_enabled && !sender_is_bot
 }
 
 /// Buffer an ambient message into the conversation's context ring (bounded to
@@ -682,6 +705,44 @@ mod tests {
             .unwrap();
         assert!(out.is_error);
         assert_eq!(out.error.as_ref().unwrap().code, "connect_failed");
+    }
+
+    #[test]
+    fn should_ack_only_humans_when_enabled() {
+        let humans = vec!["alice".to_string()];
+        let cfg = IrcConfig {
+            humans: humans.clone(),
+            ..IrcConfig::default()
+        };
+        // Default config => ack enabled.
+        assert!(cfg.effective_ack());
+        // Human sender, ack on => acked.
+        assert!(should_ack(sender_is_bot("alice", &humans), cfg.effective_ack()));
+        // Bot sender, ack on => never acked.
+        assert!(!should_ack(sender_is_bot("otheragent", &humans), cfg.effective_ack()));
+    }
+
+    #[test]
+    fn should_ack_off_suppresses_even_for_humans() {
+        let humans = vec!["alice".to_string()];
+        let cfg = IrcConfig {
+            humans: humans.clone(),
+            ack: Some(false),
+            ..IrcConfig::default()
+        };
+        assert!(!cfg.effective_ack());
+        // Even a known human gets no ack when the toggle is off.
+        assert!(!should_ack(sender_is_bot("alice", &humans), cfg.effective_ack()));
+        assert!(!should_ack(sender_is_bot("otheragent", &humans), cfg.effective_ack()));
+    }
+
+    #[test]
+    fn should_ack_empty_humans_never_acks() {
+        // Fail-closed classification: with no known humans, every sender is a bot,
+        // so the ack never fires even with the toggle on.
+        let cfg = IrcConfig::default();
+        assert!(cfg.effective_ack());
+        assert!(!should_ack(sender_is_bot("anyone", &cfg.humans), cfg.effective_ack()));
     }
 
     #[test]
