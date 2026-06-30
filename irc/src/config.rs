@@ -81,6 +81,11 @@ pub struct IrcConfig {
     /// `IRC_CONTEXT_WINDOW` only when unset in yaml. Use
     /// [`IrcConfig::effective_context_window`] for the resolved value.
     pub(crate) context_window: Option<usize>,
+    /// Send an immediate `👀` acknowledgement the moment a human's message is
+    /// picked up for a reply (before the agent turn runs). Falls back to
+    /// `IRC_ACK` only when unset in yaml. Defaults to true. Use
+    /// [`IrcConfig::effective_ack`] for the resolved value.
+    pub(crate) ack: Option<bool>,
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -188,6 +193,9 @@ impl IrcConfig {
         if self.context_window.is_none() {
             self.context_window = env_opt("IRC_CONTEXT_WINDOW").and_then(|v| v.parse().ok());
         }
+        if self.ack.is_none() {
+            self.ack = env_opt("IRC_ACK").and_then(|v| v.parse().ok());
+        }
         self
     }
 
@@ -211,6 +219,13 @@ impl IrcConfig {
     /// default.
     pub fn effective_context_window(&self) -> usize {
         self.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW)
+    }
+
+    /// Resolved pickup-ack setting: the yaml/env value if set, else the default
+    /// (true). When true, a `👀` is sent the instant a human's message is picked
+    /// up for a reply.
+    pub fn effective_ack(&self) -> bool {
+        self.ack.unwrap_or(true)
     }
 
     /// USER username, defaulting to the nick.
@@ -386,5 +401,64 @@ mod tests {
     fn unset_default_resolves_to_true() {
         let cfg = IrcConfig::default();
         assert!(cfg.mention_required_for("#any"));
+    }
+
+    #[test]
+    fn ack_defaults_to_true_when_unset() {
+        let cfg = IrcConfig::default();
+        assert!(cfg.effective_ack());
+    }
+
+    #[test]
+    fn ack_honors_explicit_false() {
+        let cfg = IrcConfig {
+            ack: Some(false),
+            ..IrcConfig::default()
+        };
+        assert!(!cfg.effective_ack());
+    }
+
+    #[test]
+    fn ack_honors_env_fallback() {
+        // Env fallback only applies when unset in yaml. Serialize via the prior
+        // value to keep the process-wide env clean for other tests.
+        let prev = std::env::var("IRC_ACK").ok();
+        // SAFETY: restored below; env access in this module is single-process.
+        unsafe {
+            std::env::set_var("IRC_ACK", "false");
+        }
+        let cfg = IrcConfig::default().with_env_fallbacks();
+        assert!(!cfg.effective_ack(), "IRC_ACK=false must disable the ack");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("IRC_ACK", v),
+                None => std::env::remove_var("IRC_ACK"),
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_ack_is_not_overridden_by_env() {
+        // An explicit yaml value must survive even with a conflicting env var.
+        let prev = std::env::var("IRC_ACK").ok();
+        // SAFETY: restored below; env access in this module is single-process.
+        unsafe {
+            std::env::set_var("IRC_ACK", "true");
+        }
+        let cfg = IrcConfig {
+            ack: Some(false),
+            ..IrcConfig::default()
+        }
+        .with_env_fallbacks();
+        assert!(
+            !cfg.effective_ack(),
+            "explicit yaml ack:false must not be clobbered by env"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("IRC_ACK", v),
+                None => std::env::remove_var("IRC_ACK"),
+            }
+        }
     }
 }
