@@ -22,6 +22,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+mod ack;
+use ack::{AckGuard, BotApi};
+
 /// Telegram caps a single message at 4096 characters.
 const TELEGRAM_MAX_CHARS: usize = 4096;
 /// Long-poll timeout (seconds) the Telegram server holds an empty `getUpdates`.
@@ -230,6 +233,10 @@ async fn run(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(POLL_TIMEOUT_SECS + 5))
         .build()?;
+    let bot_api: Arc<dyn BotApi> = Arc::new(TelegramBotApi {
+        client: client.clone(),
+        base: base.clone(),
+    });
     let mut offset: i64 = 0;
     let mut sessions: HashMap<i64, ChatConn> = HashMap::new();
 
@@ -262,6 +269,7 @@ async fn run(
                 for update in updates {
                     offset = update.update_id + 1;
                     let Some(message) = update.message else { continue };
+                    let message_id = message.message_id;
                     let Some(text) = message.text else { continue };
                     let chat_id = message.chat.id;
                     let user_id = message.from.map(|u| u.id);
@@ -278,6 +286,11 @@ async fn run(
                             user_id.map(|u| u.to_string()).unwrap_or_else(|| "?".into()),
                         ),
                     );
+                    // Acknowledge the moment the message is picked up: the guard
+                    // adds the 👀 reaction + keeps typing alive, and guarantees
+                    // both clear on drop regardless of how the turn ends.
+                    let guard =
+                        AckGuard::start(Arc::clone(&bot_api), chat_id, message_id).await;
                     let reply = run_turn(
                         ctx,
                         shutdown,
@@ -293,6 +306,10 @@ async fn run(
                             tracing::warn!(error = %err, "telegram sendMessage failed");
                         }
                     }
+                    // Reply delivered: clear 👀 and stop typing, awaiting the
+                    // clear so it lands before the next message is picked up.
+                    // (Error/panic paths fall back to the guard's Drop.)
+                    guard.finish().await;
                 }
             }
         }
@@ -411,6 +428,7 @@ struct Update {
 
 #[derive(Deserialize)]
 struct TgMessage {
+    message_id: i64,
     #[serde(default)]
     text: Option<String>,
     chat: TgChat,
@@ -483,6 +501,72 @@ async fn send_message(
         .await?
         .error_for_status()?;
     Ok(())
+}
+
+/// Set or clear a message reaction. `emoji = None` clears all reactions.
+async fn set_message_reaction(
+    client: &reqwest::Client,
+    base: &str,
+    chat_id: i64,
+    message_id: i64,
+    emoji: Option<&str>,
+) -> Result<()> {
+    let reaction = match emoji {
+        Some(emoji) => serde_json::json!([{ "type": "emoji", "emoji": emoji }]),
+        None => serde_json::json!([]),
+    };
+    client
+        .post(format!("{base}/setMessageReaction"))
+        .json(&serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reaction": reaction,
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+/// Send a chat action such as `typing` to show the activity indicator.
+async fn send_chat_action(
+    client: &reqwest::Client,
+    base: &str,
+    chat_id: i64,
+    action: &str,
+) -> Result<()> {
+    client
+        .post(format!("{base}/sendChatAction"))
+        .json(&serde_json::json!({ "chat_id": chat_id, "action": action }))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+/// Live Bot API sink for the acknowledgement guard, backed by the shared
+/// `reqwest` client. Network errors are logged and swallowed: the guard is
+/// best-effort feedback and must never break delivery of the real reply.
+struct TelegramBotApi {
+    client: reqwest::Client,
+    base: String,
+}
+
+#[async_trait]
+impl BotApi for TelegramBotApi {
+    async fn set_reaction(&self, chat_id: i64, message_id: i64, emoji: Option<&str>) {
+        if let Err(err) =
+            set_message_reaction(&self.client, &self.base, chat_id, message_id, emoji).await
+        {
+            tracing::warn!(error = %err, "telegram setMessageReaction failed");
+        }
+    }
+
+    async fn send_chat_action(&self, chat_id: i64, action: &str) {
+        if let Err(err) = send_chat_action(&self.client, &self.base, chat_id, action).await {
+            tracing::warn!(error = %err, "telegram sendChatAction failed");
+        }
+    }
 }
 
 #[cfg(test)]

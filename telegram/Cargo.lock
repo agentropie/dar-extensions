@@ -324,9 +324,9 @@ dependencies = [
 
 [[package]]
 name = "dar-extension-sdk"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae8dc0b7646ec4f880c0b99144072dbf1a8533bfa69535ab833aebaa86204659"
+checksum = "4001a24386ee338e3cc92c3ea349ed40d40251b63e9d615bde387a3d6efef2a8"
 dependencies = [
  "anyhow",
  "dar-cap-chat",
