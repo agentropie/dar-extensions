@@ -261,6 +261,18 @@ async fn open_stream(
     Ok((Box::new(r), Box::new(w)))
 }
 
+/// Build a `Sender` over an in-memory duplex pipe for testing outbound delivery
+/// without a live server. Returns the sender and the server-side half (read the
+/// bot's outbound lines from it). Test-only helper shared across modules.
+#[cfg(test)]
+pub(crate) fn duplex_sender() -> (Sender, tokio::io::DuplexStream) {
+    let (client, server) = tokio::io::duplex(8192);
+    let sender = Sender {
+        writer: Arc::new(Mutex::new(Box::new(client))),
+    };
+    (sender, server)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

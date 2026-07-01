@@ -11,6 +11,10 @@ pub const DEFAULT_PORT: u16 = 6697;
 pub const DEFAULT_MAX_BOT_TURNS: u32 = 4;
 /// Default number of ambient (context-only) messages retained per conversation.
 pub const DEFAULT_CONTEXT_WINDOW: usize = 30;
+/// Default debounce window (milliseconds) for coalescing rapid successive lines
+/// from the same conversation into a single agent turn. Rapid pasted DM lines
+/// arrive back-to-back; without coalescing each line spawns its own serial turn.
+pub const DEFAULT_DEBOUNCE_MS: u64 = 1500;
 
 /// A channel entry: the name to JOIN and an optional per-channel mention-gating
 /// override. When `mention_required` is `None` the global default (or `true`)
@@ -86,6 +90,12 @@ pub struct IrcConfig {
     /// `IRC_ACK` only when unset in yaml. Defaults to true. Use
     /// [`IrcConfig::effective_ack`] for the resolved value.
     pub(crate) ack: Option<bool>,
+    /// Debounce window in milliseconds for coalescing rapid successive lines
+    /// from the same conversation into a single turn. Falls back to
+    /// `IRC_DEBOUNCE_MS` only when unset in yaml. Defaults to
+    /// [`DEFAULT_DEBOUNCE_MS`]. `0` disables coalescing. Use
+    /// [`IrcConfig::effective_debounce`] for the resolved value.
+    pub(crate) debounce_ms: Option<u64>,
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -196,6 +206,9 @@ impl IrcConfig {
         if self.ack.is_none() {
             self.ack = env_opt("IRC_ACK").and_then(|v| v.parse().ok());
         }
+        if self.debounce_ms.is_none() {
+            self.debounce_ms = env_opt("IRC_DEBOUNCE_MS").and_then(|v| v.parse().ok());
+        }
         self
     }
 
@@ -226,6 +239,12 @@ impl IrcConfig {
     /// up for a reply.
     pub fn effective_ack(&self) -> bool {
         self.ack.unwrap_or(true)
+    }
+
+    /// Resolved debounce window: the yaml/env value if set, else the default.
+    /// A value of `0` disables coalescing (each line is its own turn).
+    pub fn effective_debounce(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.debounce_ms.unwrap_or(DEFAULT_DEBOUNCE_MS))
     }
 
     /// USER username, defaulting to the nick.
