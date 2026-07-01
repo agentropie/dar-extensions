@@ -3,4 +3,5 @@
 ## [Unreleased]
 
 ### Added
-- Render agent markdown replies richly in Telegram: bold, italic, inline/blocked code, links, headings, strikethrough, blockquotes, spoilers, bullet/task lists, and tables are converted to Telegram MarkdownV2 before sending. A graceful fallback chain (MarkdownV2 → plain text) guarantees the message is never lost even when markup can't be safely formatted, and long replies are split into `(N/M)`-labelled chunks at the 4096 UTF-16 limit. (ALG-320)
+- Live reply streaming: the assistant answer now appears while the turn runs in a single editable bubble (rate-limited to ~1s / 200 chars) instead of only after the turn finishes.
+- Tool status bubble: a separate editable message shows the running tool as `name · short target/preview` (not full argument JSON), flushes any pre-tool assistant text first, and collapses to a `Used N tools: …` summary when the turn finishes.
