@@ -23,10 +23,9 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 mod ack;
+mod markdown;
 use ack::{AckGuard, BotApi};
-
-/// Telegram caps a single message at 4096 characters.
-const TELEGRAM_MAX_CHARS: usize = 4096;
+use markdown::{render_chunks, Chunk, ParseMode};
 /// Long-poll timeout (seconds) the Telegram server holds an empty `getUpdates`.
 const POLL_TIMEOUT_SECS: u64 = 30;
 
@@ -52,7 +51,10 @@ impl Extension for TelegramExtension {
         "telegram"
     }
 
-    fn register<'a>(&'a self, ctx: &'a mut RegisterCtx) -> dar_extension_sdk::BoxFuture<'a, Result<()>> {
+    fn register<'a>(
+        &'a self,
+        ctx: &'a mut RegisterCtx,
+    ) -> dar_extension_sdk::BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let cfg = parse_config(&ctx.config, self.id())?;
             if resolve_token(&cfg).is_none() {
@@ -163,14 +165,12 @@ impl ToolExecutor for TelegramSendTool {
             ));
         }
 
-        for chunk in split_message(text) {
-            if let Err(err) = send_message(&self.client, &self.base, chat_id, &chunk).await {
-                return Ok(ToolOutcome::error_code(
-                    "send_failed",
-                    format!("Telegram sendMessage failed: {err:#}"),
-                    None::<String>,
-                ));
-            }
+        if let Err(err) = send_reply(&self.client, &self.base, chat_id, text).await {
+            return Ok(ToolOutcome::error_code(
+                "send_failed",
+                format!("Telegram sendMessage failed: {err:#}"),
+                None::<String>,
+            ));
         }
         Ok(ToolOutcome::ok(format!(
             "sent Telegram message to chat {chat_id}"
@@ -200,20 +200,90 @@ fn authorized(user_id: Option<i64>, allowed: &[i64]) -> bool {
     matches!(user_id, Some(id) if allowed.contains(&id))
 }
 
-/// Split a reply into Telegram-sized chunks on character boundaries.
-fn split_message(text: &str) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    for ch in text.chars() {
-        if current.chars().count() >= TELEGRAM_MAX_CHARS {
-            chunks.push(std::mem::take(&mut current));
+/// Send an agent reply through the fallback chain that guarantees delivery:
+/// MarkdownV2 → plain text. Each chunk is tried as rendered MarkdownV2 first;
+/// if Telegram rejects it with a parse error (malformed markup), that chunk's
+/// *exact source span* is re-sent as plain text so the content is never lost.
+///
+/// Because `render_chunks` chunks the raw source (not the escaped output), a
+/// chunk's `source` covers the same bytes as its rich rendering — so the
+/// plain-text fallback is lossless and index-aligned by construction. Non-parse
+/// network errors propagate so the caller can log a genuine delivery failure.
+async fn send_reply(client: &reqwest::Client, base: &str, chat_id: i64, reply: &str) -> Result<()> {
+    for chunk in render_chunks(reply) {
+        match send_chunk(client, base, chat_id, &chunk).await {
+            Ok(()) => {}
+            Err(SendError::Parse) => {
+                // Malformed markup: fall to a lossless plain-text send of the
+                // same source span.
+                let fallback = Chunk {
+                    text: chunk.source.clone(),
+                    parse_mode: ParseMode::Plain,
+                    source: chunk.source,
+                };
+                send_chunk(client, base, chat_id, &fallback)
+                    .await
+                    .map_err(SendError::into_anyhow)?;
+            }
+            Err(SendError::Other(err)) => return Err(err),
         }
-        current.push(ch);
     }
-    if !current.is_empty() {
-        chunks.push(current);
+    Ok(())
+}
+
+/// Outcome of a single `sendMessage`: a Telegram parse error (which triggers
+/// the plain-text fallback) is distinguished from any other failure.
+enum SendError {
+    /// Telegram rejected the message because its markup could not be parsed.
+    Parse,
+    /// A transport or non-parse API error.
+    Other(anyhow::Error),
+}
+
+impl SendError {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            SendError::Parse => anyhow::anyhow!("telegram parse error"),
+            SendError::Other(err) => err,
+        }
     }
-    chunks
+}
+
+/// Send one already-chunked message with its chosen parse mode.
+async fn send_chunk(
+    client: &reqwest::Client,
+    base: &str,
+    chat_id: i64,
+    chunk: &Chunk,
+) -> std::result::Result<(), SendError> {
+    let mut payload = serde_json::json!({ "chat_id": chat_id, "text": chunk.text });
+    if let Some(mode) = chunk.parse_mode.as_api_value() {
+        payload["parse_mode"] = serde_json::Value::String(mode.to_string());
+    }
+    let resp = client
+        .post(format!("{base}/sendMessage"))
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| SendError::Other(e.into()))?;
+    let status = resp.status();
+    let body: TgResponse<Value> = resp.json().await.map_err(|e| SendError::Other(e.into()))?;
+    if body.ok {
+        return Ok(());
+    }
+    let desc = body.description.unwrap_or_default();
+    if is_parse_error(&desc) {
+        return Err(SendError::Parse);
+    }
+    Err(SendError::Other(anyhow::anyhow!(
+        "telegram sendMessage failed ({status}): {desc}"
+    )))
+}
+
+/// Does Telegram's error description indicate a MarkdownV2 parse failure?
+fn is_parse_error(description: &str) -> bool {
+    let d = description.to_ascii_lowercase();
+    d.contains("can't parse entities") || d.contains("can't parse message text")
 }
 
 /// One live agent conversation, keyed by Telegram chat id.
@@ -247,7 +317,9 @@ async fn run(
     );
 
     match get_me(&client, &base).await {
-        Ok(username) => dar_extension_sdk::log::event("-", "telegram", &format!("connected as @{username}")),
+        Ok(username) => {
+            dar_extension_sdk::log::event("-", "telegram", &format!("connected as @{username}"))
+        }
         Err(err) => tracing::warn!(error = %err, "telegram getMe failed; continuing to poll"),
     }
 
@@ -301,10 +373,8 @@ async fn run(
                         text,
                     )
                     .await;
-                    for chunk in split_message(&reply) {
-                        if let Err(err) = send_message(&client, &base, chat_id, &chunk).await {
-                            tracing::warn!(error = %err, "telegram sendMessage failed");
-                        }
+                    if let Err(err) = send_reply(&client, &base, chat_id, &reply).await {
+                        tracing::warn!(error = %err, "telegram sendMessage failed");
                     }
                     // Reply delivered: clear 👀 and stop typing, awaiting the
                     // clear so it lands before the next message is picked up.
@@ -587,16 +657,12 @@ mod tests {
     }
 
     #[test]
-    fn split_message_chunks_on_limit() {
-        let small = "hello";
-        assert_eq!(split_message(small), vec!["hello".to_string()]);
-        assert!(split_message("").is_empty());
-
-        let big: String = "x".repeat(TELEGRAM_MAX_CHARS + 10);
-        let chunks = split_message(&big);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].chars().count(), TELEGRAM_MAX_CHARS);
-        assert_eq!(chunks[1].chars().count(), 10);
+    fn is_parse_error_detects_telegram_markup_failures() {
+        assert!(is_parse_error(
+            "Bad Request: can't parse entities: unmatched '*'"
+        ));
+        assert!(is_parse_error("Bad Request: can't parse message text"));
+        assert!(!is_parse_error("Bad Request: chat not found"));
     }
 
     #[test]
