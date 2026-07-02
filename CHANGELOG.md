@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-02
+
+### Added
+
+- **irc, telegram:** agent system context (skills, environment) is now shared
+  with the SDK chat helper so extension-driven turns carry the same grounding as
+  native ones. (ALG-315)
+- **irc:** a 👀 reaction acknowledges a human message the moment the agent picks
+  it up. (ALG-318)
+- **telegram:** self-clearing 👀 acknowledgement plus a typing indicator while a
+  turn is in flight. (ALG-319)
+- **telegram:** agent replies render as rich Markdown with an automatic
+  plain-text fallback when formatting can't be applied. (ALG-320)
+- **telegram:** replies stream live, with in-progress tool status surfaced as the
+  turn runs. (ALG-325)
+- **irc:** `debounce_ms` config (env `IRC_DEBOUNCE_MS`, default 1500, `0` to
+  disable) coalesces rapid successive lines from the same conversation — such as a
+  pasted multi-line DM — into a single agent turn instead of spawning serial
+  turns. (ALG-324)
+
 ### Fixed
 
 - **irc:** replies are no longer dropped after rapid multi-line DM input. Agent
@@ -10,10 +30,3 @@
   (previously the inline turn starved the read loop and outbound `PRIVMSG` failed
   with `Broken pipe`). A completed reply produced while the link is down is queued
   and retried on reconnect instead of being silently lost. (ALG-324)
-
-### Added
-
-- **irc:** `debounce_ms` config (env `IRC_DEBOUNCE_MS`, default 1500, `0` to
-  disable) coalesces rapid successive lines from the same conversation — such as a
-  pasted multi-line DM — into a single agent turn instead of spawning serial
-  turns. (ALG-324)
