@@ -24,8 +24,10 @@ use tokio::sync::mpsc;
 
 mod ack;
 mod markdown;
+mod stream;
 use ack::{AckGuard, BotApi};
 use markdown::{render_chunks, Chunk, ParseMode};
+use stream::{EditResult, LiveTurn, RealClock, StreamApi};
 /// Long-poll timeout (seconds) the Telegram server holds an empty `getUpdates`.
 const POLL_TIMEOUT_SECS: u64 = 30;
 
@@ -211,22 +213,7 @@ fn authorized(user_id: Option<i64>, allowed: &[i64]) -> bool {
 /// network errors propagate so the caller can log a genuine delivery failure.
 async fn send_reply(client: &reqwest::Client, base: &str, chat_id: i64, reply: &str) -> Result<()> {
     for chunk in render_chunks(reply) {
-        match send_chunk(client, base, chat_id, &chunk).await {
-            Ok(()) => {}
-            Err(SendError::Parse) => {
-                // Malformed markup: fall to a lossless plain-text send of the
-                // same source span.
-                let fallback = Chunk {
-                    text: chunk.source.clone(),
-                    parse_mode: ParseMode::Plain,
-                    source: chunk.source,
-                };
-                send_chunk(client, base, chat_id, &fallback)
-                    .await
-                    .map_err(SendError::into_anyhow)?;
-            }
-            Err(SendError::Other(err)) => return Err(err),
-        }
+        send_chunk_with_fallback(client, base, chat_id, &chunk).await?;
     }
     Ok(())
 }
@@ -277,6 +264,50 @@ async fn send_chunk(
     }
     Err(SendError::Other(anyhow::anyhow!(
         "telegram sendMessage failed ({status}): {desc}"
+    )))
+}
+
+/// Edit one message to an already-chunked body with its chosen parse mode.
+/// Mirrors [`send_chunk`] but targets `editMessageText`, distinguishing a
+/// markup parse error (which triggers the plain-text fallback) from any other
+/// failure (which triggers a fresh send).
+async fn edit_chunk(
+    client: &reqwest::Client,
+    base: &str,
+    chat_id: i64,
+    message_id: i64,
+    chunk: &Chunk,
+) -> std::result::Result<(), SendError> {
+    let mut payload =
+        serde_json::json!({ "chat_id": chat_id, "message_id": message_id, "text": chunk.text });
+    if let Some(mode) = chunk.parse_mode.as_api_value() {
+        payload["parse_mode"] = serde_json::Value::String(mode.to_string());
+    }
+    let resp = client
+        .post(format!("{base}/editMessageText"))
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| SendError::Other(e.into()))?;
+    let status = resp.status();
+    let body: TgResponse<Value> = resp.json().await.map_err(|e| SendError::Other(e.into()))?;
+    if body.ok {
+        return Ok(());
+    }
+    let desc = body.description.unwrap_or_default();
+    if is_parse_error(&desc) {
+        return Err(SendError::Parse);
+    }
+    // "message is not modified" is a benign no-op (identical text): treat it as
+    // success so an unchanged final flush never counts as an error.
+    if desc
+        .to_ascii_lowercase()
+        .contains("message is not modified")
+    {
+        return Ok(());
+    }
+    Err(SendError::Other(anyhow::anyhow!(
+        "telegram editMessageText failed ({status}): {desc}"
     )))
 }
 
@@ -363,7 +394,12 @@ async fn run(
                     // both clear on drop regardless of how the turn ends.
                     let guard =
                         AckGuard::start(Arc::clone(&bot_api), chat_id, message_id).await;
-                    let reply = run_turn(
+                    let stream_api = TelegramStreamApi {
+                        client: client.clone(),
+                        base: base.clone(),
+                        chat_id,
+                    };
+                    let outcome = run_turn(
                         ctx,
                         shutdown,
                         &mut sessions,
@@ -371,9 +407,12 @@ async fn run(
                         cfg.backend.as_deref(),
                         chat_id,
                         text,
+                        &stream_api,
                     )
                     .await;
-                    if let Err(err) = send_reply(&client, &base, chat_id, &reply).await {
+                    if let Err(err) =
+                        finalize_reply(&client, &base, chat_id, &outcome).await
+                    {
                         tracing::warn!(error = %err, "telegram sendMessage failed");
                     }
                     // Reply delivered: clear 👀 and stop typing, awaiting the
@@ -387,6 +426,17 @@ async fn run(
     Ok(())
 }
 
+/// What a turn produced: the final reply text plus the id of the live answer
+/// bubble (if streaming created one). The caller finalizes that same bubble
+/// with rich markdown so the final answer replaces the streamed preview instead
+/// of duplicating it.
+struct TurnOutcome {
+    reply: String,
+    /// Set when streaming already delivered assistant text into a live bubble.
+    answer_msg: Option<i64>,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_turn(
     ctx: &StartCtx,
     shutdown: &mut ShutdownToken,
@@ -395,44 +445,68 @@ async fn run_turn(
     configured: Option<&str>,
     chat_id: i64,
     text: String,
-) -> String {
+    stream_api: &dyn StreamApi,
+) -> TurnOutcome {
     if let std::collections::hash_map::Entry::Vacant(slot) = sessions.entry(chat_id) {
         let dir = base_dir.join(chat_id.to_string());
         if let Err(err) = std::fs::create_dir_all(&dir) {
-            return format!("Failed to create session dir: {err}");
+            return TurnOutcome {
+                reply: format!("Failed to create session dir: {err}"),
+                answer_msg: None,
+            };
         }
         match open_session(ctx, &dir, configured).await {
             Ok(conn) => {
                 slot.insert(conn);
             }
-            Err(err) => return format!("Failed to start agent session: {err}"),
+            Err(err) => {
+                return TurnOutcome {
+                    reply: format!("Failed to start agent session: {err}"),
+                    answer_msg: None,
+                }
+            }
         }
     }
 
     let conn = sessions.get_mut(&chat_id).expect("session just inserted");
     if let Err(err) = conn.session.send_turn(text).await {
         sessions.remove(&chat_id);
-        return format!("Failed to send message: {err}");
+        return TurnOutcome {
+            reply: format!("Failed to send message: {err}"),
+            answer_msg: None,
+        };
     }
 
-    let mut reply = String::new();
+    // The live bubbles (answer + tool status) are UI-only and never touch the
+    // agent's conversation history: they only mirror events as they arrive.
+    let mut live = LiveTurn::new(stream_api, RealClock);
+    let mut error_reply = String::new();
     let mut drop_session = false;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             event = conn.rx.recv() => match event {
-                Some(ChatEvent::Delta { role: ChatRole::Assistant, text }) => reply.push_str(&text),
+                Some(ChatEvent::Delta { role: ChatRole::Assistant, text }) => {
+                    live.push_text(&text).await;
+                }
+                Some(ChatEvent::ToolCall { name, args, .. }) => {
+                    // Flush pre-tool assistant text, then show what's running.
+                    live.tool_started(&name, &args).await;
+                }
                 Some(ChatEvent::TurnFinished { ok: true, .. }) => break,
                 Some(ChatEvent::TurnFinished { ok: false, error }) => {
-                    if reply.is_empty() {
-                        reply = format!("(turn failed: {})", error.unwrap_or_else(|| "unknown".into()));
+                    if live.answer().is_empty() {
+                        error_reply = format!(
+                            "(turn failed: {})",
+                            error.unwrap_or_else(|| "unknown".into())
+                        );
                     }
                     break;
                 }
                 Some(ChatEvent::SessionClosed { error }) => {
                     drop_session = true;
-                    if reply.is_empty() {
-                        reply = format!("(session closed: {})", error.unwrap_or_default());
+                    if live.answer().is_empty() {
+                        error_reply = format!("(session closed: {})", error.unwrap_or_default());
                     }
                     break;
                 }
@@ -445,13 +519,138 @@ async fn run_turn(
         }
     }
 
+    // Collapse the status bubble and flush the final streamed preview.
+    live.finish().await;
+
     if drop_session {
         sessions.remove(&chat_id);
     }
-    if reply.trim().is_empty() {
-        "(no response)".to_string()
+
+    let reply = if !live.answer().trim().is_empty() {
+        live.answer().to_string()
+    } else if !error_reply.is_empty() {
+        error_reply
     } else {
-        reply
+        "(no response)".to_string()
+    };
+    TurnOutcome {
+        reply,
+        answer_msg: live.answer_message_id(),
+    }
+}
+
+/// Deliver the final answer without duplicating the streamed preview.
+///
+/// When streaming created a live answer bubble, the bubble is finalized *in
+/// place* to the first rendered chunk (so the streamed preview becomes the real
+/// final answer instead of leaving a stale head duplicated below), and any
+/// remaining chunks of a long reply are sent as follow-up messages. When no
+/// bubble was created (e.g. the whole turn was tool work with no assistant
+/// text), the standard chunked `send_reply` path runs. Either way Telegram's
+/// length limits and the MarkdownV2→plain fallback are preserved, and delivery
+/// never fails silently: a failed edit falls back to a fresh send.
+async fn finalize_reply(
+    client: &reqwest::Client,
+    base: &str,
+    chat_id: i64,
+    outcome: &TurnOutcome,
+) -> Result<()> {
+    let chunks = render_chunks(&outcome.reply);
+    match plan_finalize(outcome.answer_msg, chunks.len()) {
+        FinalizePlan::SendAll => {
+            for chunk in &chunks {
+                send_chunk_with_fallback(client, base, chat_id, chunk).await?;
+            }
+        }
+        FinalizePlan::Empty => {}
+        FinalizePlan::EditThenSendRest { msg_id } => {
+            let mut iter = chunks.iter();
+            let first = iter.next().expect("non-empty per plan");
+            edit_first_chunk(client, base, chat_id, msg_id, first).await?;
+            // Remaining chunks of a long reply go out as fresh follow-ups,
+            // preserving the existing chunked delivery semantics.
+            for chunk in iter {
+                send_chunk_with_fallback(client, base, chat_id, chunk).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How the final reply should be delivered relative to any streamed preview
+/// bubble. Kept as a pure decision so the de-duplication contract — the preview
+/// bubble is reused for the first chunk, never left stale beside a fresh send —
+/// is unit-tested without any network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalizePlan {
+    /// No preview bubble (or nothing streamed): send every chunk fresh.
+    SendAll,
+    /// A preview bubble exists: edit it to the first chunk, send the rest.
+    EditThenSendRest { msg_id: i64 },
+    /// A bubble exists but the reply rendered to zero chunks: nothing to do.
+    Empty,
+}
+
+fn plan_finalize(answer_msg: Option<i64>, chunk_count: usize) -> FinalizePlan {
+    match answer_msg {
+        None => FinalizePlan::SendAll,
+        Some(_) if chunk_count == 0 => FinalizePlan::Empty,
+        Some(msg_id) => FinalizePlan::EditThenSendRest { msg_id },
+    }
+}
+
+/// Finalize the live bubble in place with the first chunk. On a markup parse
+/// error, retry the edit as plain text; if either edit fails outright (e.g. the
+/// message was deleted or the edit limit hit), fall back to sending the first
+/// chunk fresh so the head of the answer is never lost.
+async fn edit_first_chunk(
+    client: &reqwest::Client,
+    base: &str,
+    chat_id: i64,
+    msg_id: i64,
+    first: &Chunk,
+) -> Result<()> {
+    match edit_chunk(client, base, chat_id, msg_id, first).await {
+        Ok(()) => Ok(()),
+        Err(SendError::Parse) => {
+            let plain = Chunk {
+                text: first.source.clone(),
+                parse_mode: ParseMode::Plain,
+                source: first.source.clone(),
+            };
+            if edit_chunk(client, base, chat_id, msg_id, &plain)
+                .await
+                .is_err()
+            {
+                send_chunk_with_fallback(client, base, chat_id, first).await?;
+            }
+            Ok(())
+        }
+        Err(SendError::Other(_)) => send_chunk_with_fallback(client, base, chat_id, first).await,
+    }
+}
+
+/// Send one chunk as a fresh message with the same MarkdownV2→plain fallback
+/// `send_reply` uses, so a malformed-markup chunk still arrives losslessly.
+async fn send_chunk_with_fallback(
+    client: &reqwest::Client,
+    base: &str,
+    chat_id: i64,
+    chunk: &Chunk,
+) -> Result<()> {
+    match send_chunk(client, base, chat_id, chunk).await {
+        Ok(()) => Ok(()),
+        Err(SendError::Parse) => {
+            let plain = Chunk {
+                text: chunk.source.clone(),
+                parse_mode: ParseMode::Plain,
+                source: chunk.source.clone(),
+            };
+            send_chunk(client, base, chat_id, &plain)
+                .await
+                .map_err(SendError::into_anyhow)
+        }
+        Err(SendError::Other(err)) => Err(err),
     }
 }
 
@@ -573,6 +772,71 @@ async fn send_message(
     Ok(())
 }
 
+/// Send a plain-text message and return its Telegram message id. Used by the
+/// live streamer for the answer/status preview bubbles, which are edited in
+/// place as the turn progresses. Streaming previews are sent as plain text (no
+/// `parse_mode`): partial markdown mid-stream is often unbalanced and would be
+/// rejected — the final answer is finalized with rich markdown separately.
+async fn send_message_id(
+    client: &reqwest::Client,
+    base: &str,
+    chat_id: i64,
+    text: &str,
+) -> Result<i64> {
+    #[derive(Default, Deserialize)]
+    struct SentMessage {
+        message_id: i64,
+    }
+    let body: TgResponse<SentMessage> = client
+        .post(format!("{base}/sendMessage"))
+        .json(&serde_json::json!({ "chat_id": chat_id, "text": text }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    if !body.ok {
+        bail!(
+            "telegram sendMessage error: {}",
+            body.description.unwrap_or_default()
+        );
+    }
+    Ok(body.result.map(|m| m.message_id).unwrap_or_default())
+}
+
+/// Edit a message's plain text in place. Used for live preview edits; treats
+/// "message is not modified" as success.
+async fn edit_message_text(
+    client: &reqwest::Client,
+    base: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) -> Result<()> {
+    let resp = client
+        .post(format!("{base}/editMessageText"))
+        .json(&serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let body: TgResponse<Value> = resp.json().await?;
+    if body.ok {
+        return Ok(());
+    }
+    let desc = body.description.unwrap_or_default();
+    if desc
+        .to_ascii_lowercase()
+        .contains("message is not modified")
+    {
+        return Ok(());
+    }
+    bail!("telegram editMessageText error: {desc}");
+}
+
 /// Set or clear a message reaction. `emoji = None` clears all reactions.
 async fn set_message_reaction(
     client: &reqwest::Client,
@@ -639,6 +903,39 @@ impl BotApi for TelegramBotApi {
     }
 }
 
+/// Live Telegram surface for the reply streamer, bound to one chat: sends and
+/// edits the answer and tool-status preview bubbles. Errors are logged and
+/// reported to the streamer (via `None`/`EditResult::Failed`) so a failed edit
+/// falls back to a fresh send and never blocks the final answer.
+struct TelegramStreamApi {
+    client: reqwest::Client,
+    base: String,
+    chat_id: i64,
+}
+
+#[async_trait]
+impl StreamApi for TelegramStreamApi {
+    async fn send(&self, text: &str) -> Option<i64> {
+        match send_message_id(&self.client, &self.base, self.chat_id, text).await {
+            Ok(id) => Some(id),
+            Err(err) => {
+                tracing::warn!(error = %err, "telegram stream send failed");
+                None
+            }
+        }
+    }
+
+    async fn edit(&self, message_id: i64, text: &str) -> EditResult {
+        match edit_message_text(&self.client, &self.base, self.chat_id, message_id, text).await {
+            Ok(()) => EditResult::Ok,
+            Err(err) => {
+                tracing::warn!(error = %err, "telegram stream edit failed");
+                EditResult::Failed
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +960,34 @@ mod tests {
         ));
         assert!(is_parse_error("Bad Request: can't parse message text"));
         assert!(!is_parse_error("Bad Request: chat not found"));
+    }
+
+    #[test]
+    fn finalize_without_bubble_sends_everything_fresh() {
+        // No streamed preview: the whole reply is delivered via fresh sends,
+        // regardless of chunk count.
+        assert_eq!(plan_finalize(None, 1), FinalizePlan::SendAll);
+        assert_eq!(plan_finalize(None, 3), FinalizePlan::SendAll);
+    }
+
+    #[test]
+    fn finalize_with_bubble_reuses_it_for_first_chunk() {
+        // A streamed preview exists: it is edited to the first chunk (never
+        // left stale beside a fresh full send), and any remaining chunks follow.
+        assert_eq!(
+            plan_finalize(Some(42), 1),
+            FinalizePlan::EditThenSendRest { msg_id: 42 }
+        );
+        assert_eq!(
+            plan_finalize(Some(42), 5),
+            FinalizePlan::EditThenSendRest { msg_id: 42 },
+            "multi-chunk reply still reuses the preview bubble, no duplicated head"
+        );
+    }
+
+    #[test]
+    fn finalize_with_bubble_but_no_chunks_is_noop() {
+        assert_eq!(plan_finalize(Some(42), 0), FinalizePlan::Empty);
     }
 
     #[test]
