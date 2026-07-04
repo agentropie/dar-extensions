@@ -112,7 +112,7 @@ fn is_expired(idle_minutes: u64, last_inbound: u64, now: u64) -> bool {
     if idle_minutes == 0 {
         return false;
     }
-    now.saturating_sub(last_inbound) >= idle_minutes * 60
+    now.saturating_sub(last_inbound) >= idle_minutes.saturating_mul(60)
 }
 
 /// Per-chat session store managing append-only generations under a chat dir.
@@ -156,6 +156,43 @@ impl SessionStore {
         self.chat_dir.join(generation)
     }
 
+    /// Detect a pre-generation (legacy) layout: the chat dir exists and holds
+    /// session data written directly under `<chat_id>/`, with no `current.json`
+    /// pointer. Returns the legacy entries (everything but the pointer) so they
+    /// can be adopted into a generation instead of being silently orphaned.
+    fn legacy_entries(&self) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(&self.chat_dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().is_none_or(|n| n != "current.json"))
+            .collect()
+    }
+
+    /// Adopt a legacy (pre-generation) session directory on first upgrade: move
+    /// the existing session data into a fresh generation and write a pointer so
+    /// prior Telegram context is preserved instead of silently dropped. Returns
+    /// the adopted generation's session directory. Only called when no pointer
+    /// exists yet but legacy data is present.
+    fn migrate_legacy(&self, entries: Vec<PathBuf>, now: u64) -> std::io::Result<PathBuf> {
+        let generation = format!("{now}-{}", short_suffix());
+        let dir = self.generation_dir(&generation);
+        std::fs::create_dir_all(&dir)?;
+        for src in entries {
+            let Some(name) = src.file_name() else {
+                continue;
+            };
+            std::fs::rename(&src, dir.join(name))?;
+        }
+        self.write_pointer(&Pointer {
+            generation,
+            last_inbound: now,
+        })?;
+        Ok(dir)
+    }
+
     /// Create a fresh generation directory and point the chat at it, stamping
     /// `last_inbound = now`. Returns the new generation's session directory.
     fn rotate(&self, now: u64) -> std::io::Result<PathBuf> {
@@ -196,8 +233,16 @@ impl SessionStore {
                 })
             }
             None => {
-                // First message for this chat: start a generation, no notice.
-                let session_dir = self.rotate(now)?;
+                // No pointer yet. If legacy (pre-generation) session data lives
+                // directly under the chat dir, adopt it into a generation so an
+                // upgrade preserves prior context; otherwise this is a brand new
+                // chat. Either way there is no expiry notice.
+                let legacy = self.legacy_entries();
+                let session_dir = if legacy.is_empty() {
+                    self.rotate(now)?
+                } else {
+                    self.migrate_legacy(legacy, now)?
+                };
                 Ok(Prepared {
                     session_dir,
                     rotated: false,
@@ -323,6 +368,45 @@ mod tests {
         let much_later = store.prepare_inbound(0, 1_000 + 10_000 * 60).unwrap();
         assert!(!much_later.rotated);
         assert_eq!(first.session_dir, much_later.session_dir);
+    }
+
+    #[test]
+    fn extreme_idle_minutes_does_not_overflow() {
+        // idle_minutes * 60 would overflow u64; saturating_mul must clamp so the
+        // session simply never expires rather than panicking on debug builds.
+        assert!(!is_expired(u64::MAX, 0, u64::MAX - 1));
+    }
+
+    #[test]
+    fn legacy_layout_is_migrated_preserving_context_on_upgrade() {
+        let root = tmp();
+        let chat_id = 4242;
+        // Simulate a pre-upgrade install: session data written directly under
+        // data/telegram/sessions/<chat_id>/ with no current.json pointer.
+        let legacy_dir = root.join(chat_id.to_string());
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_file = legacy_dir.join("session.json");
+        std::fs::write(&legacy_file, "prior context").unwrap();
+
+        let store = SessionStore::new(&root, chat_id);
+        let prepared = store.prepare_inbound(360, 5_000).unwrap();
+
+        // No expiry notice on upgrade, and the prior context is preserved inside
+        // the adopted generation rather than orphaned or dropped.
+        assert!(!prepared.rotated, "upgrade must not notice-expire");
+        assert_ne!(prepared.session_dir, legacy_dir);
+        let migrated = prepared.session_dir.join("session.json");
+        assert!(migrated.is_file(), "legacy session data must be adopted");
+        assert_eq!(std::fs::read_to_string(&migrated).unwrap(), "prior context");
+        assert!(
+            !legacy_file.exists(),
+            "legacy data is moved, not duplicated"
+        );
+
+        // The next inbound reuses the adopted generation, still no notice.
+        let again = store.prepare_inbound(360, 5_060).unwrap();
+        assert!(!again.rotated);
+        assert_eq!(prepared.session_dir, again.session_dir);
     }
 
     #[test]
