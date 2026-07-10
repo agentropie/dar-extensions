@@ -24,9 +24,14 @@ use tokio::sync::mpsc;
 
 mod ack;
 mod markdown;
+mod session;
 mod stream;
 use ack::{AckGuard, BotApi};
 use markdown::{render_chunks, Chunk, ParseMode};
+use session::{
+    parse_reset_command, SessionStore, SessionsConfig, SystemTime, TimeSource, EXPIRED_NOTICE,
+    RESET_REPLY,
+};
 use stream::{EditResult, LiveTurn, RealClock, StreamApi};
 /// Long-poll timeout (seconds) the Telegram server holds an empty `getUpdates`.
 const POLL_TIMEOUT_SECS: u64 = 30;
@@ -40,6 +45,8 @@ struct TelegramConfig {
     allowed_users: Vec<i64>,
     /// Chat backend service id to drive; defaults to the stock "pi" backend.
     backend: Option<String>,
+    /// Telegram session lifecycle controls (idle expiry).
+    sessions: SessionsConfig,
 }
 
 pub struct TelegramExtension;
@@ -340,6 +347,7 @@ async fn run(
     });
     let mut offset: i64 = 0;
     let mut sessions: HashMap<i64, ChatConn> = HashMap::new();
+    let clock = SystemTime;
 
     dar_extension_sdk::log::event(
         "-",
@@ -389,6 +397,58 @@ async fn run(
                             user_id.map(|u| u.to_string()).unwrap_or_else(|| "?".into()),
                         ),
                     );
+                    let store = SessionStore::new(session_dir, chat_id);
+
+                    // `/new` and `/reset` are handled entirely by the extension
+                    // before agent dispatch: rotate to a fresh generation, drop
+                    // any live in-memory session, reply, and do not run a turn.
+                    if parse_reset_command(&text).is_some() {
+                        match store.reset(clock.unix_secs()) {
+                            Ok(_) => {
+                                sessions.remove(&chat_id);
+                                let _ =
+                                    send_message(&client, &base, chat_id, RESET_REPLY).await;
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "telegram session reset failed");
+                                let _ = send_message(
+                                    &client,
+                                    &base,
+                                    chat_id,
+                                    "Failed to reset session.",
+                                )
+                                .await;
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Otherwise prepare the chat: idle expiry rotates to a fresh
+                    // generation (and flags the notice) based on the last
+                    // inbound time; else the live generation is reused.
+                    let prepared =
+                        match store.prepare_inbound(cfg.sessions.idle_minutes, clock.unix_secs())
+                        {
+                            Ok(prepared) => prepared,
+                            Err(err) => {
+                                tracing::warn!(error = %err, "telegram session prepare failed");
+                                let _ = send_message(
+                                    &client,
+                                    &base,
+                                    chat_id,
+                                    "Failed to prepare session.",
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
+                    if prepared.rotated {
+                        // Stale session: drop the live one and warn the user
+                        // before the fresh turn produces its reply.
+                        sessions.remove(&chat_id);
+                        let _ = send_message(&client, &base, chat_id, EXPIRED_NOTICE).await;
+                    }
+
                     // Acknowledge the moment the message is picked up: the guard
                     // adds the 👀 reaction + keeps typing alive, and guarantees
                     // both clear on drop regardless of how the turn ends.
@@ -403,7 +463,7 @@ async fn run(
                         ctx,
                         shutdown,
                         &mut sessions,
-                        session_dir,
+                        &prepared.session_dir,
                         cfg.backend.as_deref(),
                         chat_id,
                         text,
@@ -441,21 +501,20 @@ async fn run_turn(
     ctx: &StartCtx,
     shutdown: &mut ShutdownToken,
     sessions: &mut HashMap<i64, ChatConn>,
-    base_dir: &Path,
+    session_dir: &Path,
     configured: Option<&str>,
     chat_id: i64,
     text: String,
     stream_api: &dyn StreamApi,
 ) -> TurnOutcome {
     if let std::collections::hash_map::Entry::Vacant(slot) = sessions.entry(chat_id) {
-        let dir = base_dir.join(chat_id.to_string());
-        if let Err(err) = std::fs::create_dir_all(&dir) {
+        if let Err(err) = std::fs::create_dir_all(session_dir) {
             return TurnOutcome {
                 reply: format!("Failed to create session dir: {err}"),
                 answer_msg: None,
             };
         }
-        match open_session(ctx, &dir, configured).await {
+        match open_session(ctx, session_dir, configured).await {
             Ok(conn) => {
                 slot.insert(conn);
             }

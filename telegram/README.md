@@ -8,7 +8,9 @@ A standalone dar extension that makes an agent reachable for chat over a Telegra
 - For each text message, opens (or reuses) a `ChatBackend` chat session keyed by Telegram chat id and sends the message as a turn.
 - Streams the reply live while the turn runs: the first assistant text creates one **answer bubble** that is then edited in place (rate-limited to ~1s / 200 chars) instead of spamming a message per token. A separate **tool-status bubble** shows the tool currently running as `name · short target` (e.g. `read · /etc/hosts`), never the full argument JSON. At each tool boundary the visible answer text is flushed first, so a long or stuck tool run can't hide text the assistant already produced. On turn finish the status bubble collapses to a summary like `Used 3 tools: read, bash, edit`, and the answer bubble is finalized with the rich-markdown reply (falling back to a chunked `sendMessage` for multi-part replies, still capped at 4096 chars). Streaming is UI-only and never alters the agent's conversation history; a failed edit falls back to a fresh send so the final answer always lands.
 - Model/provider come from the orchestrator's `RunSnapshot` when linked; otherwise the backend defaults apply.
-- One session per chat = independent conversation context, persisted under `<agent>/data/telegram/sessions/<chat_id>/`.
+- One session per chat = independent conversation context, persisted append-only by generation under `<agent>/data/telegram/sessions/<chat_id>/<generation_id>/`, with a `current.json` pointer tracking the live generation and last inbound time.
+- Idle expiry: after `sessions.idle_minutes` of no inbound messages (default 360; `0` disables), the next message rotates to a fresh generation and the user first sees `Previous session expired; starting fresh.` before the reply. Old generation directories are kept for audit/debug.
+- `/new` and `/reset` (also `/new@bot` / `/reset@bot` for group chats) start a fresh session and reply `Context cleared, new session started.` without running the agent. Only the exact command token resets — `/new please` is treated as a normal message.
 - Bundles the stock `pi` chat backend and registers it under its own id (`telegram-pi`), so the channel works under the default `foreground: logs` without requiring `foreground: tui`. When the orchestrator runner's backend is registered as a `dyn ChatBackend` it is used instead; `telegram-pi` is the final fallback.
 
 ## Install
@@ -34,6 +36,10 @@ extensions:
     # else use the bundled `telegram-pi` backend. An unregistered id falls back to
     # `telegram-pi` automatically.
     # backend: telegram-pi
+    # optional: Telegram session lifecycle
+    sessions:
+      # idle minutes before a chat's context expires; 0 disables idle expiry
+      idle_minutes: 360
 ```
 
 Alternatively, put `TELEGRAM_BOT_TOKEN=...` in the agent's `.env`. Get your numeric user id from @userinfobot.
@@ -45,6 +51,7 @@ Alternatively, put `TELEGRAM_BOT_TOKEN=...` in the agent's `.env`. Get your nume
 | `bot_token` | string | none | BotFather token (or `TELEGRAM_BOT_TOKEN` env) |
 | `allowed_users` | list of int | `[]` (everyone) | whitelist of Telegram user ids |
 | `backend` | string | auto-follow orchestrator runner, else `telegram-pi` | cap-chat backend service id to drive; a configured-but-unregistered id falls back to `telegram-pi` |
+| `sessions.idle_minutes` | int | `360` | idle minutes before a chat's context expires and rotates to a fresh generation; `0` disables idle expiry |
 
 ## Limitations
 

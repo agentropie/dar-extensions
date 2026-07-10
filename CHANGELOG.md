@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- **telegram:** Telegram-only session lifecycle: idle expiry
+  (`extensions.telegram.sessions.idle_minutes`, default 360, `0` disables)
+  rotates a stale chat to a fresh session generation on the next message and
+  prefixes the reply with `Previous session expired; starting fresh.`. `/new`
+  and `/reset` (and their `@bot` forms) start a fresh session with
+  `Context cleared, new session started.` and skip the agent turn. Sessions are
+  stored append-only by generation under `sessions/<chat_id>/<generation_id>/`;
+  old generations are retained for audit/debug. (ALG-347)
+
+### Fixed
+
+- **telegram:** upgrading from the pre-generation session layout
+  (`sessions/<chat_id>/` directly) now migrates existing session data into a
+  generation instead of silently dropping prior chat context. (ALG-347)
+
 ## [0.3.1] - 2026-07-02
 
 ### Added
