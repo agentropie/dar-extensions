@@ -277,6 +277,7 @@ pub async fn run(ctx: StartCtx, cfg: SlackConfig) -> Result<()> {
             if !accepted_message(&cfg, &identity, &patterns, &incoming) {
                 continue;
             }
+            dar_extension_sdk::log::event("-", "slack", &accepted_message_log(&incoming));
             if message_command(&incoming, &identity, &patterns) == Some(Command::Stop) {
                 let response = if stop_active_session(&mut workers, &incoming).await {
                     commands::reply(Command::Stop)
@@ -453,6 +454,27 @@ fn accepted_message(
         route(cfg, patterns, &message),
         RouteDecision::Dispatch { .. }
     )
+}
+
+fn accepted_message_log(incoming: &Incoming) -> String {
+    format!(
+        "message from channel {} (user {})",
+        safe_slack_identifier(&incoming.channel_id),
+        safe_slack_identifier(&incoming.sender_id),
+    )
+}
+
+fn safe_slack_identifier(identifier: &str) -> String {
+    let safe: String = identifier
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        .take(128)
+        .collect();
+    if safe.is_empty() {
+        "?".into()
+    } else {
+        safe
+    }
 }
 
 fn work_key(work: &Work) -> String {
@@ -1464,6 +1486,25 @@ mod tests {
                 &[]
             ),
             Some(Command::Stop)
+        );
+    }
+
+    #[test]
+    fn accepted_message_log_uses_only_safe_identifiers() {
+        let incoming = Incoming {
+            team_id: "T1".into(),
+            channel_id: "D1\nsecret".into(),
+            sender_id: "U1\tuser".into(),
+            text: "message content must not appear".into(),
+            ts: "1.0".into(),
+            thread_ts: None,
+            kind: ConversationKind::DirectMessage,
+            files: vec![],
+            is_reaction: false,
+        };
+        assert_eq!(
+            accepted_message_log(&incoming),
+            "message from channel D1secret (user U1user)"
         );
     }
 
