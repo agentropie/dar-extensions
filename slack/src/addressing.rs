@@ -190,22 +190,58 @@ mod tests {
         assert_eq!(route(&config, &[], &message), RouteDecision::Ignore);
     }
 
+    fn direct_message<'a>(text: &'a str, thread_ts: Option<&'a str>) -> InboundMessage<'a> {
+        InboundMessage {
+            kind: ConversationKind::DirectMessage,
+            ..channel(text, thread_ts)
+        }
+    }
+
     #[test]
-    fn dm_thread_policy_is_applied() {
+    fn dm_default_routes_root_directly_and_follows_existing_thread() {
         let mut config = SlackConfig::default();
         config.dm.enabled = true;
-        config.dm.thread_policy = ThreadPolicy::Never;
-        let message = InboundMessage {
-            kind: ConversationKind::DirectMessage,
-            ..channel("hello", Some("9.0"))
-        };
+
         assert_eq!(
-            route(&config, &[], &message),
+            route(&config, &[], &direct_message("hello", None)),
             RouteDecision::Dispatch {
                 text: "hello".into(),
-                reply_thread_ts: None
+                reply_thread_ts: None,
             }
         );
+        assert_eq!(
+            route(&config, &[], &direct_message("hello", Some("9.0"))),
+            RouteDecision::Dispatch {
+                text: "hello".into(),
+                reply_thread_ts: Some("9.0".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn dm_explicit_thread_policies_control_reply_placement() {
+        for (policy, root, thread) in [
+            (ThreadPolicy::Always, Some("1.2"), Some("9.0")),
+            (ThreadPolicy::Never, None, None),
+        ] {
+            let mut config = SlackConfig::default();
+            config.dm.enabled = true;
+            config.dm.thread_policy = policy;
+            assert_eq!(
+                route(&config, &[], &direct_message("hello", None)),
+                RouteDecision::Dispatch {
+                    text: "hello".into(),
+                    reply_thread_ts: root.map(str::to_owned),
+                }
+            );
+            assert_eq!(
+                route(&config, &[], &direct_message("hello", Some("9.0"))),
+                RouteDecision::Dispatch {
+                    text: "hello".into(),
+                    reply_thread_ts: thread.map(str::to_owned),
+                }
+            );
+        }
     }
 
     #[test]

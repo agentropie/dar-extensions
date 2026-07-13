@@ -59,13 +59,23 @@ impl Default for ChannelConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct DirectMessageConfig {
     pub enabled: bool,
     #[serde(alias = "allowFrom")]
     pub users: Vec<String>,
     pub thread_policy: ThreadPolicy,
+}
+
+impl Default for DirectMessageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            users: Vec::new(),
+            thread_policy: ThreadPolicy::Follow,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -162,6 +172,19 @@ mod tests {
         assert!(config.channels.is_empty());
         assert!(!config.show_thinking);
         assert_eq!(ChannelConfig::default().thread_policy, ThreadPolicy::Always);
+        assert_eq!(
+            DirectMessageConfig::default().thread_policy,
+            ThreadPolicy::Follow
+        );
+    }
+
+    #[test]
+    fn dm_thread_policy_defaults_to_follow_when_deserialized() {
+        let config: SlackConfig = serde_json::from_value(serde_json::json!({
+            "dm": { "enabled": true }
+        }))
+        .unwrap();
+        assert_eq!(config.dm.thread_policy, ThreadPolicy::Follow);
     }
 
     #[test]

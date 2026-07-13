@@ -12,12 +12,12 @@ extensions:
     channels:
       C0123456789:
         requireMention: true
-        threadPolicy: always # always | never | follow
+        threadPolicy: always # always | never | follow; default always
         users: []
     dm:
       enabled: false
       users: []
-      threadPolicy: always # always | never | follow
+      threadPolicy: follow # always | never | follow; default follow
     showThinking: true
     deleteThinkingOnComplete: true
     historyLimit: 20

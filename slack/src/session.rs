@@ -97,6 +97,24 @@ mod tests {
     }
 
     #[test]
+    fn separates_dm_root_and_thread_sessions() {
+        let root = ConversationKey::from_message(&message(
+            ConversationKind::DirectMessage,
+            "U1",
+            "D1",
+            None,
+        ));
+        let thread = ConversationKey::from_message(&message(
+            ConversationKind::DirectMessage,
+            "U1",
+            "D1",
+            Some("1.1"),
+        ));
+        assert_eq!(root.as_str(), "workspace:T/../unsafe:dm:U1:root");
+        assert_eq!(thread.as_str(), "workspace:T/../unsafe:dm:U1:thread:1.1");
+    }
+
+    #[test]
     fn directory_cannot_contain_slack_path_segments() {
         let key = ConversationKey::from_message(&message(
             ConversationKind::DirectMessage,
