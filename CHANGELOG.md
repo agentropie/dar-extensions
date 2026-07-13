@@ -4,6 +4,9 @@
 
 ### Added
 
+- **irc, slack, telegram:** now declare `agent_singleton`, so a non-default
+  `dar run --workflow` process skips them — the default-workflow process
+  owns the external connection.
 - **telegram:** Telegram-only session lifecycle: idle expiry
   (`extensions.telegram.sessions.idle_minutes`, default 360, `0` disables)
   rotates a stale chat to a fresh session generation on the next message and

@@ -89,6 +89,10 @@ impl Extension for IrcExtension {
         })
     }
 
+    fn agent_singleton(&self) -> bool {
+        true
+    }
+
     fn start<'a>(&'a self, ctx: StartCtx) -> dar_extension_sdk::BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let cfg = parse_config(&ctx.config, self.id())?;

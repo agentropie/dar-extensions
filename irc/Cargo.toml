@@ -26,3 +26,7 @@ tracing = "0.1"
 tokio = { version = "1.43", features = ["test-util"] }
 
 [workspace]
+
+# Temporary until a dar-extension-sdk with `agent_singleton` is published.
+[patch.crates-io]
+dar-extension-sdk = { path = "/Users/thinh/code/agentropy/dar/crates/extension-sdk" }
