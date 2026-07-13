@@ -1,0 +1,24 @@
+[package]
+name = "slack"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+
+[package.metadata.dar]
+factory = "slack::extension"
+requires_stock = ["chat-pi"]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+dar-extension-sdk = { path = "/Users/thinh/code/agentropy/dar/crates/extension-sdk" }
+futures-util = "0.3"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "io-util", "net", "rt", "sync", "test-util", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+url = "2"
+
+[workspace]
