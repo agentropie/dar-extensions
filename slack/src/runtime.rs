@@ -1076,6 +1076,9 @@ async fn run_turn(
     let mut artifacts = Vec::new();
     let result = loop {
         tokio::select! {
+            _ = live_answer.wait_for_flush() => {
+                live_answer.flush_if_due(&answer).await;
+            }
             _ = shutdown.cancelled() => {
                 let _ = conn.session.abort().await;
                 break (answer, true, false);

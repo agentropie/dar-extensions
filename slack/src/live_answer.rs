@@ -1,3 +1,8 @@
+use std::{
+    future,
+    time::{Duration, Instant},
+};
+
 use crate::{
     api::{SentMessage, SlackClient},
     mrkdwn,
@@ -43,6 +48,25 @@ impl LiveAnswer {
         self.flush(answer).await;
     }
 
+    /// Wait until a coalesced update is due. With no pending update this never
+    /// completes, so callers can use it directly as a `select!` branch.
+    pub async fn wait_for_flush(&self) {
+        let Some(last_update) = self.dirty.then_some(self.last_update).flatten() else {
+            future::pending::<()>().await;
+            return;
+        };
+        tokio::time::sleep(
+            (last_update + UPDATE_INTERVAL).saturating_duration_since(Instant::now()),
+        )
+        .await;
+    }
+
+    pub async fn flush_if_due(&mut self, answer: &str) {
+        if self.dirty {
+            self.flush(answer).await;
+        }
+    }
+
     async fn flush(&mut self, answer: &str) {
         let chunks = mrkdwn::chunk(&mrkdwn::render(answer), MAX_MESSAGE_BYTES);
         for (index, chunk) in chunks.iter().enumerate() {
@@ -54,6 +78,7 @@ impl LiveAnswer {
                     .is_err()
                 {
                     self.failed = true;
+                    self.dirty = false;
                     return;
                 }
             } else {
@@ -67,6 +92,7 @@ impl LiveAnswer {
                         // Do not post a later chunk before this one. Retrying
                         // on the next flush preserves the chunk/message map.
                         self.failed = true;
+                        self.dirty = false;
                         return;
                     }
                 }
@@ -77,7 +103,7 @@ impl LiveAnswer {
     }
 
     pub async fn finish(mut self, answer: &str) -> (bool, bool) {
-        if !self.messages.is_empty() {
+        if self.dirty || (self.failed && !self.messages.is_empty()) {
             self.flush(answer).await;
         }
         (!self.messages.is_empty(), !self.failed)
@@ -126,8 +152,8 @@ mod tests {
         assert_eq!(chunks.concat(), answer);
     }
 
-    #[tokio::test]
-    async fn posts_first_delta_then_flushes_coalesced_update_in_thread() {
+    #[tokio::test(start_paused = true)]
+    async fn posts_first_delta_then_flushes_coalesced_update_before_finish() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -158,9 +184,19 @@ mod tests {
         answer.push("first").await;
         answer.push("first second").await;
         assert_eq!(answer.messages.len(), 1);
+        {
+            let wait = answer.wait_for_flush();
+            tokio::pin!(wait);
+            tokio::select! {
+                _ = &mut wait => panic!("coalesced update flushed too early"),
+                _ = tokio::time::sleep(Duration::ZERO) => {}
+            }
+            tokio::time::advance(UPDATE_INTERVAL).await;
+            wait.await;
+        }
+        answer.flush_if_due("first second").await;
         let (displayed, succeeded) = answer.finish("first second").await;
         assert!(displayed && succeeded);
         server.await.unwrap();
     }
 }
-use std::time::{Duration, Instant};
