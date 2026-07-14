@@ -9,6 +9,7 @@ pub mod attachments;
 pub mod commands;
 pub mod config;
 pub mod history;
+pub mod live_answer;
 pub mod mrkdwn;
 pub mod runtime;
 pub mod session;

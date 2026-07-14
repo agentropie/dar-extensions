@@ -18,6 +18,9 @@
 
 ### Fixed
 
+- **slack:** assistant replies now appear as the runner emits them instead of
+  arriving together after a turn completes.
+
 - **telegram:** upgrading from the pre-generation session layout
   (`sessions/<chat_id>/` directly) now migrates existing session data into a
   generation instead of silently dropping prior chat context. (ALG-347)
