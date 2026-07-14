@@ -152,7 +152,7 @@ mod tests {
         assert_eq!(chunks.concat(), answer);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn posts_first_delta_then_flushes_coalesced_update_before_finish() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -184,6 +184,7 @@ mod tests {
         answer.push("first").await;
         answer.push("first second").await;
         assert_eq!(answer.messages.len(), 1);
+        tokio::time::pause();
         {
             let wait = answer.wait_for_flush();
             tokio::pin!(wait);
@@ -194,6 +195,7 @@ mod tests {
             tokio::time::advance(UPDATE_INTERVAL).await;
             wait.await;
         }
+        tokio::time::resume();
         answer.flush_if_due("first second").await;
         let (displayed, succeeded) = answer.finish("first second").await;
         assert!(displayed && succeeded);
