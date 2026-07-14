@@ -608,7 +608,12 @@ fn incoming(envelope: &Envelope) -> Option<Incoming> {
     let event_type = event.get("type")?.as_str()?;
     match event_type {
         "message" | "app_mention"
-            if event.get("subtype").is_none() && event.get("bot_id").is_none() => {}
+            if event.get("bot_id").is_none()
+                && (event.get("subtype").is_none()
+                    || matches!(
+                        event.get("subtype"),
+                        Some(serde_json::Value::String(subtype)) if subtype == "file_share"
+                    )) => {}
         "reaction_added" | "reaction_removed"
             if event.get("item")?.get("type")?.as_str()? == "message" =>
         {
@@ -907,6 +912,7 @@ fn inbound<'a>(incoming: &'a Incoming, bot_user_id: &'a str) -> InboundMessage<'
         channel_id: &incoming.channel_id,
         sender_id: &incoming.sender_id,
         text: &incoming.text,
+        has_files: !incoming.files.is_empty(),
         bot_user_id: Some(bot_user_id),
         thread_ts: incoming.thread_ts.as_deref(),
         message_ts: &incoming.ts,
@@ -1350,9 +1356,23 @@ mod tests {
         assert_eq!(event.team_id, "T1");
     }
     #[test]
-    fn filters_bot_messages_and_reads_files() {
-        let envelope: Envelope = serde_json::from_value(serde_json::json!({"type":"events_api","payload":{"event":{"type":"message","channel":"D1","user":"U1","ts":"1.2","files":[{"name":"x.png","mimetype":"image/png","url_private_download":"https://files.slack.com/x"}]}}})).unwrap();
-        assert_eq!(incoming(&envelope).unwrap().files.len(), 1);
+    fn file_share_messages_and_app_mentions_parse_files_but_reject_bots_and_other_subtypes() {
+        for event_type in ["message", "app_mention"] {
+            let envelope: Envelope = serde_json::from_value(serde_json::json!({"type":"events_api","payload":{"event":{"type":event_type,"subtype":"file_share","channel":"D1","user":"U1","ts":"1.2","files":[{"name":"x.png","mimetype":"image/png","url_private_download":"https://files.slack.com/x"}]}}})).unwrap();
+            assert_eq!(incoming(&envelope).unwrap().files.len(), 1);
+        }
+
+        for subtype in [
+            serde_json::json!("channel_join"),
+            serde_json::json!(null),
+            serde_json::json!(true),
+        ] {
+            let invalid_subtype: Envelope = serde_json::from_value(serde_json::json!({"type":"events_api","payload":{"event":{"type":"message","subtype":subtype,"channel":"D1","user":"U1","ts":"1.2"}}})).unwrap();
+            assert!(incoming(&invalid_subtype).is_none());
+        }
+
+        let bot_message: Envelope = serde_json::from_value(serde_json::json!({"type":"events_api","payload":{"event":{"type":"message","subtype":"file_share","bot_id":"B1","channel":"D1","user":"U1","ts":"1.2"}}})).unwrap();
+        assert!(incoming(&bot_message).is_none());
     }
 
     #[test]
@@ -1416,6 +1436,7 @@ mod tests {
             channel_id: "C1",
             sender_id: "U1",
             text: "hello",
+            has_files: false,
             bot_user_id: Some("B1"),
             thread_ts: None,
             message_ts: "1.1",

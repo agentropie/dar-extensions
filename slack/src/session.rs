@@ -55,6 +55,7 @@ mod tests {
             channel_id: channel,
             sender_id: sender,
             text: "x",
+            has_files: false,
             bot_user_id: None,
             thread_ts: thread,
             message_ts: "1",

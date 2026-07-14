@@ -14,6 +14,7 @@ pub struct InboundMessage<'a> {
     pub channel_id: &'a str,
     pub sender_id: &'a str,
     pub text: &'a str,
+    pub has_files: bool,
     pub bot_user_id: Option<&'a str>,
     pub thread_ts: Option<&'a str>,
     pub message_ts: &'a str,
@@ -75,7 +76,10 @@ fn route_channel(
     }
 
     let (mentioned, text) = strip_mention(message.text, message.bot_user_id, patterns);
-    if channel.require_mention && !mentioned {
+    if channel.require_mention
+        && !mentioned
+        && !(message.has_files && message.text.trim().is_empty())
+    {
         return RouteDecision::Ignore;
     }
 
@@ -141,6 +145,7 @@ mod tests {
             channel_id: "C1",
             sender_id: "U1",
             text,
+            has_files: false,
             bot_user_id: Some("B1"),
             thread_ts,
             message_ts: "1.2",
@@ -160,6 +165,26 @@ mod tests {
                 text: "hello".into(),
                 reply_thread_ts: Some("1.2".into())
             }
+        );
+    }
+
+    #[test]
+    fn attachment_only_channel_bypasses_mention_requirement() {
+        let mut attachment = channel("", None);
+        attachment.has_files = true;
+        assert!(matches!(
+            route(&channel_config(), &[], &attachment),
+            RouteDecision::Dispatch { text, .. } if text.is_empty()
+        ));
+        assert_eq!(
+            route(&channel_config(), &[], &channel("", None)),
+            RouteDecision::Ignore
+        );
+        let mut captioned_attachment = channel("caption", None);
+        captioned_attachment.has_files = true;
+        assert_eq!(
+            route(&channel_config(), &[], &captioned_attachment),
+            RouteDecision::Ignore
         );
     }
 
