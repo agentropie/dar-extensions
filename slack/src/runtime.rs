@@ -25,6 +25,7 @@ use crate::{
     commands::{self, Command},
     config::SlackConfig,
     history::History,
+    live_answer::LiveAnswer,
     mrkdwn,
     session::ConversationKey,
     thinking::Thinking,
@@ -836,39 +837,52 @@ async fn handle_message(
             }
         }
     }
-    let (mut answer, artifacts, closed, agent_succeeded) = match run_turn(
-        sessions.get_mut(&key_string).expect("session inserted"),
-        prompt,
-        &mut env.ctx.shutdown.clone(),
-        control_rx,
-        TurnDisplay {
-            client: env.client.clone(),
-            channel: incoming.channel_id.clone(),
-            thread_ts: reply_thread_ts.clone(),
-            show_thinking: env.cfg.show_thinking,
-            delete_thinking_on_complete: env.cfg.delete_thinking_on_complete,
-        },
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => ("Agent response failed.".into(), Vec::new(), true, false),
-    };
+    let (mut answer, artifacts, closed, agent_succeeded, live_displayed, live_succeeded) =
+        match run_turn(
+            sessions.get_mut(&key_string).expect("session inserted"),
+            prompt,
+            &mut env.ctx.shutdown.clone(),
+            control_rx,
+            TurnDisplay {
+                client: env.client.clone(),
+                channel: incoming.channel_id.clone(),
+                thread_ts: reply_thread_ts.clone(),
+                show_thinking: env.cfg.show_thinking,
+                delete_thinking_on_complete: env.cfg.delete_thinking_on_complete,
+            },
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => (
+                "Agent response failed.".into(),
+                Vec::new(),
+                true,
+                false,
+                false,
+                true,
+            ),
+        };
     if answer.trim().is_empty() {
         answer = "Agent completed without a text response.".into();
     }
     if closed {
         sessions.remove(&key_string);
     }
-    let mut reply_succeeded = true;
-    for chunk in mrkdwn::chunk(&mrkdwn::render(&answer), 3900) {
-        if env
-            .client
-            .post_message(&incoming.channel_id, &chunk, reply_thread_ts.as_deref())
-            .await
-            .is_err()
-        {
-            reply_succeeded = false;
+    // A live display already represents this answer. A live Slack failure is a
+    // failed reply even if the fallback post below later succeeds, so artifact
+    // delivery and history clearing keep their existing all-or-nothing gate.
+    let mut reply_succeeded = live_succeeded;
+    if !live_displayed {
+        for chunk in mrkdwn::chunk(&mrkdwn::render(&answer), 3900) {
+            if env
+                .client
+                .post_message(&incoming.channel_id, &chunk, reply_thread_ts.as_deref())
+                .await
+                .is_err()
+            {
+                reply_succeeded = false;
+            }
         }
     }
     if agent_succeeded && reply_succeeded {
@@ -1038,15 +1052,20 @@ async fn run_turn(
     shutdown: &mut dar_extension_sdk::ShutdownToken,
     control_rx: &mut mpsc::Receiver<Control>,
     display: TurnDisplay,
-) -> Result<(String, Vec<ArtifactReady>, bool, bool)> {
+) -> Result<(String, Vec<ArtifactReady>, bool, bool, bool, bool)> {
     let thinking = display.show_thinking.then(|| {
         Thinking::start(
-            display.client,
-            display.channel,
-            display.thread_ts,
+            display.client.clone(),
+            display.channel.clone(),
+            display.thread_ts.clone(),
             display.delete_thinking_on_complete,
         )
     });
+    let mut live_answer = LiveAnswer::new(
+        display.client.clone(),
+        display.channel.clone(),
+        display.thread_ts.clone(),
+    );
     if let Err(error) = conn.session.send_turn(prompt).await {
         if let Some(thinking) = thinking {
             thinking.finish().await;
@@ -1071,7 +1090,10 @@ async fn run_turn(
                 append_artifact(&mut artifacts, artifact);
             },
             event = conn.rx.recv() => match event {
-                Some(ChatEvent::Delta { role: ChatRole::Assistant, text }) => answer.push_str(&text),
+                Some(ChatEvent::Delta { role: ChatRole::Assistant, text }) => {
+                    answer.push_str(&text);
+                    live_answer.push(&answer).await;
+                }
                 Some(ChatEvent::Delta { role: ChatRole::Thinking, text }) => {
                     if let Some(thinking) = &thinking { thinking.append(text); }
                 }
@@ -1092,7 +1114,15 @@ async fn run_turn(
     if let Some(thinking) = thinking {
         thinking.finish().await;
     }
-    Ok((result.0, artifacts, result.1, result.2))
+    let (live_displayed, live_succeeded) = live_answer.finish(&result.0).await;
+    Ok((
+        result.0,
+        artifacts,
+        result.1,
+        result.2,
+        live_displayed,
+        live_succeeded,
+    ))
 }
 
 fn append_artifact(artifacts: &mut Vec<ArtifactReady>, artifact: ArtifactReady) {
