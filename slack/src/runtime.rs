@@ -836,7 +836,7 @@ async fn handle_message(
             }
         }
     }
-    let (answer, artifacts, closed, agent_succeeded) = match run_turn(
+    let (mut answer, artifacts, closed, agent_succeeded) = match run_turn(
         sessions.get_mut(&key_string).expect("session inserted"),
         prompt,
         &mut env.ctx.shutdown.clone(),
@@ -854,6 +854,9 @@ async fn handle_message(
         Ok(result) => result,
         Err(_) => ("Agent response failed.".into(), Vec::new(), true, false),
     };
+    if answer.trim().is_empty() {
+        answer = "Agent completed without a text response.".into();
+    }
     if closed {
         sessions.remove(&key_string);
     }
@@ -1256,10 +1259,10 @@ mod tests {
     #[test]
     fn artifact_events_preserve_order_and_dedupe_id() {
         let value = serde_json::json!({"type":"resource_link","uri":"dar-artifact://00000000-0000-4000-8000-000000000001","name":"one.txt","bytes":1,"sha256":"a"});
-        let first = ArtifactReady::from_publish_resource("artifact.publish", &value).unwrap();
+        let first = ArtifactReady::from_publish_resource("artifact_publish", &value).unwrap();
         let mut value = value;
         value["name"] = serde_json::Value::String("duplicate.txt".into());
-        let duplicate = ArtifactReady::from_publish_resource("artifact.publish", &value).unwrap();
+        let duplicate = ArtifactReady::from_publish_resource("artifact_publish", &value).unwrap();
         let mut artifacts = Vec::new();
         append_artifact(&mut artifacts, first);
         append_artifact(&mut artifacts, duplicate);

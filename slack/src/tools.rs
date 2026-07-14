@@ -13,18 +13,18 @@ const MAX_RESULTS: usize = 200;
 pub fn specs() -> [ToolSpec; 3] {
     [
         ToolSpec::new(
-            "slack.send_message",
+            "slack_send_message",
             "Send a Slack message to an exact allowed channel or direct-message conversation.",
             json!({"type":"object","additionalProperties":false,"properties":{"channel":{"type":"string","minLength":1},"text":{"type":"string","minLength":1},"threadTs":{"type":"string"},"thread_ts":{"type":"string"}},"required":["channel","text"]}),
         )
         .writes(),
         ToolSpec::new(
-            "slack.list_users",
+            "slack_list_users",
             "List active Slack users visible to configured bot.",
             json!({"type":"object","additionalProperties":false,"properties":{"query":{"type":"string","maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":200}}}),
         ),
         ToolSpec::new(
-            "slack.list_channels",
+            "slack_list_channels",
             "List active Slack channels visible to configured bot.",
             json!({"type":"object","additionalProperties":false,"properties":{"query":{"type":"string","maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":200}}}),
         ),
@@ -72,7 +72,7 @@ impl SlackTool {
             .and_then(Value::as_str)
             .filter(|value| valid_id(value))
         else {
-            return Ok(invalid("slack.send_message requires Slack channel id"));
+            return Ok(invalid("slack_send_message requires Slack channel id"));
         };
         let Some(text) = args
             .get("text")
@@ -81,7 +81,7 @@ impl SlackTool {
             .filter(|value| !value.is_empty() && value.len() <= MAX_TEXT)
         else {
             return Ok(invalid(
-                "slack.send_message requires non-empty text up to 40000 bytes",
+                "slack_send_message requires non-empty text up to 40000 bytes",
             ));
         };
         let thread_ts = args
@@ -90,7 +90,7 @@ impl SlackTool {
             .and_then(Value::as_str);
         if thread_ts.is_some_and(|value| !valid_timestamp(value)) {
             return Ok(invalid(
-                "slack.send_message thread_ts must be Slack timestamp",
+                "slack_send_message thread_ts must be Slack timestamp",
             ));
         }
         let destination = if channel.starts_with('U') {
@@ -147,7 +147,7 @@ impl SlackTool {
                 "sent Slack message to {} at {}",
                 sent.channel, sent.ts
             ))),
-            None => Ok(invalid("slack.send_message requires non-empty text")),
+            None => Ok(invalid("slack_send_message requires non-empty text")),
         }
     }
 
@@ -213,4 +213,18 @@ fn outbound_allowed(config: &SlackConfig, channel: &str) -> bool {
         return config.dm.enabled && config.dm.users.is_empty();
     }
     config.channels.is_empty() || config.channels.contains_key(channel)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registered_tool_names_are_codex_compatible() {
+        for spec in specs() {
+            assert!(spec.name.chars().all(
+                |character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            ));
+        }
+    }
 }

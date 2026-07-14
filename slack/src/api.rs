@@ -29,11 +29,15 @@ impl std::error::Error for SlackError {}
 
 #[derive(Debug, Deserialize)]
 struct SlackEnvelope<T> {
+    #[serde(flatten)]
+    value: T,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackStatus {
     ok: bool,
     #[serde(default)]
     error: Option<String>,
-    #[serde(flatten)]
-    value: T,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -447,6 +451,12 @@ impl SlackClient {
     ) -> Result<T, SlackError> {
         let retry_after = retry_after(response.headers());
         let status = response.status();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("none")
+            .to_owned();
         let body = response.text().await.unwrap_or_default();
         if status == StatusCode::TOO_MANY_REQUESTS {
             return Err(SlackError::new("rate_limited", retry_after));
@@ -454,14 +464,35 @@ impl SlackClient {
         if !status.is_success() {
             return Err(SlackError::new("http_error", retry_after));
         }
-        let envelope: SlackEnvelope<T> = serde_json::from_str(&body)
-            .map_err(|_| SlackError::new("invalid_api_response", None))?;
-        if !envelope.ok {
+        let value: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
+            SlackError::new(
+                format!(
+                    "invalid_api_response_status_{}_type_{}_bytes_{}",
+                    status.as_u16(),
+                    sanitize(&content_type).chars().take(40).collect::<String>(),
+                    body.len()
+                ),
+                None,
+            )
+        })?;
+        let shape = value.as_object().map_or_else(
+            || "non_object".into(),
+            |object| {
+                let mut fields: Vec<_> = object.keys().map(String::as_str).collect();
+                fields.sort_unstable();
+                fields.join("_")
+            },
+        );
+        let status_value: SlackStatus = serde_json::from_value(value.clone())
+            .map_err(|_| SlackError::new(format!("invalid_api_shape_fields_{shape}"), None))?;
+        if !status_value.ok {
             return Err(SlackError::new(
-                envelope.error.unwrap_or_else(|| "unknown_error".into()),
+                status_value.error.unwrap_or_else(|| "unknown_error".into()),
                 retry_after,
             ));
         }
+        let envelope: SlackEnvelope<T> = serde_json::from_value(value)
+            .map_err(|_| SlackError::new(format!("invalid_api_shape_fields_{shape}"), None))?;
         Ok(envelope.value)
     }
 }
@@ -585,7 +616,7 @@ mod tests {
     }
     #[test]
     fn response_parsing_preserves_slack_error() {
-        let parsed: SlackEnvelope<Empty> =
+        let parsed: SlackStatus =
             serde_json::from_str(r#"{"ok":false,"error":"missing_scope"}"#).unwrap();
         assert!(!parsed.ok);
         assert_eq!(parsed.error.as_deref(), Some("missing_scope"));

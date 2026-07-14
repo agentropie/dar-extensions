@@ -55,7 +55,7 @@ must be created in app configuration, not this extension.
   This untrusted context is prefixed to each prompt; it does not reset DAR
   backend history. `clearHistoryAfterReply` clears it only after agent and Slack
   reply success.
-- Registers `slack.send_message`, `slack.list_users`, and `slack.list_channels`
+- Registers `slack_send_message`, `slack_list_users`, and `slack_list_channels`
   for normal agent and scheduled-job use. Sending renders Markdown as Slack mrkdwn
   and chunks long messages; `threadTs` replies in a thread (`thread_ts` accepted
   for compatibility). Listing accepts case-insensitive `query` filters.
@@ -64,9 +64,9 @@ must be created in app configuration, not this extension.
 
 Socket delivery and dedupe are currently best effort: reconnect/crash can lose
 in-memory session and duplicate suppression state. Generated files must be written under `data/artifact-exports/` then published with
-`artifact.publish`; verified artifacts upload to originating Slack channel/thread after
-successful agent response text. Enable DAR `tool-registry-host` so `artifact.publish`
-and artifact store service are registered. `slack.send_message` takes Slack
+`artifact_publish`; verified artifacts upload to originating Slack channel/thread after
+successful agent response text. Enable DAR `tool-registry-host` so `artifact_publish`
+and artifact store service are registered. `slack_send_message` takes Slack
 channel or DM conversation ID; direct-message creation from a user ID is not
 implemented. File downloads are capped at 25 MiB. Never place Slack tokens in
 agent config committed to source control.
