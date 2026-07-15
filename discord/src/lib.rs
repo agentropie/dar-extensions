@@ -11,6 +11,8 @@ use std::{path::Path, time::Duration};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 mod config;
+mod live_answer;
+mod markdown;
 mod session;
 pub fn extension() -> Box<dyn Extension> {
     Box::new(DiscordExtension)
@@ -100,41 +102,35 @@ async fn answer(
     let mut chat = backend.open(params, tx).await?;
     chat.send_turn(text).await?;
     let mut reply = String::new();
-    while let Some(event) = rx.recv().await {
-        match event {
-            ChatEvent::Delta {
-                role: ChatRole::Assistant,
-                text,
-            } => reply.push_str(&text),
-            ChatEvent::TurnFinished { .. } | ChatEvent::SessionClosed { .. } => break,
-            _ => {}
+    let mut live = live_answer::LiveAnswer::new(
+        reqwest::Client::new(),
+        "https://discord.com/api/v10",
+        token,
+        channel,
+    );
+    loop {
+        tokio::select! {
+            event = rx.recv() => match event {
+                Some(ChatEvent::Delta { role: ChatRole::Assistant, text }) => {
+                    reply.push_str(&text);
+                    live.push(&reply).await?;
+                }
+                Some(ChatEvent::TurnFinished { .. } | ChatEvent::SessionClosed { .. }) | None => break,
+                Some(_) => {}
+            },
+            _ = live.wait_for_flush() => {
+                live.flush_if_due(&reply).await?;
+            }
         }
     }
     chat.close().await?;
     if reply.trim().is_empty() {
         reply = "(no response)".into()
     };
-    let response = reqwest::Client::new()
-        .post(format!(
-            "https://discord.com/api/v10/channels/{channel}/messages"
-        ))
-        .header("Authorization", format!("Bot {token}"))
-        .json(&json!({"content":discord_message(&reply)}))
-        .send()
-        .await?;
-    response.error_for_status()?;
+    live.finish(&reply).await?;
     Ok(())
 }
 
-const DISCORD_MESSAGE_LIMIT: usize = 2_000;
-fn discord_message(reply: &str) -> String {
-    if reply.chars().count() <= DISCORD_MESSAGE_LIMIT {
-        return reply.to_owned();
-    }
-    let mut output: String = reply.chars().take(DISCORD_MESSAGE_LIMIT - 1).collect();
-    output.push('…');
-    output
-}
 #[derive(Deserialize)]
 struct Gateway {
     url: String,
@@ -161,15 +157,4 @@ fn parse_message(message: Message) -> Result<Option<Value>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn reply_is_capped_to_discord_limit() {
-        let text = "x".repeat(DISCORD_MESSAGE_LIMIT + 1);
-        assert_eq!(
-            discord_message(&text).chars().count(),
-            DISCORD_MESSAGE_LIMIT
-        );
-        assert!(discord_message(&text).ends_with('…'));
-    }
-}
+mod tests {}
