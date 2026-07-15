@@ -1,6 +1,6 @@
 # discord
 
-Discord extension for dar. DMs are accepted as before. Guild messages require an @mention by default, are stripped before forwarding, and each guild channel (including a thread) keeps an isolated session. Bot and webhook messages are ignored.
+Discord extension for dar. DMs are accepted as before. Guild messages require an @mention by default, are stripped before forwarding, and each guild channel keeps an isolated session. Threads inherit their parent channel's addressing configuration, reply in the thread, and keep a separate session; after an accepted mention, follow-ups in that thread continue without another mention. Bot and webhook messages are ignored.
 
 ## Install
 

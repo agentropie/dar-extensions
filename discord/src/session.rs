@@ -13,6 +13,9 @@ impl SessionKey {
     pub fn guild_channel(guild_id: &str, channel_id: &str) -> Self {
         Self(format!("guild:{guild_id}:channel:{channel_id}"))
     }
+    pub fn guild_thread(guild_id: &str, thread_id: &str) -> Self {
+        Self(format!("guild:{guild_id}:thread:{thread_id}"))
+    }
     pub fn directory(&self, data_dir: &Path) -> PathBuf {
         data_dir.join("sessions").join(hex(self.0.as_bytes()))
     }
@@ -24,12 +27,7 @@ struct Metadata {
 }
 
 pub fn prepare(data_dir: &Path, key: &SessionKey) -> Result<PathBuf> {
-    let base = key.directory(data_dir);
-    let directory = match std::fs::read_to_string(base.join("current")) {
-        Ok(generation) => base.join(generation.trim()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => base,
-        Err(error) => return Err(error.into()),
-    };
+    let directory = current_directory(data_dir, key)?;
     std::fs::create_dir_all(&directory)?;
     std::fs::write(
         directory.join("session.json"),
@@ -47,6 +45,24 @@ pub fn reset(data_dir: &Path, key: &SessionKey) -> Result<()> {
         .unwrap_or(0);
     std::fs::write(base.join("current"), (current + 1).to_string())?;
     Ok(())
+}
+
+pub fn engage(data_dir: &Path, key: &SessionKey) -> Result<()> {
+    std::fs::write(prepare(data_dir, key)?.join("engaged"), "")?;
+    Ok(())
+}
+
+pub fn is_engaged(data_dir: &Path, key: &SessionKey) -> bool {
+    current_directory(data_dir, key).is_ok_and(|directory| directory.join("engaged").is_file())
+}
+
+fn current_directory(data_dir: &Path, key: &SessionKey) -> Result<PathBuf> {
+    let base = key.directory(data_dir);
+    match std::fs::read_to_string(base.join("current")) {
+        Ok(generation) => Ok(base.join(generation.trim())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(base),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub fn resume_id(directory: &Path) -> Option<String> {
@@ -91,6 +107,13 @@ mod tests {
             .contains(".."));
     }
     #[test]
+    fn thread_keys_are_isolated_from_their_parent_channel() {
+        assert_ne!(
+            SessionKey::guild_channel("g1", "c1"),
+            SessionKey::guild_thread("g1", "t1")
+        );
+    }
+    #[test]
     fn prepare_persists_metadata() {
         let root = std::env::temp_dir().join(format!("discord-session-{}", std::process::id()));
         let key = SessionKey::dm("42");
@@ -121,6 +144,19 @@ mod tests {
         assert_ne!(old, fresh);
         assert_eq!(resume_id(&fresh), None);
         assert!(old.join("turn.jsonl").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn engagement_persists_until_reset() {
+        let root = std::env::temp_dir().join(format!("discord-engaged-{}", std::process::id()));
+        let key = SessionKey::guild_thread("g1", "t1");
+        assert!(!is_engaged(&root, &key));
+        assert!(!key.directory(&root).exists());
+        engage(&root, &key).unwrap();
+        assert!(is_engaged(&root, &key));
+        reset(&root, &key).unwrap();
+        assert!(!is_engaged(&root, &key));
         let _ = std::fs::remove_dir_all(root);
     }
 }
