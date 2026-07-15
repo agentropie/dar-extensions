@@ -10,6 +10,7 @@ mod attachments;
 mod commands;
 mod config;
 mod delivery;
+mod history;
 mod live_answer;
 mod markdown;
 mod runtime;

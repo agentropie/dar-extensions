@@ -9,6 +9,8 @@ pub struct DiscordConfig {
     pub bot_token: Option<String>,
     pub backend: Option<String>,
     pub ack_emoji: String,
+    pub history_limit: usize,
+    pub clear_history_after_reply: bool,
     pub guilds: HashMap<String, GuildConfig>,
 }
 
@@ -18,6 +20,8 @@ impl Default for DiscordConfig {
             bot_token: None,
             backend: None,
             ack_emoji: "👀".into(),
+            history_limit: 20,
+            clear_history_after_reply: false,
             guilds: HashMap::new(),
         }
     }
