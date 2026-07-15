@@ -4,6 +4,7 @@
 
 ### Added
 
+- **discord:** the gateway now reconnects with capped exponential backoff and cleanly drains active turns during shutdown.
 - **discord:** agents can now send messages to configured channels or automatically opened user DMs with `discord_send_message`.
 - **discord:** message attachments are downloaded and routed to the agent.
 - **discord:** `/reset` (`/new`) starts a fresh channel session, while `/abort` (`/stop`) cancels the active response with a visible confirmation.

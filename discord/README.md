@@ -28,6 +28,8 @@ extensions:
 
 Every accepted message is immediately acknowledged with `ack_emoji` (default `👀`). Image and file attachments are downloaded to `data/uploads` and their local paths are supplied to the agent; attachment-only messages are accepted too. Files over 25 MiB or failed downloads produce a visible error. Agent failures, a 60-second queue/no-output timeout, and failed reply delivery are surfaced with a visible error; Discord post attempts are retried three times, then the source message receives a `⚠️` reaction if an error message cannot be posted.
 
+The gateway reconnects automatically after a disconnect, retrying after 1, 2, 4, 8, 16, then 30 seconds (maximum). A reconnect starts a fresh gateway session; messages sent while it was disconnected are not replayed and will not receive a delayed reply. On shutdown the gateway sends a close frame and all active agent turns are cancelled and awaited.
+
 ## Agent tool
 
 `discord_send_message` lets the agent proactively post `text` to exactly one target: a configured `channel` (its name or ID), or a numeric Discord `user` ID. User targets automatically open a DM channel. Channel names are resolved only among the configured channel IDs; ambiguous names require an ID.

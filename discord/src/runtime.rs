@@ -32,51 +32,172 @@ impl ActiveTurn {
     }
 }
 
+struct ConnectionEnv<'a> {
+    ctx: &'a StartCtx,
+    cfg: &'a config::DiscordConfig,
+    token: &'a str,
+    data: &'a Path,
+    root: &'a Path,
+    client: &'a reqwest::Client,
+    turns: &'a Arc<Mutex<HashMap<session::SessionKey, ActiveTurn>>>,
+    next_turn: &'a AtomicU64,
+}
+
 pub async fn run(
-    mut ctx: StartCtx,
+    ctx: StartCtx,
     cfg: config::DiscordConfig,
     token: String,
     data: std::path::PathBuf,
 ) -> Result<()> {
     let client = reqwest::Client::new();
-    let gateway: Gateway = client
+    let root = ctx.paths.root().to_path_buf();
+    let turns = Arc::new(Mutex::new(HashMap::new()));
+    let next_turn = AtomicU64::new(0);
+    let mut delay = Duration::from_secs(1);
+    loop {
+        if ctx.shutdown.is_cancelled() {
+            stop_turns(&turns).await;
+            return Ok(());
+        }
+        let mut shutdown = ctx.shutdown.clone();
+        let gateway = match tokio::select! {
+            _ = shutdown.cancelled() => { stop_turns(&turns).await; return Ok(()); }
+            result = gateway_url(&client, &token) => result,
+        } {
+            Ok(url) => url,
+            Err(error) => {
+                tracing::warn!(%error, "discord gateway discovery failed; retrying");
+                let mut shutdown = ctx.shutdown.clone();
+                wait_or_shutdown(&mut shutdown, delay).await;
+                delay = reconnect_delay(delay);
+                continue;
+            }
+        };
+        let mut shutdown = ctx.shutdown.clone();
+        let socket = match tokio::select! {
+            _ = shutdown.cancelled() => { stop_turns(&turns).await; return Ok(()); }
+            result = tokio_tungstenite::connect_async(format!("{gateway}?v=10&encoding=json")) => result,
+        } {
+            Ok((socket, _)) => socket,
+            Err(error) => {
+                tracing::warn!(%error, "discord gateway connection failed; retrying");
+                let mut shutdown = ctx.shutdown.clone();
+                wait_or_shutdown(&mut shutdown, delay).await;
+                delay = reconnect_delay(delay);
+                continue;
+            }
+        };
+        delay = Duration::from_secs(1);
+        if let Err(error) = run_connection(
+            ConnectionEnv {
+                ctx: &ctx,
+                cfg: &cfg,
+                token: &token,
+                data: &data,
+                root: &root,
+                client: &client,
+                turns: &turns,
+                next_turn: &next_turn,
+            },
+            socket,
+        )
+        .await
+        {
+            tracing::warn!(%error, "discord gateway disconnected; reconnecting");
+        }
+        if ctx.shutdown.is_cancelled() {
+            stop_turns(&turns).await;
+            return Ok(());
+        }
+        let mut shutdown = ctx.shutdown.clone();
+        wait_or_shutdown(&mut shutdown, delay).await;
+        delay = reconnect_delay(delay);
+    }
+}
+
+async fn gateway_url(client: &reqwest::Client, token: &str) -> Result<String> {
+    Ok(client
         .get("https://discord.com/api/v10/gateway/bot")
         .header("Authorization", format!("Bot {token}"))
         .send()
         .await?
         .error_for_status()?
-        .json()
-        .await?;
-    let (socket, _) =
-        tokio_tungstenite::connect_async(format!("{}?v=10&encoding=json", gateway.url)).await?;
+        .json::<Gateway>()
+        .await?
+        .url)
+}
+
+async fn run_connection(
+    env: ConnectionEnv<'_>,
+    socket: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Result<()> {
     let (mut write, mut read) = socket.split();
-    let hello = next_json(&mut read).await?;
+    let mut shutdown = env.ctx.shutdown.clone();
+    let hello = tokio::select! {
+        _ = shutdown.cancelled() => {
+            let _ = close_gateway(&mut write).await;
+            return Ok(());
+        }
+        result = next_json(&mut read) => result?,
+    };
     let interval = hello["d"]["heartbeat_interval"]
         .as_u64()
         .context("Discord gateway hello missing heartbeat_interval")?;
-    write.send(Message::Text(json!({"op":2,"d":{"token":token,"intents":37376,"properties":{"os":"dar","browser":"dar","device":"dar"}}}).to_string())).await?;
-    let root = ctx.paths.root().to_path_buf();
+    write.send(Message::Text(json!({"op":2,"d":{"token":env.token,"intents":37376,"properties":{"os":"dar","browser":"dar","device":"dar"}}}).to_string())).await?;
     let mut heartbeat = tokio::time::interval(Duration::from_millis(interval));
     let mut sequence = None;
     let mut bot_user_id = None;
-    let turns = Arc::new(Mutex::new(HashMap::new()));
-    let next_turn = AtomicU64::new(0);
     dar_extension_sdk::log::event("-", "discord", "gateway connected");
     loop {
         tokio::select! {
-            _ = ctx.shutdown.cancelled() => return Ok(()),
+            _ = shutdown.cancelled() => {
+                let _ = close_gateway(&mut write).await;
+                return Ok(());
+            },
             _ = heartbeat.tick() => write.send(Message::Text(json!({"op":1,"d":sequence}).to_string())).await?,
             message = read.next() => {
                 let Some(message) = message else { anyhow::bail!("Discord gateway closed") };
                 let Some(value) = parse_message(message?)? else { continue };
+                if gateway_requests_reconnect(&value) { anyhow::bail!("Discord gateway requested reconnect"); }
                 if let Some(seq) = value["s"].as_i64() { sequence = Some(seq); }
                 if value["t"] == "READY" { bot_user_id = value["d"]["user"]["id"].as_str().map(str::to_owned); }
                 if value["t"] == "MESSAGE_CREATE" {
-                    handle_message(&ctx, &cfg, &token, &data, &root, &client, &turns, &next_turn, bot_user_id.as_deref(), &value["d"]).await;
+                    handle_message(env.ctx, env.cfg, env.token, env.data, env.root, env.client, env.turns, env.next_turn, bot_user_id.as_deref(), &value["d"]).await;
                 }
             }
         }
     }
+}
+
+async fn close_gateway<W>(write: &mut W) -> Result<()>
+where
+    W: futures_util::Sink<Message> + Unpin,
+    W::Error: std::error::Error + Send + Sync + 'static,
+{
+    write.send(Message::Close(None)).await?;
+    write.close().await?;
+    Ok(())
+}
+
+async fn stop_turns(turns: &Arc<Mutex<HashMap<session::SessionKey, ActiveTurn>>>) {
+    let active = std::mem::take(&mut *turns.lock().await);
+    for (_, turn) in active {
+        turn.stop().await;
+    }
+}
+
+fn reconnect_delay(delay: Duration) -> Duration {
+    (delay * 2).min(Duration::from_secs(30))
+}
+
+fn gateway_requests_reconnect(value: &Value) -> bool {
+    matches!(value["op"].as_i64(), Some(7 | 9))
+}
+
+async fn wait_or_shutdown(shutdown: &mut dar_extension_sdk::ShutdownToken, delay: Duration) {
+    tokio::select! { _ = shutdown.cancelled() => {}, _ = tokio::time::sleep(delay) => {} }
 }
 
 async fn handle_message(
@@ -265,5 +386,116 @@ fn parse_message(message: Message) -> Result<Option<Value>> {
         Message::Ping(_) | Message::Pong(_) | Message::Binary(_) => Ok(None),
         Message::Close(_) => anyhow::bail!("Discord gateway closed"),
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_backoff_is_capped() {
+        let mut delay = Duration::from_secs(1);
+        for expected in [2, 4, 8, 16, 30, 30] {
+            delay = reconnect_delay(delay);
+            assert_eq!(delay, Duration::from_secs(expected));
+        }
+    }
+
+    #[test]
+    fn gateway_reconnect_opcodes_are_detected() {
+        assert!(gateway_requests_reconnect(&json!({"op": 7})));
+        assert!(gateway_requests_reconnect(&json!({"op": 9})));
+        assert!(!gateway_requests_reconnect(&json!({"op": 0})));
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_a_pending_reconnect_wait() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tx.send(true).unwrap();
+        let mut shutdown = dar_extension_sdk::ShutdownToken::new(rx);
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            wait_or_shutdown(&mut shutdown, Duration::from_secs(30)),
+        )
+        .await
+        .expect("shutdown should not wait for reconnect backoff");
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_a_live_gateway_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            matches!(socket.next().await.unwrap().unwrap(), Message::Close(_))
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let (mut write, _) = socket.split();
+        close_gateway(&mut write).await.unwrap();
+        assert!(server.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_a_gateway_waiting_for_hello() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            matches!(socket.next().await.unwrap().unwrap(), Message::Close(_))
+        });
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let root =
+            std::env::temp_dir().join(format!("discord-runtime-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = host_api::HostPaths::new(&root).unwrap();
+        let register = host_api::RegisterCtx {
+            bus: host_api::EventBus::new(),
+            http: host_api::HttpRegistry::disabled(),
+            foreground: host_api::ForegroundRegistry::default(),
+            services: host_api::ServiceRegistry::default(),
+            paths: paths.clone(),
+            config: host_api::ConfigStore::default(),
+            shutdown: host_api::ShutdownToken::new(shutdown_rx.clone()),
+        };
+        let config = register.config.clone();
+        let host = register.into_start_services().unwrap();
+        let ctx = StartCtx {
+            shutdown: host_api::ShutdownToken::new(shutdown_rx),
+            paths,
+            config,
+            host,
+        };
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let turns = Arc::new(Mutex::new(HashMap::new()));
+            run_connection(
+                ConnectionEnv {
+                    ctx: &ctx,
+                    cfg: &config::DiscordConfig::default(),
+                    token: "token",
+                    data: ctx.paths.root(),
+                    root: ctx.paths.root(),
+                    client: &reqwest::Client::new(),
+                    turns: &turns,
+                    next_turn: &AtomicU64::new(0),
+                },
+                socket,
+            )
+            .await
+        });
+        shutdown_tx.send(true).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok());
+        assert!(server.await.unwrap());
     }
 }
