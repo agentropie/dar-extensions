@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
+mod addressing;
 mod config;
 mod live_answer;
 mod markdown;
@@ -71,12 +72,13 @@ async fn run(
     let interval = hello["d"]["heartbeat_interval"]
         .as_u64()
         .context("Discord gateway hello missing heartbeat_interval")?;
-    write.send(Message::Text(json!({"op":2,"d":{"token":token,"intents":4096,"properties":{"os":"dar","browser":"dar","device":"dar"}}}).to_string())).await?;
+    write.send(Message::Text(json!({"op":2,"d":{"token":token,"intents":37376,"properties":{"os":"dar","browser":"dar","device":"dar"}}}).to_string())).await?;
     let mut heartbeat = tokio::time::interval(Duration::from_millis(interval));
     let mut sequence: Option<i64> = None;
+    let mut bot_user_id: Option<String> = None;
     dar_extension_sdk::log::event("-", "discord", "gateway connected");
     loop {
-        tokio::select! { _=ctx.shutdown.cancelled()=>return Ok(()), _=heartbeat.tick()=> { write.send(Message::Text(json!({"op":1,"d":sequence}).to_string())).await?; }, message=read.next()=> { let Some(message)=message else { anyhow::bail!("Discord gateway closed") }; let Some(value)=parse_message(message?)? else { continue }; if let Some(seq)=value["s"].as_i64(){sequence=Some(seq)}; if value["t"]=="MESSAGE_CREATE" { let d=&value["d"]; if d.get("guild_id").is_some() || d["author"]["bot"].as_bool()==Some(true) {continue}; let channel=d["channel_id"].as_str().context("Discord DM missing channel id")?.to_owned(); let user=d["author"]["id"].as_str().context("Discord DM missing author id")?.to_owned(); let text=d["content"].as_str().unwrap_or("").trim().to_owned(); if text.is_empty(){continue}; let token=token.clone(); let backend=cfg.backend.clone(); let ctx=ctx.clone(); let data=data.clone(); tokio::spawn(async move { if let Err(error)=answer(ctx,backend,&data,&token,&channel,&user,text).await { tracing::warn!(%error,"discord DM turn failed") }}); } } }
+        tokio::select! { _=ctx.shutdown.cancelled()=>return Ok(()), _=heartbeat.tick()=> { write.send(Message::Text(json!({"op":1,"d":sequence}).to_string())).await?; }, message=read.next()=> { let Some(message)=message else { anyhow::bail!("Discord gateway closed") }; let Some(value)=parse_message(message?)? else { continue }; if let Some(seq)=value["s"].as_i64(){sequence=Some(seq)}; if value["t"]=="READY" { bot_user_id=value["d"]["user"]["id"].as_str().map(str::to_owned); } if value["t"]=="MESSAGE_CREATE" { let d=&value["d"]; let route = addressing::route(&cfg, bot_user_id.as_deref(), &addressing::InboundMessage { guild_id: d["guild_id"].as_str(), channel_id: d["channel_id"].as_str().unwrap_or(""), author_id: d["author"]["id"].as_str().unwrap_or(""), author_is_bot: d["author"]["bot"].as_bool().unwrap_or(false), webhook_id: d["webhook_id"].as_str(), text: d["content"].as_str().unwrap_or("") }); let addressing::RouteDecision::Dispatch { text, session_key } = route else { continue }; if text.is_empty(){continue}; let channel=d["channel_id"].as_str().context("Discord message missing channel id")?.to_owned(); let token=token.clone(); let backend=cfg.backend.clone(); let ctx=ctx.clone(); let data=data.clone(); tokio::spawn(async move { if let Err(error)=answer(ctx,backend,&data,&token,&channel,session_key,text).await { tracing::warn!(%error,"discord turn failed") }}); } } }
     }
 }
 async fn answer(
@@ -85,10 +87,10 @@ async fn answer(
     data: &Path,
     token: &str,
     channel: &str,
-    user: &str,
+    session_key: session::SessionKey,
     text: String,
 ) -> Result<()> {
-    let dir = session::prepare(data, &session::SessionKey::dm(user))?;
+    let dir = session::prepare(data, &session_key)?;
     let backend_id = dar_extension_sdk::chat::resolve_agent_backend(&ctx, configured.as_deref());
     let backend = ctx
         .host
