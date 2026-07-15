@@ -42,7 +42,7 @@ impl Delivery {
         }
     }
 
-    async fn post(&self, content: &str) -> Result<()> {
+    pub async fn post(&self, content: &str) -> Result<()> {
         self.retry(|| {
             self.client
                 .post(format!("{}/channels/{}/messages", self.base, self.channel))

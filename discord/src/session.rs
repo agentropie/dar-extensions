@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SessionKey(String);
 
 impl SessionKey {
@@ -24,13 +24,29 @@ struct Metadata {
 }
 
 pub fn prepare(data_dir: &Path, key: &SessionKey) -> Result<PathBuf> {
-    let directory = key.directory(data_dir);
+    let base = key.directory(data_dir);
+    let directory = match std::fs::read_to_string(base.join("current")) {
+        Ok(generation) => base.join(generation.trim()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => base,
+        Err(error) => return Err(error.into()),
+    };
     std::fs::create_dir_all(&directory)?;
     std::fs::write(
         directory.join("session.json"),
         serde_json::to_vec(&Metadata { key: key.0.clone() })?,
     )?;
     Ok(directory)
+}
+
+pub fn reset(data_dir: &Path, key: &SessionKey) -> Result<()> {
+    let base = key.directory(data_dir);
+    std::fs::create_dir_all(&base)?;
+    let current = std::fs::read_to_string(base.join("current"))
+        .ok()
+        .and_then(|generation| generation.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    std::fs::write(base.join("current"), (current + 1).to_string())?;
+    Ok(())
 }
 
 pub fn resume_id(directory: &Path) -> Option<String> {
@@ -91,6 +107,20 @@ mod tests {
         std::fs::write(root.join("2025-01-01_old.jsonl"), "{\"id\":\"old\"}\n").unwrap();
         std::fs::write(root.join("2025-02-01_new.jsonl"), "{\"id\":\"new\"}\n").unwrap();
         assert_eq!(resume_id(&root).as_deref(), Some("new"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reset_rotates_to_a_fresh_session_directory() {
+        let root = std::env::temp_dir().join(format!("discord-reset-{}", std::process::id()));
+        let key = SessionKey::dm("42");
+        let old = prepare(&root, &key).unwrap();
+        std::fs::write(old.join("turn.jsonl"), "old context").unwrap();
+        reset(&root, &key).unwrap();
+        let fresh = prepare(&root, &key).unwrap();
+        assert_ne!(old, fresh);
+        assert_eq!(resume_id(&fresh), None);
+        assert!(old.join("turn.jsonl").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 }
