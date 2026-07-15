@@ -1,6 +1,9 @@
 //! Discord DM chat channel for dar.
 use anyhow::Result;
-use dar_extension_sdk::{Extension, RegisterCtx, StartCtx};
+use dar_extension_sdk::{
+    tools::{ToolRegistryHandle, TOOL_REGISTRY_SERVICE},
+    Extension, RegisterCtx, StartCtx,
+};
 use serde::Deserialize;
 mod addressing;
 mod attachments;
@@ -11,6 +14,7 @@ mod live_answer;
 mod markdown;
 mod runtime;
 mod session;
+mod tools;
 pub fn extension() -> Box<dyn Extension> {
     Box::new(DiscordExtension)
 }
@@ -25,7 +29,14 @@ impl Extension for DiscordExtension {
         ctx: &'a mut RegisterCtx,
     ) -> dar_extension_sdk::BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            config::token(&config::parse(&ctx.config, self.id())?)?;
+            let cfg = config::parse(&ctx.config, self.id())?;
+            let token = config::token(&cfg)?;
+            if let Ok(registry) = ctx
+                .services
+                .get_named::<dyn ToolRegistryHandle>(TOOL_REGISTRY_SERVICE)
+            {
+                registry.register_tool(tools::spec(), tools::DiscordSendTool::new(token, cfg))?;
+            }
             Ok(())
         })
     }
