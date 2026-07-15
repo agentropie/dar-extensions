@@ -8,6 +8,7 @@ use std::{
 };
 
 const UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+const SEND_ATTEMPTS: usize = 3;
 
 pub struct LiveAnswer {
     client: reqwest::Client,
@@ -81,12 +82,33 @@ impl LiveAnswer {
             } else {
                 self.client.post(url)
             };
-            let response = request
+            let request = request
                 .header("Authorization", format!("Bot {}", self.token))
-                .json(&json!({"content": content}))
-                .send()
-                .await?
-                .error_for_status()?;
+                .json(&json!({"content": content}));
+            let mut last_error = None;
+            let mut response = None;
+            for attempt in 0..SEND_ATTEMPTS {
+                match request
+                    .try_clone()
+                    .expect("request is cloneable")
+                    .send()
+                    .await
+                    .and_then(|r| r.error_for_status())
+                {
+                    Ok(value) => {
+                        response = Some(value);
+                        break;
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        if attempt + 1 < SEND_ATTEMPTS {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            }
+            let response =
+                response.ok_or_else(|| last_error.expect("a failed request has an error"))?;
             if index == self.messages.len() {
                 self.messages.push(response.json::<Posted>().await?.id);
             }

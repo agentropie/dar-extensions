@@ -3,12 +3,24 @@ use dar_extension_sdk::ConfigStore;
 use serde::Deserialize;
 use std::collections::HashMap;
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiscordConfig {
     pub bot_token: Option<String>,
     pub backend: Option<String>,
+    pub ack_emoji: String,
     pub guilds: HashMap<String, GuildConfig>,
+}
+
+impl Default for DiscordConfig {
+    fn default() -> Self {
+        Self {
+            bot_token: None,
+            backend: None,
+            ack_emoji: "👀".into(),
+            guilds: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
