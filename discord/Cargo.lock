@@ -461,6 +461,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dar-extension-sdk",
+ "dar-host-api",
  "futures-util",
  "reqwest",
  "serde",
