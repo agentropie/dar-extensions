@@ -93,11 +93,6 @@ async fn handle_message(
 ) {
     let attachments = attachments::parse(message["attachments"].as_array());
     let content = message["content"].as_str().unwrap_or("");
-    let routing_text = if content.trim().is_empty() && !attachments.is_empty() {
-        "Attachment received."
-    } else {
-        content
-    };
     let route = addressing::route(
         cfg,
         bot_user_id,
@@ -107,7 +102,8 @@ async fn handle_message(
             author_id: message["author"]["id"].as_str().unwrap_or(""),
             author_is_bot: message["author"]["bot"].as_bool().unwrap_or(false),
             webhook_id: message["webhook_id"].as_str(),
-            text: routing_text,
+            text: content,
+            has_attachments: !attachments.is_empty(),
         },
     );
     let addressing::RouteDecision::Dispatch { session_key, .. } = route else {
