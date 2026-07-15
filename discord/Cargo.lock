@@ -459,6 +459,7 @@ name = "discord"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dar-extension-sdk",
  "futures-util",
  "reqwest",
