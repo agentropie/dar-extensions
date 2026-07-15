@@ -26,7 +26,7 @@ extensions:
 
 `DISCORD_BOT_TOKEN` is used when `bot_token` is omitted. Guilds and channels are deny-by-default: both IDs must be configured and enabled. Empty user allowlists allow every user; populated guild and channel allowlists must both include the sender. Enable the **Message Content Intent** and guild-message intent for the bot in Discord's developer portal.
 
-Every accepted message is immediately acknowledged with `ack_emoji` (default `👀`). Agent failures, a 60-second queue/no-output timeout, and failed reply delivery are surfaced with a visible error; Discord post attempts are retried three times, then the source message receives a `⚠️` reaction if an error message cannot be posted.
+Every accepted message is immediately acknowledged with `ack_emoji` (default `👀`). Image and file attachments are downloaded to `data/uploads` and their local paths are supplied to the agent; attachment-only messages are accepted too. Files over 25 MiB or failed downloads produce a visible error. Agent failures, a 60-second queue/no-output timeout, and failed reply delivery are surfaced with a visible error; Discord post attempts are retried three times, then the source message receives a `⚠️` reaction if an error message cannot be posted.
 
 ## Commands
 

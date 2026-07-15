@@ -4,6 +4,7 @@
 
 ### Added
 
+- **discord:** message attachments are downloaded and routed to the agent.
 - **discord:** `/reset` (`/new`) starts a fresh channel session, while `/abort` (`/stop`) cancels the active response with a visible confirmation.
 - **discord:** accepted messages now receive a configurable immediate acknowledgement and delivery failures surface visibly instead of being dropped.
 - **discord:** guild channels now support mention-gated, allowlisted addressing with isolated per-channel sessions.

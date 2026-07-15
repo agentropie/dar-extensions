@@ -20,25 +20,27 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 mod addressing;
+mod attachments;
 mod commands;
 mod config;
 mod delivery;
 mod live_answer;
 mod markdown;
+mod runtime;
 mod session;
 pub fn extension() -> Box<dyn Extension> {
     Box::new(DiscordExtension)
 }
 struct DiscordExtension;
 
-struct ActiveTurn {
+pub(crate) struct ActiveTurn {
     id: u64,
     cancel: CancellationToken,
     done: oneshot::Receiver<()>,
 }
 
 impl ActiveTurn {
-    async fn stop(self) {
+    pub(crate) async fn stop(self) {
         self.cancel.cancel();
         let _ = self.done.await;
     }
@@ -66,8 +68,9 @@ impl Extension for DiscordExtension {
             let token = config::token(&cfg)?;
             let data = ctx.paths.data_dir(self.id())?;
             std::fs::create_dir_all(data.join("sessions"))?;
+            let _ = run;
             tokio::spawn(async move {
-                if let Err(error) = run(ctx, cfg, token, data).await {
+                if let Err(error) = runtime::run(ctx, cfg, token, data).await {
                     tracing::error!(%error,"discord gateway stopped");
                 }
             });
@@ -75,7 +78,7 @@ impl Extension for DiscordExtension {
         })
     }
 }
-async fn run(
+pub(crate) async fn run(
     mut ctx: StartCtx,
     cfg: config::DiscordConfig,
     token: String,
@@ -109,7 +112,7 @@ async fn run(
         tokio::select! { _=ctx.shutdown.cancelled()=>return Ok(()), _=heartbeat.tick()=> { write.send(Message::Text(json!({"op":1,"d":sequence}).to_string())).await?; }, message=read.next()=> { let Some(message)=message else { anyhow::bail!("Discord gateway closed") }; let Some(value)=parse_message(message?)? else { continue }; if let Some(seq)=value["s"].as_i64(){sequence=Some(seq)}; if value["t"]=="READY" { bot_user_id=value["d"]["user"]["id"].as_str().map(str::to_owned); } if value["t"]=="MESSAGE_CREATE" { let d=&value["d"]; let route = addressing::route(&cfg, bot_user_id.as_deref(), &addressing::InboundMessage { guild_id: d["guild_id"].as_str(), channel_id: d["channel_id"].as_str().unwrap_or(""), author_id: d["author"]["id"].as_str().unwrap_or(""), author_is_bot: d["author"]["bot"].as_bool().unwrap_or(false), webhook_id: d["webhook_id"].as_str(), text: d["content"].as_str().unwrap_or("") }); let addressing::RouteDecision::Dispatch { text, session_key } = route else { continue }; if text.is_empty(){continue}; let channel=d["channel_id"].as_str().context("Discord message missing channel id")?.to_owned(); let message=d["id"].as_str().context("Discord message missing id")?.to_owned(); let delivery=delivery::Delivery::new(client.clone(), &token, &channel, &message, &cfg.ack_emoji); if let Err(error)=delivery.acknowledge().await { delivery.failure(&error).await; continue; } if let Some(command) = commands::parse(&text) { let previous = turns.lock().await.remove(&session_key); if let Some(turn) = previous { turn.stop().await; } if command == commands::Command::Reset { if let Err(error) = session::reset(&data, &session_key) { tracing::warn!(%error, "discord session reset failed"); delivery.failure(&error.into()).await; continue; } } if let Err(error) = delivery.post(commands::reply(command)).await { delivery.failure(&error).await; } continue; } let token=token.clone(); let backend=cfg.backend.clone(); let ctx=ctx.clone(); let data=data.clone(); let cancel=CancellationToken::new(); let task_cancel=cancel.clone(); let id=next_turn.fetch_add(1, Ordering::Relaxed); let (done_tx, done) = oneshot::channel(); let previous = turns.lock().await.insert(session_key.clone(), ActiveTurn { id, cancel: cancel.clone(), done }); if let Some(previous) = previous { previous.stop().await; } let active=Arc::clone(&turns); tokio::spawn(async move { if let Err(error)=answer(ctx,backend,&data,&token,&channel,session_key.clone(),text,cancel).await { if !task_cancel.is_cancelled() { tracing::warn!(%error,"discord turn failed"); delivery.failure(&error).await; } } let _ = done_tx.send(()); let mut active=active.lock().await; if active.get(&session_key).is_some_and(|turn| turn.id == id) { active.remove(&session_key); } }); } } }
     }
 }
-async fn answer(
+pub(crate) async fn answer(
     ctx: StartCtx,
     configured: Option<String>,
     data: &Path,
@@ -187,7 +190,7 @@ async fn answer(
 struct Gateway {
     url: String,
 }
-async fn next_json<S>(read: &mut S) -> Result<Value>
+pub(crate) async fn next_json<S>(read: &mut S) -> Result<Value>
 where
     S: futures_util::Stream<
             Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>,
@@ -199,7 +202,7 @@ where
         }
     }
 }
-fn parse_message(message: Message) -> Result<Option<Value>> {
+pub(crate) fn parse_message(message: Message) -> Result<Option<Value>> {
     match message {
         Message::Text(text) => Ok(Some(serde_json::from_str(&text)?)),
         Message::Ping(_) | Message::Pong(_) | Message::Binary(_) => Ok(None),
