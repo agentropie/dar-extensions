@@ -4,6 +4,8 @@ use crate::{config::DiscordConfig, session::SessionKey};
 pub struct InboundMessage<'a> {
     pub guild_id: Option<&'a str>,
     pub channel_id: &'a str,
+    pub parent_channel_id: Option<&'a str>,
+    pub thread_engaged: bool,
     pub author_id: &'a str,
     pub author_is_bot: bool,
     pub webhook_id: Option<&'a str>,
@@ -41,7 +43,8 @@ pub fn route(
     let Some(guild) = config.guilds.get(guild_id) else {
         return RouteDecision::Ignore;
     };
-    let Some(channel) = guild.channels.get(message.channel_id) else {
+    let configured_channel_id = message.parent_channel_id.unwrap_or(message.channel_id);
+    let Some(channel) = guild.channels.get(configured_channel_id) else {
         return RouteDecision::Ignore;
     };
     if !guild.enabled
@@ -54,13 +57,17 @@ pub fn route(
     let (mentioned, text) = strip_mention(message.text, bot_user_id);
     if channel.require_mention
         && !mentioned
+        && !(message.parent_channel_id.is_some() && message.thread_engaged)
         && !(message.text.trim().is_empty() && message.has_attachments)
     {
         return RouteDecision::Ignore;
     }
     RouteDecision::Dispatch {
         text,
-        session_key: SessionKey::guild_channel(guild_id, message.channel_id),
+        session_key: match message.parent_channel_id {
+            Some(_) => SessionKey::guild_thread(guild_id, message.channel_id),
+            None => SessionKey::guild_channel(guild_id, message.channel_id),
+        },
     }
 }
 
@@ -113,6 +120,8 @@ mod tests {
         InboundMessage {
             guild_id,
             channel_id,
+            parent_channel_id: None,
+            thread_engaged: false,
             author_id: "u1",
             author_is_bot: false,
             webhook_id: None,
@@ -242,5 +251,37 @@ mod tests {
             route(&config(), Some("b1"), &attachment),
             RouteDecision::Dispatch { text, .. } if text.is_empty()
         ));
+    }
+
+    #[test]
+    fn threads_inherit_parent_addressing_and_continue_after_engagement() {
+        let cfg = config();
+        let mut thread = message(Some("g1"), "thread-id", "<@b1> hello");
+        thread.parent_channel_id = Some("c1");
+        assert_eq!(
+            route(&cfg, Some("b1"), &thread),
+            RouteDecision::Dispatch {
+                text: "hello".into(),
+                session_key: SessionKey::guild_thread("g1", "thread-id"),
+            }
+        );
+        thread.text = "follow up";
+        thread.thread_engaged = true;
+        assert!(matches!(
+            route(&cfg, Some("b1"), &thread),
+            RouteDecision::Dispatch { text, session_key }
+                if text == "follow up" && session_key == SessionKey::guild_thread("g1", "thread-id")
+        ));
+    }
+
+    #[test]
+    fn unengaged_thread_requires_a_mention_and_never_shares_parent_session() {
+        let cfg = config();
+        let mut thread = message(Some("g1"), "thread-id", "follow up");
+        thread.parent_channel_id = Some("c1");
+        assert_eq!(route(&cfg, Some("b1"), &thread), RouteDecision::Ignore);
+        let parent = route(&cfg, Some("b1"), &message(Some("g1"), "c1", "<@b1> hello"));
+        thread.text = "<@b1> hello";
+        assert_ne!(parent, route(&cfg, Some("b1"), &thread));
     }
 }

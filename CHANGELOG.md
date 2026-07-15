@@ -4,6 +4,7 @@
 
 ### Added
 
+- **discord:** text-channel threads now inherit parent-channel addressing, reply in-thread, and keep isolated engaged sessions for follow-ups.
 - **discord:** the gateway now reconnects with capped exponential backoff and cleanly drains active turns during shutdown.
 - **discord:** agents can now send messages to configured channels or automatically opened user DMs with `discord_send_message`.
 - **discord:** message attachments are downloaded and routed to the agent.
@@ -27,6 +28,7 @@
 
 ### Fixed
 
+- **discord:** active threads are restored from the gateway's initial guild state, preserving parent-channel addressing after startup or reconnect.
 - **slack:** assistant replies now appear as the runner emits them instead of
   arriving together after a turn completes.
 

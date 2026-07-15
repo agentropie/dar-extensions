@@ -25,6 +25,11 @@ struct ActiveTurn {
     cancel: CancellationToken,
     done: oneshot::Receiver<()>,
 }
+
+#[derive(Default)]
+struct Threads {
+    parents: HashMap<String, String>,
+}
 impl ActiveTurn {
     async fn stop(self) {
         self.cancel.cancel();
@@ -40,6 +45,7 @@ struct ConnectionEnv<'a> {
     root: &'a Path,
     client: &'a reqwest::Client,
     turns: &'a Arc<Mutex<HashMap<session::SessionKey, ActiveTurn>>>,
+    threads: &'a Arc<Mutex<Threads>>,
     next_turn: &'a AtomicU64,
 }
 
@@ -52,6 +58,7 @@ pub async fn run(
     let client = reqwest::Client::new();
     let root = ctx.paths.root().to_path_buf();
     let turns = Arc::new(Mutex::new(HashMap::new()));
+    let threads = Arc::new(Mutex::new(Threads::default()));
     let next_turn = AtomicU64::new(0);
     let mut delay = Duration::from_secs(1);
     loop {
@@ -97,6 +104,7 @@ pub async fn run(
                 root: &root,
                 client: &client,
                 turns: &turns,
+                threads: &threads,
                 next_turn: &next_turn,
             },
             socket,
@@ -145,7 +153,7 @@ async fn run_connection(
     let interval = hello["d"]["heartbeat_interval"]
         .as_u64()
         .context("Discord gateway hello missing heartbeat_interval")?;
-    write.send(Message::Text(json!({"op":2,"d":{"token":env.token,"intents":37376,"properties":{"os":"dar","browser":"dar","device":"dar"}}}).to_string())).await?;
+    write.send(Message::Text(json!({"op":2,"d":{"token":env.token,"intents":37377,"properties":{"os":"dar","browser":"dar","device":"dar"}}}).to_string())).await?;
     let mut heartbeat = tokio::time::interval(Duration::from_millis(interval));
     let mut sequence = None;
     let mut bot_user_id = None;
@@ -163,8 +171,14 @@ async fn run_connection(
                 if gateway_requests_reconnect(&value) { anyhow::bail!("Discord gateway requested reconnect"); }
                 if let Some(seq) = value["s"].as_i64() { sequence = Some(seq); }
                 if value["t"] == "READY" { bot_user_id = value["d"]["user"]["id"].as_str().map(str::to_owned); }
-                if value["t"] == "MESSAGE_CREATE" {
-                    handle_message(env.ctx, env.cfg, env.token, env.data, env.root, env.client, env.turns, env.next_turn, bot_user_id.as_deref(), &value["d"]).await;
+                if update_thread_event(env.threads, value["t"].as_str(), &value["d"]).await {
+                    continue;
+                }
+                match value["t"].as_str() {
+                    Some("MESSAGE_CREATE") => {
+                        handle_message(env.ctx, env.cfg, env.token, env.data, env.root, env.client, env.turns, env.threads, env.next_turn, bot_user_id.as_deref(), &value["d"]).await;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -208,18 +222,36 @@ async fn handle_message(
     root: &Path,
     client: &reqwest::Client,
     turns: &Arc<Mutex<HashMap<session::SessionKey, ActiveTurn>>>,
+    threads: &Arc<Mutex<Threads>>,
     next_turn: &AtomicU64,
     bot_user_id: Option<&str>,
     message: &Value,
 ) {
     let attachments = attachments::parse(message["attachments"].as_array());
     let content = message["content"].as_str().unwrap_or("");
+    if let Some(thread) = message.get("thread") {
+        update_thread(threads, thread).await;
+    }
+    let channel_id = message["channel_id"].as_str().unwrap_or("");
+    let parent_channel_id = {
+        let threads = threads.lock().await;
+        threads.parents.get(channel_id).cloned()
+    };
+    let thread_session_key = message["guild_id"]
+        .as_str()
+        .zip(parent_channel_id.as_ref())
+        .map(|(guild_id, _)| session::SessionKey::guild_thread(guild_id, channel_id));
+    let thread_engaged = thread_session_key
+        .as_ref()
+        .is_some_and(|key| session::is_engaged(data, key));
     let route = addressing::route(
         cfg,
         bot_user_id,
         &addressing::InboundMessage {
             guild_id: message["guild_id"].as_str(),
-            channel_id: message["channel_id"].as_str().unwrap_or(""),
+            channel_id,
+            parent_channel_id: parent_channel_id.as_deref(),
+            thread_engaged,
             author_id: message["author"]["id"].as_str().unwrap_or(""),
             author_is_bot: message["author"]["bot"].as_bool().unwrap_or(false),
             webhook_id: message["webhook_id"].as_str(),
@@ -230,6 +262,12 @@ async fn handle_message(
     let addressing::RouteDecision::Dispatch { session_key, .. } = route else {
         return;
     };
+    if parent_channel_id.is_some() {
+        if let Err(error) = session::engage(data, &session_key) {
+            tracing::warn!(%error, "discord thread engagement could not be persisted");
+            return;
+        }
+    }
     if content.trim().is_empty() && attachments.is_empty() {
         return;
     }
@@ -311,6 +349,47 @@ async fn handle_message(
             turns.remove(&session_key);
         }
     });
+}
+
+async fn update_thread(threads: &Arc<Mutex<Threads>>, thread: &Value) {
+    let (Some(id), Some(parent_id)) = (thread["id"].as_str(), thread["parent_id"].as_str()) else {
+        return;
+    };
+    threads
+        .lock()
+        .await
+        .parents
+        .insert(id.to_owned(), parent_id.to_owned());
+}
+
+async fn update_thread_event(
+    threads: &Arc<Mutex<Threads>>,
+    event: Option<&str>,
+    data: &Value,
+) -> bool {
+    match event {
+        Some("THREAD_CREATE") | Some("THREAD_UPDATE") => update_thread(threads, data).await,
+        Some("THREAD_DELETE") => remove_thread(threads, data).await,
+        Some("GUILD_CREATE") | Some("THREAD_LIST_SYNC") => {
+            update_threads(threads, data["threads"].as_array()).await
+        }
+        _ => return false,
+    }
+    true
+}
+
+async fn update_threads(threads: &Arc<Mutex<Threads>>, values: Option<&Vec<Value>>) {
+    for thread in values.into_iter().flatten() {
+        update_thread(threads, thread).await;
+    }
+}
+
+async fn remove_thread(threads: &Arc<Mutex<Threads>>, thread: &Value) {
+    let Some(id) = thread["id"].as_str() else {
+        return;
+    };
+    let mut threads = threads.lock().await;
+    threads.parents.remove(id);
 }
 
 async fn answer(
@@ -410,6 +489,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_create_routes_messages_through_the_parent_channel_config() {
+        let threads = Arc::new(Mutex::new(Threads::default()));
+        update_thread(&threads, &json!({"id":"t1", "parent_id":"c1"})).await;
+        let parent_id = threads.lock().await.parents.get("t1").cloned();
+        let cfg = config::DiscordConfig {
+            guilds: HashMap::from([(
+                "g1".into(),
+                config::GuildConfig {
+                    channels: HashMap::from([("c1".into(), config::ChannelConfig::default())]),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            addressing::route(
+                &cfg,
+                Some("b1"),
+                &addressing::InboundMessage {
+                    guild_id: Some("g1"), channel_id: "t1", parent_channel_id: parent_id.as_deref(), thread_engaged: false,
+                    author_id: "u1", author_is_bot: false, webhook_id: None, text: "<@b1> hello", has_attachments: false,
+                },
+            ),
+            addressing::RouteDecision::Dispatch { session_key, .. }
+                if session_key == session::SessionKey::guild_thread("g1", "t1")
+        ));
+    }
+
+    #[tokio::test]
+    async fn guild_create_backfills_active_threads() {
+        let threads = Arc::new(Mutex::new(Threads::default()));
+        assert!(
+            update_thread_event(
+                &threads,
+                Some("GUILD_CREATE"),
+                &json!({"threads":[{"id":"t1", "parent_id":"c1"}]}),
+            )
+            .await
+        );
+        assert_eq!(
+            threads.lock().await.parents.get("t1"),
+            Some(&"c1".to_owned())
+        );
+    }
+
+    #[tokio::test]
     async fn shutdown_interrupts_a_pending_reconnect_wait() {
         let (tx, rx) = tokio::sync::watch::channel(false);
         tx.send(true).unwrap();
@@ -484,6 +609,7 @@ mod tests {
                     root: ctx.paths.root(),
                     client: &reqwest::Client::new(),
                     turns: &turns,
+                    threads: &Arc::new(Mutex::new(Threads::default())),
                     next_turn: &AtomicU64::new(0),
                 },
                 socket,
