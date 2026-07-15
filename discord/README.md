@@ -27,3 +27,7 @@ extensions:
 `DISCORD_BOT_TOKEN` is used when `bot_token` is omitted. Guilds and channels are deny-by-default: both IDs must be configured and enabled. Empty user allowlists allow every user; populated guild and channel allowlists must both include the sender. Enable the **Message Content Intent** and guild-message intent for the bot in Discord's developer portal.
 
 Every accepted message is immediately acknowledged with `ack_emoji` (default `👀`). Agent failures, a 60-second queue/no-output timeout, and failed reply delivery are surfaced with a visible error; Discord post attempts are retried three times, then the source message receives a `⚠️` reaction if an error message cannot be posted.
+
+## Commands
+
+`/reset` (or `/new`) clears the current channel or DM session; the next message starts fresh. `/abort` (or `/stop`) cancels the active response in that channel or DM. Both commands post a confirmation even when there is no existing session or active response.
