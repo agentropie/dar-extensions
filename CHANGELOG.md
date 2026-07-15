@@ -4,6 +4,8 @@
 
 ### Added
 
+- **discord:** added a Discord DM extension with persisted per-user agent sessions.
+
 - **irc, slack, telegram:** now declare `agent_singleton`, so a non-default
   `dar run --workflow` process skips them — the default-workflow process
   owns the external connection.
