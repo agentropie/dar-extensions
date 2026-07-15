@@ -110,6 +110,7 @@ async fn answer(
             _ => {}
         }
     }
+    chat.close().await?;
     if reply.trim().is_empty() {
         reply = "(no response)".into()
     };
