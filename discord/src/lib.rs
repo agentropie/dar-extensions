@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 mod addressing;
 mod config;
+mod delivery;
 mod live_answer;
 mod markdown;
 mod session;
@@ -78,7 +79,7 @@ async fn run(
     let mut bot_user_id: Option<String> = None;
     dar_extension_sdk::log::event("-", "discord", "gateway connected");
     loop {
-        tokio::select! { _=ctx.shutdown.cancelled()=>return Ok(()), _=heartbeat.tick()=> { write.send(Message::Text(json!({"op":1,"d":sequence}).to_string())).await?; }, message=read.next()=> { let Some(message)=message else { anyhow::bail!("Discord gateway closed") }; let Some(value)=parse_message(message?)? else { continue }; if let Some(seq)=value["s"].as_i64(){sequence=Some(seq)}; if value["t"]=="READY" { bot_user_id=value["d"]["user"]["id"].as_str().map(str::to_owned); } if value["t"]=="MESSAGE_CREATE" { let d=&value["d"]; let route = addressing::route(&cfg, bot_user_id.as_deref(), &addressing::InboundMessage { guild_id: d["guild_id"].as_str(), channel_id: d["channel_id"].as_str().unwrap_or(""), author_id: d["author"]["id"].as_str().unwrap_or(""), author_is_bot: d["author"]["bot"].as_bool().unwrap_or(false), webhook_id: d["webhook_id"].as_str(), text: d["content"].as_str().unwrap_or("") }); let addressing::RouteDecision::Dispatch { text, session_key } = route else { continue }; if text.is_empty(){continue}; let channel=d["channel_id"].as_str().context("Discord message missing channel id")?.to_owned(); let token=token.clone(); let backend=cfg.backend.clone(); let ctx=ctx.clone(); let data=data.clone(); tokio::spawn(async move { if let Err(error)=answer(ctx,backend,&data,&token,&channel,session_key,text).await { tracing::warn!(%error,"discord turn failed") }}); } } }
+        tokio::select! { _=ctx.shutdown.cancelled()=>return Ok(()), _=heartbeat.tick()=> { write.send(Message::Text(json!({"op":1,"d":sequence}).to_string())).await?; }, message=read.next()=> { let Some(message)=message else { anyhow::bail!("Discord gateway closed") }; let Some(value)=parse_message(message?)? else { continue }; if let Some(seq)=value["s"].as_i64(){sequence=Some(seq)}; if value["t"]=="READY" { bot_user_id=value["d"]["user"]["id"].as_str().map(str::to_owned); } if value["t"]=="MESSAGE_CREATE" { let d=&value["d"]; let route = addressing::route(&cfg, bot_user_id.as_deref(), &addressing::InboundMessage { guild_id: d["guild_id"].as_str(), channel_id: d["channel_id"].as_str().unwrap_or(""), author_id: d["author"]["id"].as_str().unwrap_or(""), author_is_bot: d["author"]["bot"].as_bool().unwrap_or(false), webhook_id: d["webhook_id"].as_str(), text: d["content"].as_str().unwrap_or("") }); let addressing::RouteDecision::Dispatch { text, session_key } = route else { continue }; if text.is_empty(){continue}; let channel=d["channel_id"].as_str().context("Discord message missing channel id")?.to_owned(); let message=d["id"].as_str().context("Discord message missing id")?.to_owned(); let token=token.clone(); let ack=cfg.ack_emoji.clone(); let backend=cfg.backend.clone(); let ctx=ctx.clone(); let data=data.clone(); let delivery=delivery::Delivery::new(client.clone(), &token, &channel, &message, &ack); if let Err(error)=delivery.acknowledge().await { delivery.failure(&error).await; continue; } tokio::spawn(async move { if let Err(error)=answer(ctx,backend,&data,&token,&channel,session_key,text).await { tracing::warn!(%error,"discord turn failed"); delivery.failure(&error).await }}); } } }
     }
 }
 async fn answer(
@@ -102,7 +103,9 @@ async fn answer(
         .resume_session_id(session::resume_id(&dir))
         .build();
     let mut chat = backend.open(params, tx).await?;
-    chat.send_turn(text).await?;
+    tokio::time::timeout(Duration::from_secs(60), chat.send_turn(text))
+        .await
+        .context("agent queue timed out")??;
     let mut reply = String::new();
     let mut live = live_answer::LiveAnswer::new(
         reqwest::Client::new(),
@@ -112,7 +115,7 @@ async fn answer(
     );
     loop {
         tokio::select! {
-            event = rx.recv() => match event {
+            event = tokio::time::timeout(Duration::from_secs(60), rx.recv()) => match event.context("agent response timed out")? {
                 Some(ChatEvent::Delta { role: ChatRole::Assistant, text }) => {
                     reply.push_str(&text);
                     live.push(&reply).await?;
