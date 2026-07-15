@@ -28,6 +28,7 @@
 
 ### Fixed
 
+- **discord:** active threads are restored from the gateway's initial guild state, preserving parent-channel addressing after startup or reconnect.
 - **slack:** assistant replies now appear as the runner emits them instead of
   arriving together after a turn completes.
 

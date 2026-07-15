@@ -171,10 +171,10 @@ async fn run_connection(
                 if gateway_requests_reconnect(&value) { anyhow::bail!("Discord gateway requested reconnect"); }
                 if let Some(seq) = value["s"].as_i64() { sequence = Some(seq); }
                 if value["t"] == "READY" { bot_user_id = value["d"]["user"]["id"].as_str().map(str::to_owned); }
+                if update_thread_event(env.threads, value["t"].as_str(), &value["d"]).await {
+                    continue;
+                }
                 match value["t"].as_str() {
-                    Some("THREAD_CREATE") | Some("THREAD_UPDATE") => update_thread(env.threads, &value["d"]).await,
-                    Some("THREAD_DELETE") => remove_thread(env.threads, &value["d"]).await,
-                    Some("THREAD_LIST_SYNC") => update_threads(env.threads, value["d"]["threads"].as_array()).await,
                     Some("MESSAGE_CREATE") => {
                         handle_message(env.ctx, env.cfg, env.token, env.data, env.root, env.client, env.turns, env.threads, env.next_turn, bot_user_id.as_deref(), &value["d"]).await;
                     }
@@ -362,6 +362,22 @@ async fn update_thread(threads: &Arc<Mutex<Threads>>, thread: &Value) {
         .insert(id.to_owned(), parent_id.to_owned());
 }
 
+async fn update_thread_event(
+    threads: &Arc<Mutex<Threads>>,
+    event: Option<&str>,
+    data: &Value,
+) -> bool {
+    match event {
+        Some("THREAD_CREATE") | Some("THREAD_UPDATE") => update_thread(threads, data).await,
+        Some("THREAD_DELETE") => remove_thread(threads, data).await,
+        Some("GUILD_CREATE") | Some("THREAD_LIST_SYNC") => {
+            update_threads(threads, data["threads"].as_array()).await
+        }
+        _ => return false,
+    }
+    true
+}
+
 async fn update_threads(threads: &Arc<Mutex<Threads>>, values: Option<&Vec<Value>>) {
     for thread in values.into_iter().flatten() {
         update_thread(threads, thread).await;
@@ -499,6 +515,23 @@ mod tests {
             addressing::RouteDecision::Dispatch { session_key, .. }
                 if session_key == session::SessionKey::guild_thread("g1", "t1")
         ));
+    }
+
+    #[tokio::test]
+    async fn guild_create_backfills_active_threads() {
+        let threads = Arc::new(Mutex::new(Threads::default()));
+        assert!(
+            update_thread_event(
+                &threads,
+                Some("GUILD_CREATE"),
+                &json!({"threads":[{"id":"t1", "parent_id":"c1"}]}),
+            )
+            .await
+        );
+        assert_eq!(
+            threads.lock().await.parents.get("t1"),
+            Some(&"c1".to_owned())
+        );
     }
 
     #[tokio::test]
