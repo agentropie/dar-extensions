@@ -1,12 +1,50 @@
 use anyhow::Result;
 use dar_extension_sdk::ConfigStore;
 use serde::Deserialize;
+use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiscordConfig {
     pub bot_token: Option<String>,
     pub backend: Option<String>,
+    pub guilds: HashMap<String, GuildConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GuildConfig {
+    pub enabled: bool,
+    pub users: Vec<String>,
+    pub channels: HashMap<String, ChannelConfig>,
+}
+
+impl Default for GuildConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            users: Vec::new(),
+            channels: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChannelConfig {
+    pub enabled: bool,
+    pub require_mention: bool,
+    pub users: Vec<String>,
+}
+
+impl Default for ChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            require_mention: true,
+            users: Vec::new(),
+        }
+    }
 }
 
 pub fn parse(config: &ConfigStore, id: &str) -> Result<DiscordConfig> {

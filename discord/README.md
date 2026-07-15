@@ -1,6 +1,6 @@
 # discord
 
-Discord DM extension for dar. It connects a bot through Discord's Gateway and sends each DM through the configured chat backend; replies are posted as one message. Sessions are keyed by Discord user and persist in `data/discord/sessions/`.
+Discord extension for dar. DMs are accepted as before. Guild messages require an @mention by default, are stripped before forwarding, and each guild channel (including a thread) keeps an isolated session. Bot and webhook messages are ignored.
 
 ## Install
 
@@ -13,6 +13,14 @@ extensions:
   discord:
     bot_token: "Discord bot token"
     # backend: pi # optional cap-chat backend override
+    guilds:
+      "guild-id":
+        users: ["allowed-user-id"] # empty allows every user
+        channels:
+          "channel-id":
+            require_mention: true # default
+            # enabled: false
+            # users: ["allowed-user-id"]
 ```
 
-`DISCORD_BOT_TOKEN` is used when `bot_token` is omitted. Enable the **Message Content Intent** for the bot in Discord's developer portal; the extension requests the Direct Messages gateway intent.
+`DISCORD_BOT_TOKEN` is used when `bot_token` is omitted. Guilds and channels are deny-by-default: both IDs must be configured and enabled. Empty user allowlists allow every user; populated guild and channel allowlists must both include the sender. Enable the **Message Content Intent** and guild-message intent for the bot in Discord's developer portal.

@@ -10,6 +10,9 @@ impl SessionKey {
     pub fn dm(user_id: &str) -> Self {
         Self(format!("dm:{user_id}"))
     }
+    pub fn guild_channel(guild_id: &str, channel_id: &str) -> Self {
+        Self(format!("guild:{guild_id}:channel:{channel_id}"))
+    }
     pub fn directory(&self, data_dir: &Path) -> PathBuf {
         data_dir.join("sessions").join(hex(self.0.as_bytes()))
     }

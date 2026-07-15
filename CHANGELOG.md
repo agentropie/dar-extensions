@@ -4,6 +4,7 @@
 
 ### Added
 
+- **discord:** guild channels now support mention-gated, allowlisted addressing with isolated per-channel sessions.
 - **discord:** added a Discord DM extension with persisted per-user agent sessions.
 - **discord:** replies now stream through live edits and continue across Discord-sized messages.
 
