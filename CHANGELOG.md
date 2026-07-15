@@ -5,6 +5,7 @@
 ### Added
 
 - **discord:** added a Discord DM extension with persisted per-user agent sessions.
+- **discord:** replies now stream through live edits and continue across Discord-sized messages.
 
 - **irc, slack, telegram:** now declare `agent_singleton`, so a non-default
   `dar run --workflow` process skips them — the default-workflow process
