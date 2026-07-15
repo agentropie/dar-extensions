@@ -8,6 +8,7 @@ pub struct InboundMessage<'a> {
     pub author_is_bot: bool,
     pub webhook_id: Option<&'a str>,
     pub text: &'a str,
+    pub has_attachments: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -51,7 +52,10 @@ pub fn route(
         return RouteDecision::Ignore;
     }
     let (mentioned, text) = strip_mention(message.text, bot_user_id);
-    if channel.require_mention && !mentioned {
+    if channel.require_mention
+        && !mentioned
+        && !(message.text.trim().is_empty() && message.has_attachments)
+    {
         return RouteDecision::Ignore;
     }
     RouteDecision::Dispatch {
@@ -113,6 +117,7 @@ mod tests {
             author_is_bot: false,
             webhook_id: None,
             text,
+            has_attachments: false,
         }
     }
 
@@ -217,5 +222,25 @@ mod tests {
             &message(Some("g1"), "thread", "<@b1> hello"),
         );
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn attachment_only_message_bypasses_mention_gating() {
+        assert_eq!(
+            route(&config(), Some("b1"), &message(Some("g1"), "c1", "")),
+            RouteDecision::Ignore
+        );
+        let mut captioned = message(Some("g1"), "c1", "a picture");
+        captioned.has_attachments = true;
+        assert_eq!(
+            route(&config(), Some("b1"), &captioned),
+            RouteDecision::Ignore
+        );
+        let mut attachment = message(Some("g1"), "c1", "");
+        attachment.has_attachments = true;
+        assert!(matches!(
+            route(&config(), Some("b1"), &attachment),
+            RouteDecision::Dispatch { text, .. } if text.is_empty()
+        ));
     }
 }
