@@ -18,7 +18,10 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
-use crate::{addressing, attachments, commands, config, delivery, live_answer, session, Gateway};
+use crate::{
+    addressing, attachments, commands, config, delivery, history::History, live_answer, session,
+    Gateway,
+};
 
 struct ActiveTurn {
     id: u64,
@@ -46,6 +49,7 @@ struct ConnectionEnv<'a> {
     client: &'a reqwest::Client,
     turns: &'a Arc<Mutex<HashMap<session::SessionKey, ActiveTurn>>>,
     threads: &'a Arc<Mutex<Threads>>,
+    history: &'a Arc<History>,
     next_turn: &'a AtomicU64,
 }
 
@@ -59,6 +63,7 @@ pub async fn run(
     let root = ctx.paths.root().to_path_buf();
     let turns = Arc::new(Mutex::new(HashMap::new()));
     let threads = Arc::new(Mutex::new(Threads::default()));
+    let history = Arc::new(History::default());
     let next_turn = AtomicU64::new(0);
     let mut delay = Duration::from_secs(1);
     loop {
@@ -105,6 +110,7 @@ pub async fn run(
                 client: &client,
                 turns: &turns,
                 threads: &threads,
+                history: &history,
                 next_turn: &next_turn,
             },
             socket,
@@ -176,7 +182,7 @@ async fn run_connection(
                 }
                 match value["t"].as_str() {
                     Some("MESSAGE_CREATE") => {
-                        handle_message(env.ctx, env.cfg, env.token, env.data, env.root, env.client, env.turns, env.threads, env.next_turn, bot_user_id.as_deref(), &value["d"]).await;
+                        handle_message(env.ctx, env.cfg, env.token, env.data, env.root, env.client, env.turns, env.threads, env.history, env.next_turn, bot_user_id.as_deref(), &value["d"]).await;
                     }
                     _ => {}
                 }
@@ -223,6 +229,7 @@ async fn handle_message(
     client: &reqwest::Client,
     turns: &Arc<Mutex<HashMap<session::SessionKey, ActiveTurn>>>,
     threads: &Arc<Mutex<Threads>>,
+    history: &Arc<History>,
     next_turn: &AtomicU64,
     bot_user_id: Option<&str>,
     message: &Value,
@@ -244,6 +251,25 @@ async fn handle_message(
     let thread_engaged = thread_session_key
         .as_ref()
         .is_some_and(|key| session::is_engaged(data, key));
+    let history_key = session::history_key(
+        message["guild_id"].as_str(),
+        channel_id,
+        parent_channel_id.as_deref(),
+        message["author"]["id"].as_str(),
+    );
+    if !message["author"]["bot"].as_bool().unwrap_or(false)
+        && message["webhook_id"].as_str().is_none()
+        && (!content.trim().is_empty() || !attachments.is_empty())
+    {
+        if let Some(message_id) = message["id"].as_str() {
+            let history_text = if content.trim().is_empty() {
+                "[attachment]".to_owned()
+            } else {
+                content.to_owned()
+            };
+            history.add(&history_key, message_id.to_owned(), history_text);
+        }
+    }
     let route = addressing::route(
         cfg,
         bot_user_id,
@@ -259,7 +285,7 @@ async fn handle_message(
             has_attachments: !attachments.is_empty(),
         },
     );
-    let addressing::RouteDecision::Dispatch { session_key, .. } = route else {
+    let addressing::RouteDecision::Dispatch { text, session_key } = route else {
         return;
     };
     if parent_channel_id.is_some() {
@@ -295,6 +321,7 @@ async fn handle_message(
                 delivery.failure(&error.into()).await;
                 return;
             }
+            history.clear(&history_key);
         }
         if let Err(error) = delivery.post(commands::reply(command)).await {
             delivery.failure(&error).await;
@@ -303,11 +330,15 @@ async fn handle_message(
     }
     let token = token.to_owned();
     let backend = cfg.backend.clone();
+    let history = Arc::clone(history);
+    let history_limit = cfg.history_limit;
+    let clear_history_after_reply = cfg.clear_history_after_reply;
     let ctx = ctx.clone();
     let data = data.to_path_buf();
     let root = root.to_path_buf();
     let channel = channel.to_owned();
-    let prompt = content.to_owned();
+    let history_message_id = message_id.to_owned();
+    let prompt = text;
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
     let id = next_turn.fetch_add(1, Ordering::Relaxed);
@@ -332,6 +363,11 @@ async fn handle_message(
             &token,
             &channel,
             session_key.clone(),
+            history_key,
+            history_message_id,
+            history,
+            history_limit,
+            clear_history_after_reply,
             prompt,
             attachments,
             cancel,
@@ -400,6 +436,11 @@ async fn answer(
     token: &str,
     channel: &str,
     session_key: session::SessionKey,
+    history_key: String,
+    history_message_id: String,
+    history: Arc<History>,
+    history_limit: usize,
+    clear_history_after_reply: bool,
     text: String,
     attachments: Vec<attachments::Attachment>,
     cancel: CancellationToken,
@@ -408,6 +449,7 @@ async fn answer(
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let text = attachments::prompt(&client, root, &attachments, text).await?;
+    let text = history.prompt(&history_key, &history_message_id, &text, history_limit);
     let dir = session::prepare(data, &session_key)?;
     let backend_id = dar_extension_sdk::chat::resolve_agent_backend(&ctx, configured.as_deref());
     let backend = ctx
@@ -444,6 +486,9 @@ async fn answer(
         reply = "(no response)".into()
     }
     live.finish(&reply).await?;
+    if clear_history_after_reply {
+        history.clear(&history_key);
+    }
     Ok(())
 }
 
@@ -610,6 +655,7 @@ mod tests {
                     client: &reqwest::Client::new(),
                     turns: &turns,
                     threads: &Arc::new(Mutex::new(Threads::default())),
+                    history: &Arc::new(History::default()),
                     next_turn: &AtomicU64::new(0),
                 },
                 socket,

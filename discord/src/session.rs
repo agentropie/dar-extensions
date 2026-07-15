@@ -21,6 +21,18 @@ impl SessionKey {
     }
 }
 
+pub fn history_key(
+    guild_id: Option<&str>,
+    channel_id: &str,
+    _parent_channel_id: Option<&str>,
+    author_id: Option<&str>,
+) -> String {
+    match guild_id {
+        Some(guild_id) => format!("guild:{guild_id}:channel:{channel_id}"),
+        None => format!("dm:{}", author_id.unwrap_or_default()),
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Eq, PartialEq)]
 struct Metadata {
     key: String,
@@ -111,6 +123,18 @@ mod tests {
         assert_ne!(
             SessionKey::guild_channel("g1", "c1"),
             SessionKey::guild_thread("g1", "t1")
+        );
+    }
+
+    #[test]
+    fn history_is_scoped_to_threads_and_dms() {
+        assert_ne!(
+            history_key(Some("g1"), "t1", Some("c1"), Some("u1")),
+            history_key(Some("g1"), "c1", None, Some("u1")),
+        );
+        assert_ne!(
+            history_key(None, "dm", None, Some("u1")),
+            history_key(None, "dm", None, Some("u2")),
         );
     }
     #[test]
