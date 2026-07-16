@@ -209,7 +209,10 @@ mod tests {
 
     #[test]
     fn short_text_is_one_line() {
-        assert_eq!(split_message("hello there", ""), vec!["hello there".to_string()]);
+        assert_eq!(
+            split_message("hello there", ""),
+            vec!["hello there".to_string()]
+        );
     }
 
     #[test]
@@ -228,8 +231,14 @@ mod tests {
 
     #[test]
     fn markdown_links_are_stripped() {
-        assert_eq!(strip_markdown("[see here](https://example.com)"), "see here");
-        assert_eq!(strip_markdown("<https://example.com>"), "https://example.com");
+        assert_eq!(
+            strip_markdown("[see here](https://example.com)"),
+            "see here"
+        );
+        assert_eq!(
+            strip_markdown("<https://example.com>"),
+            "https://example.com"
+        );
     }
 
     #[test]

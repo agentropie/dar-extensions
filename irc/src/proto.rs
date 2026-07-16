@@ -122,7 +122,9 @@ fn normalize_ctcp(sender: &str, raw: &str) -> String {
         .strip_prefix("ACTION ")
         .or_else(|| trimmed.strip_prefix("ACTION"))
     {
-        return format!("* {sender} {}", action.trim_start()).trim_end().to_string();
+        return format!("* {sender} {}", action.trim_start())
+            .trim_end()
+            .to_string();
     }
     trimmed.to_string()
 }

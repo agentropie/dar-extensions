@@ -98,7 +98,7 @@ mod tests {
         assert!(g.should_respond(true, "#room"));
         assert!(g.should_respond(true, "#room"));
         assert!(!g.should_respond(true, "#room")); // capped
-        // A human speaks: counter resets.
+                                                   // A human speaks: counter resets.
         assert!(g.should_respond(false, "#room"));
         assert_eq!(g.count("#room"), 0);
         // Bot turns are allowed again, up to the cap.

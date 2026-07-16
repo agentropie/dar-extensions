@@ -151,12 +151,13 @@ pub async fn connect_and_register(cfg: &IrcConfig) -> Result<Connection> {
     }
     let mut nick = base_nick.to_string();
     conn.sender().send_raw(&format!("NICK {nick}")).await?;
-    conn.sender().send_raw(&format!(
-        "USER {} 0 * :{}",
-        cfg.effective_username(),
-        cfg.effective_realname()
-    ))
-    .await?;
+    conn.sender()
+        .send_raw(&format!(
+            "USER {} 0 * :{}",
+            cfg.effective_username(),
+            cfg.effective_realname()
+        ))
+        .await?;
 
     // Drive the registration to 001 (RPL_WELCOME), retrying nick on 433.
     let registered = drive_registration(&mut conn, &mut nick, base_nick).await?;
@@ -168,7 +169,9 @@ pub async fn connect_and_register(cfg: &IrcConfig) -> Result<Connection> {
 
     // NickServ IDENTIFY.
     if let Some(pw) = cfg.nickserv_password.as_deref().filter(|p| !p.is_empty()) {
-        conn.sender().send_raw(&format!("PRIVMSG NickServ :IDENTIFY {pw}")).await?;
+        conn.sender()
+            .send_raw(&format!("PRIVMSG NickServ :IDENTIFY {pw}"))
+            .await?;
         tracing::info!("irc sent NickServ IDENTIFY");
     }
 

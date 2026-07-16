@@ -158,12 +158,18 @@ pub fn strip_mention<'a>(text: &'a str, bot_nick: &str) -> &'a str {
     }
     let (candidate, rest) = after_at.split_at(bot_nick.len());
     if !candidate.eq_ignore_ascii_case(bot_nick)
-        || rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        || rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
     {
         return t;
     }
     // After the nick: optional `:` or `,`, then trim whitespace.
-    let rest = rest.strip_prefix(':').or_else(|| rest.strip_prefix(',')).unwrap_or(rest);
+    let rest = rest
+        .strip_prefix(':')
+        .or_else(|| rest.strip_prefix(','))
+        .unwrap_or(rest);
     rest.trim_start()
 }
 
@@ -195,7 +201,11 @@ mod tests {
 
     #[test]
     fn channel_with_colon_mention_is_reply() {
-        let (v, _) = classify(&pm("alice", "#room", "darbot: do the thing"), "darbot", true);
+        let (v, _) = classify(
+            &pm("alice", "#room", "darbot: do the thing"),
+            "darbot",
+            true,
+        );
         assert_eq!(v, Verdict::Reply);
     }
 
@@ -220,7 +230,11 @@ mod tests {
 
     #[test]
     fn self_authored_is_ignored() {
-        let (v, _) = classify(&pm("darbot", "#room", "darbot: my own message"), "darbot", true);
+        let (v, _) = classify(
+            &pm("darbot", "#room", "darbot: my own message"),
+            "darbot",
+            true,
+        );
         assert_eq!(v, Verdict::Ignore);
         let (v2, _) = classify(&pm("DarBot", "#room", "hi"), "darbot", true);
         assert_eq!(v2, Verdict::Ignore);
@@ -243,9 +257,15 @@ mod tests {
     fn strip_mention_removes_address() {
         assert_eq!(strip_mention("darbot: do it", "darbot"), "do it");
         assert_eq!(strip_mention("darbot, please", "darbot"), "please");
-        assert_eq!(strip_mention("no address here", "darbot"), "no address here");
+        assert_eq!(
+            strip_mention("no address here", "darbot"),
+            "no address here"
+        );
         // Substring of the nick must not be stripped.
-        assert_eq!(strip_mention("darbotic things", "darbot"), "darbotic things");
+        assert_eq!(
+            strip_mention("darbotic things", "darbot"),
+            "darbotic things"
+        );
     }
 
     #[test]
@@ -291,7 +311,10 @@ mod tests {
         // `@dale do it` → `do it`
         assert_eq!(strip_mention("@dale do it", "dale"), "do it");
         // Inline nick: text is unchanged.
-        assert_eq!(strip_mention("yo dale you here?", "dale"), "yo dale you here?");
+        assert_eq!(
+            strip_mention("yo dale you here?", "dale"),
+            "yo dale you here?"
+        );
     }
 
     #[test]
