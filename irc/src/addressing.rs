@@ -119,13 +119,15 @@ pub fn is_mention(text: &str, bot_nick: &str) -> bool {
         Some(r) => (true, r),
         None => (false, trimmed),
     };
-    if rest.len() < bot_nick.len() {
+    // `get` returns None both when `rest` is too short and when the index
+    // would land inside a multi-byte char; either way there's no mention.
+    let Some(candidate) = rest.get(..bot_nick.len()) else {
         return false;
-    }
-    let (candidate, after) = rest.split_at(bot_nick.len());
+    };
     if !candidate.eq_ignore_ascii_case(bot_nick) {
         return false;
     }
+    let after = &rest[bot_nick.len()..];
     if has_at {
         // A boundary after the nick: end of string, whitespace, `:` or `,`.
         match after.chars().next() {
@@ -152,11 +154,13 @@ pub fn strip_mention<'a>(text: &'a str, bot_nick: &str) -> &'a str {
     let t = text.trim_start();
     // Strip optional leading `@`.
     let after_at = t.strip_prefix('@').unwrap_or(t);
-    // Check if the nick matches at the start (case-insensitive).
-    if after_at.len() < bot_nick.len() {
+    // Check if the nick matches at the start (case-insensitive). `get` returns
+    // None both when `after_at` is too short and when the index would land
+    // inside a multi-byte char; either way the text is unchanged.
+    let Some(candidate) = after_at.get(..bot_nick.len()) else {
         return t;
-    }
-    let (candidate, rest) = after_at.split_at(bot_nick.len());
+    };
+    let rest = &after_at[bot_nick.len()..];
     if !candidate.eq_ignore_ascii_case(bot_nick)
         || rest
             .chars()
@@ -321,6 +325,25 @@ mod tests {
     fn conversation_keys_are_distinct_and_safe() {
         assert_eq!(Conversation::Channel("#room".into()).key(), "chan__room");
         assert_eq!(Conversation::Dm("alice".into()).key(), "dm_alice");
+    }
+
+    #[test]
+    fn is_mention_on_non_char_boundary_does_not_panic() {
+        // "Findev" is 6 bytes, but byte index 6 in this message falls inside
+        // the 3-byte em dash "—" (bytes 4..7). A naive `split_at` would panic.
+        assert!(!is_mention("Yes — saw it. Findev reported:", "Findev"));
+    }
+
+    #[test]
+    fn strip_mention_on_non_char_boundary_returns_unchanged() {
+        let text = "Yes — saw it. Findev reported:";
+        assert_eq!(strip_mention(text, "Findev"), text);
+    }
+
+    #[test]
+    fn is_mention_on_short_multibyte_message_does_not_panic() {
+        // Already handled by the length guard, but cheap to pin.
+        assert!(!is_mention("👀", "Findev"));
     }
 
     #[test]
