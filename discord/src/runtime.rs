@@ -180,11 +180,8 @@ async fn run_connection(
                 if update_thread_event(env.threads, value["t"].as_str(), &value["d"]).await {
                     continue;
                 }
-                match value["t"].as_str() {
-                    Some("MESSAGE_CREATE") => {
-                        handle_message(env.ctx, env.cfg, env.token, env.data, env.root, env.client, env.turns, env.threads, env.history, env.next_turn, bot_user_id.as_deref(), &value["d"]).await;
-                    }
-                    _ => {}
+                if let Some("MESSAGE_CREATE") = value["t"].as_str() {
+                    handle_message(&env, bot_user_id.as_deref(), &value["d"]).await;
                 }
             }
         }
@@ -220,20 +217,17 @@ async fn wait_or_shutdown(shutdown: &mut dar_extension_sdk::ShutdownToken, delay
     tokio::select! { _ = shutdown.cancelled() => {}, _ = tokio::time::sleep(delay) => {} }
 }
 
-async fn handle_message(
-    ctx: &StartCtx,
-    cfg: &config::DiscordConfig,
-    token: &str,
-    data: &Path,
-    root: &Path,
-    client: &reqwest::Client,
-    turns: &Arc<Mutex<HashMap<session::SessionKey, ActiveTurn>>>,
-    threads: &Arc<Mutex<Threads>>,
-    history: &Arc<History>,
-    next_turn: &AtomicU64,
-    bot_user_id: Option<&str>,
-    message: &Value,
-) {
+async fn handle_message(env: &ConnectionEnv<'_>, bot_user_id: Option<&str>, message: &Value) {
+    let ctx = env.ctx;
+    let cfg = env.cfg;
+    let token = env.token;
+    let data = env.data;
+    let root = env.root;
+    let client = env.client;
+    let turns = env.turns;
+    let threads = env.threads;
+    let history = env.history;
+    let next_turn = env.next_turn;
     let attachments = attachments::parse(message["attachments"].as_array());
     let content = message["content"].as_str().unwrap_or("");
     if let Some(thread) = message.get("thread") {
@@ -248,9 +242,9 @@ async fn handle_message(
         .as_str()
         .zip(parent_channel_id.as_ref())
         .map(|(guild_id, _)| session::SessionKey::guild_thread(guild_id, channel_id));
-    let thread_engaged = thread_session_key
-        .as_ref()
-        .is_some_and(|key| session::is_engaged(data, key));
+    let thread_engaged = thread_session_key.as_ref().is_some_and(|key| {
+        session::is_active_engagement(data, key, cfg.sessions.idle_minutes, session::now())
+    });
     let history_key = session::history_key(
         message["guild_id"].as_str(),
         channel_id,
@@ -288,12 +282,6 @@ async fn handle_message(
     let addressing::RouteDecision::Dispatch { text, session_key } = route else {
         return;
     };
-    if parent_channel_id.is_some() {
-        if let Err(error) = session::engage(data, &session_key) {
-            tracing::warn!(%error, "discord thread engagement could not be persisted");
-            return;
-        }
-    }
     if content.trim().is_empty() && attachments.is_empty() {
         return;
     }
@@ -317,8 +305,8 @@ async fn handle_message(
             turn.stop().await;
         }
         if command == commands::Command::Reset {
-            if let Err(error) = session::reset(data, &session_key) {
-                delivery.failure(&error.into()).await;
+            if let Err(error) = session::reset_with_activity(data, &session_key, session::now()) {
+                delivery.failure(&error).await;
                 return;
             }
             history.clear(&history_key);
@@ -327,6 +315,33 @@ async fn handle_message(
             delivery.failure(&error).await;
         }
         return;
+    }
+    if let Some(turn) = turns.lock().await.remove(&session_key) {
+        turn.stop().await;
+    }
+    match session::prepare_activity(
+        data,
+        &session_key,
+        cfg.sessions.idle_minutes,
+        session::now(),
+    ) {
+        Ok(true) => {
+            history.clear(&history_key);
+            if let Err(error) = delivery.post(session::EXPIRED_NOTICE).await {
+                tracing::warn!(%error, "discord expiry notice delivery failed");
+            }
+        }
+        Ok(false) => {}
+        Err(error) => {
+            delivery.failure(&error).await;
+            return;
+        }
+    }
+    if parent_channel_id.is_some() {
+        if let Err(error) = session::engage(data, &session_key) {
+            delivery.failure(&error).await;
+            return;
+        }
     }
     let token = token.to_owned();
     let backend = cfg.backend.clone();
@@ -355,23 +370,23 @@ async fn handle_message(
     }
     let turns = Arc::clone(turns);
     tokio::spawn(async move {
-        if let Err(error) = answer(
+        if let Err(error) = answer(AnswerRequest {
             ctx,
-            backend,
-            &data,
-            &root,
-            &token,
-            &channel,
-            session_key.clone(),
+            configured: backend,
+            data,
+            root,
+            token,
+            channel,
+            session_key: session_key.clone(),
             history_key,
             history_message_id,
             history,
             history_limit,
             clear_history_after_reply,
-            prompt,
+            text: prompt,
             attachments,
             cancel,
-        )
+        })
         .await
         {
             if !task_cancel.is_cancelled() {
@@ -428,13 +443,13 @@ async fn remove_thread(threads: &Arc<Mutex<Threads>>, thread: &Value) {
     threads.parents.remove(id);
 }
 
-async fn answer(
+struct AnswerRequest {
     ctx: StartCtx,
     configured: Option<String>,
-    data: &Path,
-    root: &Path,
-    token: &str,
-    channel: &str,
+    data: std::path::PathBuf,
+    root: std::path::PathBuf,
+    token: String,
+    channel: String,
     session_key: session::SessionKey,
     history_key: String,
     history_message_id: String,
@@ -444,13 +459,32 @@ async fn answer(
     text: String,
     attachments: Vec<attachments::Attachment>,
     cancel: CancellationToken,
-) -> Result<()> {
+}
+
+async fn answer(request: AnswerRequest) -> Result<()> {
+    let AnswerRequest {
+        ctx,
+        configured,
+        data,
+        root,
+        token,
+        channel,
+        session_key,
+        history_key,
+        history_message_id,
+        history,
+        history_limit,
+        clear_history_after_reply,
+        text,
+        attachments,
+        cancel,
+    } = request;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    let text = attachments::prompt(&client, root, &attachments, text).await?;
+    let text = attachments::prompt(&client, &root, &attachments, text).await?;
     let text = history.prompt(&history_key, &history_message_id, &text, history_limit);
-    let dir = session::prepare(data, &session_key)?;
+    let dir = session::prepare(&data, &session_key)?;
     let backend_id = dar_extension_sdk::chat::resolve_agent_backend(&ctx, configured.as_deref());
     let backend = ctx
         .host
@@ -467,8 +501,8 @@ async fn answer(
     let mut live = live_answer::LiveAnswer::new(
         reqwest::Client::new(),
         "https://discord.com/api/v10",
-        token,
-        channel,
+        &token,
+        &channel,
     );
     let mut aborted = false;
     loop {

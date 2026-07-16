@@ -11,6 +11,7 @@ pub struct DiscordConfig {
     pub ack_emoji: String,
     pub history_limit: usize,
     pub clear_history_after_reply: bool,
+    pub sessions: SessionsConfig,
     pub guilds: HashMap<String, GuildConfig>,
 }
 
@@ -22,8 +23,20 @@ impl Default for DiscordConfig {
             ack_emoji: "👀".into(),
             history_limit: 20,
             clear_history_after_reply: false,
+            sessions: SessionsConfig::default(),
             guilds: HashMap::new(),
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionsConfig {
+    pub idle_minutes: u64,
+}
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self { idle_minutes: 360 }
     }
 }
 
@@ -89,6 +102,13 @@ mod tests {
     #[test]
     fn rejects_unknown_config() {
         assert!(serde_json::from_value::<DiscordConfig>(serde_json::json!({"nope":true})).is_err());
+    }
+    #[test]
+    fn session_defaults_and_zero_parse() {
+        assert_eq!(DiscordConfig::default().sessions.idle_minutes, 360);
+        let cfg: DiscordConfig =
+            serde_json::from_value(serde_json::json!({"sessions":{"idle_minutes":0}})).unwrap();
+        assert_eq!(cfg.sessions.idle_minutes, 0);
     }
     #[test]
     fn parses_extension_config() {

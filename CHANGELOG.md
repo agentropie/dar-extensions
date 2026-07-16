@@ -4,6 +4,7 @@
 
 ### Added
 
+- **discord:** session generations rotate lazily after configurable idle expiry (`sessions.idle_minutes`, default 360; `0` disables); persisted activity survives restart and legacy contexts remain resumable.
 - **discord:** recent channel and thread messages are now supplied as bounded, configurable agent context.
 - **discord:** text-channel threads now inherit parent-channel addressing, reply in-thread, and keep isolated engaged sessions for follow-ups.
 - **discord:** the gateway now reconnects with capped exponential backoff and cleanly drains active turns during shutdown.

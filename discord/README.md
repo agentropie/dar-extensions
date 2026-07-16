@@ -15,6 +15,8 @@ extensions:
     ack_emoji: "👀" # optional immediate acknowledgement
     history_limit: 20 # recent prior messages included with each accepted turn; 0 keeps all buffered (max 50)
     clear_history_after_reply: false # set true to discard that channel/thread history after a successful reply
+    sessions:
+      idle_minutes: 360 # lazy expiry on next accepted turn; 0 disables
     # backend: pi # optional cap-chat backend override
     guilds:
       "guild-id":
@@ -40,4 +42,4 @@ Recent human messages are kept in memory per channel or thread (and per DM), inc
 
 ## Commands
 
-`/reset` (or `/new`) clears the current channel or DM session; the next message starts fresh. `/abort` (or `/stop`) cancels the active response in that channel or DM. Both commands post a confirmation even when there is no existing session or active response.
+Sessions rotate append-only after 360 idle minutes of accepted agent-turn activity by default (`sessions.idle_minutes`; `0` disables); unaddressed history traffic does not refresh TTL. Rotation retains old generation data on disk but makes it inactive, clears buffered history and thread engagement, and posts `Previous session expired; starting fresh.` on next accepted message. Existing session layouts resume without forced rotation. `/reset` (or `/new`) clears the current channel or DM session; the next message starts fresh. `/abort` (or `/stop`) cancels the active response in that channel or DM. Both commands post a confirmation even when there is no existing session or active response.
