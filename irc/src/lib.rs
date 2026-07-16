@@ -573,21 +573,24 @@ async fn handle_reply(
     );
     let target = conv.reply_target(&pm.sender);
 
-    // Coalesce rapid successive lines from the SAME DM into one prompt. A pasted
-    // multi-line DM arrives as several PRIVMSGs back-to-back; without this each
-    // line would spawn its own serial turn (the accidental serial-turn bug). We
-    // buffer the addressed line, then briefly wait for more lines from the same
-    // DM, folding each into the prompt and resetting the timer.
+    // Coalesce rapid successive lines from the SAME conversation AND sender into
+    // one prompt. A pasted multi-line DM (or channel message) arrives as several
+    // PRIVMSGs back-to-back; without this each line would spawn its own serial
+    // turn (the accidental serial-turn bug). We buffer the addressed line, then
+    // briefly wait for more lines from the same conversation and sender, folding
+    // each into the prompt and resetting the timer.
     //
-    // Restricted to DMs on purpose: a DM conversation is exactly one sender, so
-    // coalescing only ever merges that one person's paste. A channel conversation
-    // is keyed by channel name, so coalescing there could fold two *different*
-    // humans' mentions into one turn — so channel mentions keep their own
-    // per-message turn.
+    // Keyed by (conversation, sender) rather than conversation alone: a DM
+    // conversation is already exactly one sender, but a channel conversation is
+    // keyed by channel name and can hold many humans, so the sender check keeps
+    // two different humans' channel messages from ever being merged into one
+    // turn. Only the first line of a channel paste carries the `nick:` mention
+    // prefix — the rest classify as ContextOnly — so same-sender ContextOnly
+    // lines within the window fold in too (see `coalesce_followups`).
     let mut request_lines = vec![strip_mention(&pm.text, &bot_nick).to_string()];
     let mut carry = None;
-    if !debounce.is_zero() && matches!(conv, Conversation::Dm(_)) {
-        carry = coalesce_followups(rx, &conv, &bot_nick, debounce, &mut request_lines, sender).await;
+    if !debounce.is_zero() {
+        carry = coalesce_followups(rx, &conv, &pm.sender, &bot_nick, debounce, &mut request_lines, sender).await;
     }
 
     // Pickup ack: send a `👀` once the full burst has been coalesced, right
@@ -619,13 +622,18 @@ async fn handle_reply(
 }
 
 /// During the debounce window, drain further lines addressed to the SAME
-/// conversation and fold them into `request_lines`. Any line for a DIFFERENT
-/// conversation, or of another verdict, is not consumed here — the worker will
-/// process it on the next loop. Non-matching control/context is applied inline so
-/// nothing is dropped. Each matching line resets the window.
+/// conversation AND SAME sender (case-insensitive nick match) and fold them into
+/// `request_lines`. A matching `Reply` line folds in as-is; a matching
+/// `ContextOnly` line also folds in, since a channel paste's second and later
+/// lines lack the `nick:` mention prefix and would otherwise classify as
+/// ContextOnly and be misread as ambient chatter. Anything else — a different
+/// conversation, a different sender, or an unrelated verdict — is not consumed
+/// here: it is handed back as carry so the worker processes it on the next loop
+/// instead of dropping it. Each matching line resets the window.
 async fn coalesce_followups(
     rx: &mut mpsc::Receiver<WorkerMsg>,
     conv: &Conversation,
+    burst_sender: &str,
     bot_nick: &str,
     debounce: Duration,
     request_lines: &mut Vec<String>,
@@ -634,12 +642,15 @@ async fn coalesce_followups(
     loop {
         match tokio::time::timeout(debounce, rx.recv()).await {
             Ok(Some(WorkerMsg::Msg(next))) => {
-                if &next.conv == conv && next.verdict == Verdict::Reply {
+                let same_burst = &next.conv == conv
+                    && next.pm.sender.eq_ignore_ascii_case(burst_sender)
+                    && matches!(next.verdict, Verdict::Reply | Verdict::ContextOnly);
+                if same_burst {
                     request_lines.push(strip_mention(&next.pm.text, bot_nick).to_string());
                     // Keep waiting: this resets the window by looping.
                 } else {
-                    // A line for a different conversation: hand it back so the
-                    // worker processes it next instead of dropping it.
+                    // Not part of this burst: hand it back so the worker
+                    // processes it next instead of dropping it.
                     return Some(next);
                 }
             }
@@ -970,6 +981,20 @@ mod tests {
         }
     }
 
+    /// A `#room` channel message classified against `bot_nick`: `Reply` when
+    /// `text` leads with the mention, `ContextOnly` otherwise (the shape of the
+    /// second and later lines of a channel paste).
+    fn channel_incoming(sender: &str, bot_nick: &str, text: &str) -> Incoming {
+        let p = pm(sender, "#room", text);
+        let (verdict, conv) = classify(&p, bot_nick, true);
+        Incoming {
+            pm: p,
+            conv,
+            verdict,
+            bot_nick: bot_nick.to_string(),
+        }
+    }
+
     /// A fresh ChannelState with no known humans (default config) for prompt tests.
     fn empty_state() -> ChannelState {
         ChannelState {
@@ -995,6 +1020,7 @@ mod tests {
         let carry = coalesce_followups(
             &mut rx,
             &conv,
+            "thinh",
             "darbot",
             Duration::from_millis(1500),
             &mut lines,
@@ -1026,6 +1052,7 @@ mod tests {
         let carry = coalesce_followups(
             &mut rx,
             &conv,
+            "thinh",
             "darbot",
             Duration::from_millis(1500),
             &mut lines,
@@ -1035,6 +1062,99 @@ mod tests {
         let carried = carry.expect("cross-conversation line must be carried, not dropped");
         assert_eq!(carried.pm.sender, "alice");
         assert_eq!(lines, vec!["hello"]); // unchanged: not folded in
+    }
+
+    /// A channel paste from the SAME sender folds in even though only its first
+    /// line carries the mention: the second line classifies as ContextOnly, not
+    /// Reply, and must still be coalesced (otherwise it would leak into the
+    /// context ring instead of the prompt).
+    #[tokio::test(start_paused = true)]
+    async fn coalesce_folds_channel_paste_from_same_sender() {
+        let (tx, mut rx) = mpsc::channel::<WorkerMsg>(16);
+        // A same-sender follow-up with no mention: ContextOnly.
+        tx.send(WorkerMsg::Msg(channel_incoming("thinh", "darbot", "plain follow-up line")))
+            .await
+            .unwrap();
+        // A same-sender follow-up that re-addresses the bot: Reply.
+        tx.send(WorkerMsg::Msg(channel_incoming("thinh", "darbot", "darbot: more")))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let conv = Conversation::Channel("#room".into());
+        let mut lines = vec!["darbot: first line".to_string()];
+        let mut sender: Option<conn::Sender> = None;
+        let carry = coalesce_followups(
+            &mut rx,
+            &conv,
+            "thinh",
+            "darbot",
+            Duration::from_millis(1500),
+            &mut lines,
+            &mut sender,
+        )
+        .await;
+        assert!(carry.is_none(), "same-sender channel burst must fully fold");
+        assert_eq!(
+            lines,
+            vec!["darbot: first line", "plain follow-up line", "more"]
+        );
+    }
+
+    /// A channel line from a DIFFERENT sender must never be folded into another
+    /// human's burst, even mid-window — the fix that lets channel coalescing
+    /// stay safe for multi-human rooms.
+    #[tokio::test(start_paused = true)]
+    async fn coalesce_carries_different_sender_channel_line() {
+        let (tx, mut rx) = mpsc::channel::<WorkerMsg>(16);
+        tx.send(WorkerMsg::Msg(channel_incoming("alice", "darbot", "darbot: butting in")))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let conv = Conversation::Channel("#room".into());
+        let mut lines = vec!["darbot: first line".to_string()];
+        let mut sender: Option<conn::Sender> = None;
+        let carry = coalesce_followups(
+            &mut rx,
+            &conv,
+            "thinh",
+            "darbot",
+            Duration::from_millis(1500),
+            &mut lines,
+            &mut sender,
+        )
+        .await;
+        let carried = carry.expect("different-sender channel line must be carried, not dropped");
+        assert_eq!(carried.pm.sender, "alice");
+        assert_eq!(lines, vec!["darbot: first line"]); // unchanged: not folded in
+    }
+
+    /// IRC nicks are case-insensitive: a follow-up from "THINH" still matches a
+    /// burst opened by "thinh".
+    #[tokio::test(start_paused = true)]
+    async fn coalesce_sender_match_is_case_insensitive() {
+        let (tx, mut rx) = mpsc::channel::<WorkerMsg>(16);
+        tx.send(WorkerMsg::Msg(channel_incoming("THINH", "darbot", "darbot: more")))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let conv = Conversation::Channel("#room".into());
+        let mut lines = vec!["darbot: first line".to_string()];
+        let mut sender: Option<conn::Sender> = None;
+        let carry = coalesce_followups(
+            &mut rx,
+            &conv,
+            "thinh",
+            "darbot",
+            Duration::from_millis(1500),
+            &mut lines,
+            &mut sender,
+        )
+        .await;
+        assert!(carry.is_none(), "case-insensitive same-sender line must fold in");
+        assert_eq!(lines, vec!["darbot: first line", "more"]);
     }
 
     /// A completed reply produced with no live link is queued, then delivered on
