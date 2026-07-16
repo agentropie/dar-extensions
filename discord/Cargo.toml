@@ -23,9 +23,9 @@ tracing = "0.1"
 url = "2"
 
 [dev-dependencies]
-dar-host-api = { path = "/Users/agents/code/agentropy/dar/crates/host-api" }
+dar-host-api = { path = "../../dar/crates/host-api" }
 
 [workspace]
 
 [patch.crates-io]
-dar-extension-sdk = { path = "/Users/agents/code/agentropy/dar/crates/extension-sdk" }
+dar-extension-sdk = { path = "../../dar/crates/extension-sdk" }
