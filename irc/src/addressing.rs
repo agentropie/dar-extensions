@@ -93,44 +93,50 @@ pub fn classify(pm: &PrivMsg, bot_nick: &str, mention_required: bool) -> (Verdic
     }
 }
 
-/// True if `c` is an ASCII alphanumeric character (used for word-boundary checks).
-fn is_nick_char(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-}
-
-/// True if `text` mentions `bot_nick` as a whole word anywhere in the text
-/// (case-insensitive). A "whole word" means the characters immediately before
-/// and after the matched nick are NOT ASCII-alphanumeric (start/end of string
-/// also count as boundaries).
+/// True if `text` addresses `bot_nick` at the start of the message
+/// (case-insensitive), mirroring aihub's `isAddressed` regex
+/// `^\s*nick\s*[:,]\s*` plus an `@nick` form. Concretely:
+///
+///   `\s* nick [:,]`      — the nick, optionally preceded by whitespace, must
+///                          be followed by a `:` or `,` separator (itself
+///                          optionally preceded by whitespace). E.g.
+///                          `darbot: hi`, `darbot, hi`, `darbot , hi`.
+///   `\s* @ nick <boundary>` — an `@`-prefixed nick just needs a boundary
+///                          after it: end of string, whitespace, `:` or `,`.
+///                          E.g. `@darbot`, `@darbot help`, `@darbot: help`.
+///
+/// A bare, unaddressed nick (`darbot do it`) and inline/mid-sentence mentions
+/// (`hey darbot can you help`) are NOT mentions — the nick must lead the
+/// message. Substrings never match (`darbotic things` is not a mention of
+/// `darbot`) because the character right after the nick can't be ASCII
+/// alphanumeric in either form.
 pub fn is_mention(text: &str, bot_nick: &str) -> bool {
     if bot_nick.is_empty() {
         return false;
     }
-    let lower = text.to_ascii_lowercase();
-    let nick = bot_nick.to_ascii_lowercase();
-    let nick_len = nick.len();
-    let bytes = lower.as_bytes();
-
-    let mut start = 0;
-    while start + nick_len <= bytes.len() {
-        if let Some(pos) = lower[start..].find(&nick[..]) {
-            let abs = start + pos;
-            // Check boundary before the match.
-            let before_ok = abs == 0
-                || !is_nick_char(bytes[abs - 1] as char);
-            // Check boundary after the match.
-            let after = abs + nick_len;
-            let after_ok = after >= bytes.len()
-                || !is_nick_char(bytes[after] as char);
-            if before_ok && after_ok {
-                return true;
-            }
-            start = abs + 1;
-        } else {
-            break;
-        }
+    let trimmed = text.trim_start();
+    let (has_at, rest) = match trimmed.strip_prefix('@') {
+        Some(r) => (true, r),
+        None => (false, trimmed),
+    };
+    if rest.len() < bot_nick.len() {
+        return false;
     }
-    false
+    let (candidate, after) = rest.split_at(bot_nick.len());
+    if !candidate.eq_ignore_ascii_case(bot_nick) {
+        return false;
+    }
+    if has_at {
+        // A boundary after the nick: end of string, whitespace, `:` or `,`.
+        match after.chars().next() {
+            None => true,
+            Some(c) => c.is_whitespace() || c == ':' || c == ',',
+        }
+    } else {
+        // No `@`: a `:` or `,` separator is required (optional whitespace before it).
+        let after = after.trim_start();
+        after.starts_with(':') || after.starts_with(',')
+    }
 }
 
 /// Strip a leading address prefix from a mention so the turn sees just the
@@ -151,7 +157,9 @@ pub fn strip_mention<'a>(text: &'a str, bot_nick: &str) -> &'a str {
         return t;
     }
     let (candidate, rest) = after_at.split_at(bot_nick.len());
-    if !candidate.eq_ignore_ascii_case(bot_nick) {
+    if !candidate.eq_ignore_ascii_case(bot_nick)
+        || rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+    {
         return t;
     }
     // After the nick: optional `:` or `,`, then trim whitespace.
@@ -236,6 +244,8 @@ mod tests {
         assert_eq!(strip_mention("darbot: do it", "darbot"), "do it");
         assert_eq!(strip_mention("darbot, please", "darbot"), "please");
         assert_eq!(strip_mention("no address here", "darbot"), "no address here");
+        // Substring of the nick must not be stripped.
+        assert_eq!(strip_mention("darbotic things", "darbot"), "darbotic things");
     }
 
     #[test]
@@ -247,16 +257,31 @@ mod tests {
     }
 
     #[test]
-    fn inline_nick_is_a_mention() {
-        // Nick appearing mid-sentence as a whole word.
-        assert!(is_mention("yo dale you here?", "dale"));
-        assert!(is_mention("hey darbot can you help", "darbot"));
+    fn inline_nick_is_not_a_mention_anymore() {
+        // Nick appearing mid-sentence (not addressing the bot) is no longer a mention.
+        assert!(!is_mention("yo dale you here?", "dale"));
+        assert!(!is_mention("hey darbot can you help", "darbot"));
     }
 
     #[test]
     fn inline_nick_substring_is_not_a_mention() {
         // "darbotic" must not count as addressing "darbot".
         assert!(!is_mention("darbotic things", "darbot"));
+    }
+
+    #[test]
+    fn leading_whitespace_addressing_is_a_mention() {
+        assert!(is_mention("  darbot: hi", "darbot"));
+    }
+
+    #[test]
+    fn bare_leading_nick_without_separator_is_not_a_mention() {
+        assert!(!is_mention("darbot do it", "darbot"));
+    }
+
+    #[test]
+    fn at_prefixed_substring_is_not_a_mention() {
+        assert!(!is_mention("@darbotic", "darbot"));
     }
 
     #[test]
