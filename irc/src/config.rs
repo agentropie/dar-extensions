@@ -294,6 +294,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Serializes tests that touch process-wide env vars; parallel test threads
+    /// otherwise race on set_var/remove_var vs. with_env_fallbacks() reads.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn empty_allowlist_permits_anyone() {
         assert!(dm_authorized("alice", &[]));
@@ -325,9 +329,10 @@ mod tests {
         // silently overridden by a concurrent env var. This protects the
         // non-negotiable loop-guard: `max_bot_turns: 4` (== default) must stay 4
         // even if `IRC_MAX_BOT_TURNS=0` is set in the environment.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("IRC_MAX_BOT_TURNS").ok();
-        // SAFETY: tests in this module that touch this env var are serialized by
-        // running them in one process; we restore the prior value below.
+        // SAFETY: ENV_LOCK serializes access to this env var across tests; we
+        // restore the prior value below.
         unsafe {
             std::env::set_var("IRC_MAX_BOT_TURNS", "0");
         }
@@ -439,10 +444,11 @@ mod tests {
 
     #[test]
     fn ack_honors_env_fallback() {
-        // Env fallback only applies when unset in yaml. Serialize via the prior
-        // value to keep the process-wide env clean for other tests.
+        // Env fallback only applies when unset in yaml. ENV_LOCK serializes
+        // access to keep the process-wide env clean for other tests.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("IRC_ACK").ok();
-        // SAFETY: restored below; env access in this module is single-process.
+        // SAFETY: restored below; ENV_LOCK serializes access in this module.
         unsafe {
             std::env::set_var("IRC_ACK", "false");
         }
@@ -459,8 +465,9 @@ mod tests {
     #[test]
     fn explicit_ack_is_not_overridden_by_env() {
         // An explicit yaml value must survive even with a conflicting env var.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("IRC_ACK").ok();
-        // SAFETY: restored below; env access in this module is single-process.
+        // SAFETY: restored below; ENV_LOCK serializes access in this module.
         unsafe {
             std::env::set_var("IRC_ACK", "true");
         }
