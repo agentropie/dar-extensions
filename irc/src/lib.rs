@@ -47,7 +47,8 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Brief window for a one-shot outbound tool call to observe immediate IRC
 /// rejection numerics after writing PRIVMSG.
 const OUTBOUND_ERROR_WAIT: Duration = Duration::from_millis(750);
-/// The pickup acknowledgement sent the instant a human's message is picked up.
+/// The pickup acknowledgement sent once a human's message burst has been
+/// coalesced, right before the turn runs.
 const ACK_TEXT: &str = "👀";
 
 pub struct IrcExtension;
@@ -572,17 +573,6 @@ async fn handle_reply(
     );
     let target = conv.reply_target(&pm.sender);
 
-    // Pickup ack: send an immediate `👀` the instant a human's message clears
-    // every gate and before the turn runs. Best-effort: a failed send is logged
-    // and swallowed so it can never block or delay the turn.
-    if should_ack(is_bot, cfg.effective_ack()) {
-        if let Some(s) = sender.as_ref() {
-            if let Err(err) = send_reply(s, &target, ACK_TEXT).await {
-                tracing::warn!(error = %err, target, "irc pickup ack failed");
-            }
-        }
-    }
-
     // Coalesce rapid successive lines from the SAME DM into one prompt. A pasted
     // multi-line DM arrives as several PRIVMSGs back-to-back; without this each
     // line would spawn its own serial turn (the accidental serial-turn bug). We
@@ -592,12 +582,24 @@ async fn handle_reply(
     // Restricted to DMs on purpose: a DM conversation is exactly one sender, so
     // coalescing only ever merges that one person's paste. A channel conversation
     // is keyed by channel name, so coalescing there could fold two *different*
-    // humans' mentions into one turn (and ack only the first) — so channel
-    // mentions keep their own per-message turn.
+    // humans' mentions into one turn — so channel mentions keep their own
+    // per-message turn.
     let mut request_lines = vec![strip_mention(&pm.text, &bot_nick).to_string()];
     let mut carry = None;
     if !debounce.is_zero() && matches!(conv, Conversation::Dm(_)) {
         carry = coalesce_followups(rx, &conv, &bot_nick, debounce, &mut request_lines, sender).await;
+    }
+
+    // Pickup ack: send a `👀` once the full burst has been coalesced, right
+    // before the turn runs — this lands after a human's multi-line paste instead
+    // of in the middle of it. Best-effort: a failed send is logged and swallowed
+    // so it can never block or delay the turn.
+    if should_ack(is_bot, cfg.effective_ack()) {
+        if let Some(s) = sender.as_ref() {
+            if let Err(err) = send_reply(s, &target, ACK_TEXT).await {
+                tracing::warn!(error = %err, target, "irc pickup ack failed");
+            }
+        }
     }
 
     let prompt = build_prompt(state, &conv, &pm, &request_lines);
@@ -711,12 +713,12 @@ fn sender_is_bot(sender: &str, humans: &[String]) -> bool {
     !humans.iter().any(|h| h.eq_ignore_ascii_case(sender))
 }
 
-/// Decide whether a picked-up message should get an immediate `👀` pickup ack.
-/// Only known humans are acked, and only when the ack is enabled. Bots are never
-/// acked: this single rule keeps the ack off bot-to-bot traffic and keeps it
-/// aligned with the loop guard, which only ever stays silent on bots. The caller
-/// invokes this post-gate (after the loop guard) so a `true` here implies a reply
-/// will follow.
+/// Decide whether a picked-up message should get a `👀` pickup ack once its
+/// burst has been coalesced. Only known humans are acked, and only when the ack
+/// is enabled. Bots are never acked: this single rule keeps the ack off
+/// bot-to-bot traffic and keeps it aligned with the loop guard, which only ever
+/// stays silent on bots. The caller invokes this post-gate (after the loop guard
+/// and after coalescing) so a `true` here implies a reply will follow.
 fn should_ack(sender_is_bot: bool, ack_enabled: bool) -> bool {
     ack_enabled && !sender_is_bot
 }
