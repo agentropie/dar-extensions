@@ -36,7 +36,7 @@ impl Delivery {
     }
 
     pub async fn failure(&self, _cause: &anyhow::Error) {
-        let text = "Sorry, I couldn't complete that request. Please try again.";
+        let text = "Sorry, I couldn't complete that request. Please try again.".to_owned();
         if self.post(&text).await.is_err() {
             let _ = self.reaction("⚠️", "PUT").await;
         }

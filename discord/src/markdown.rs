@@ -45,7 +45,7 @@ pub fn chunk(input: &str) -> Vec<String> {
             .as_ref()
             .map(|lang| format!("```{lang}\n"))
             .unwrap_or_default();
-        let reserve = if prefix.is_empty() { 4 } else { 4 };
+        let reserve = 4;
         let budget = MESSAGE_LIMIT
             .saturating_sub(prefix.chars().count() + reserve)
             .max(1);
