@@ -47,8 +47,8 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Brief window for a one-shot outbound tool call to observe immediate IRC
 /// rejection numerics after writing PRIVMSG.
 const OUTBOUND_ERROR_WAIT: Duration = Duration::from_millis(750);
-/// The pickup acknowledgement sent once a human's message burst has been
-/// coalesced, right before the turn runs.
+/// The pickup acknowledgement sent once a message burst has been coalesced,
+/// right before the turn runs.
 const ACK_TEXT: &str = "👀";
 
 pub struct IrcExtension;
@@ -62,7 +62,10 @@ impl Extension for IrcExtension {
         "irc"
     }
 
-    fn register<'a>(&'a self, ctx: &'a mut RegisterCtx) -> dar_extension_sdk::BoxFuture<'a, Result<()>> {
+    fn register<'a>(
+        &'a self,
+        ctx: &'a mut RegisterCtx,
+    ) -> dar_extension_sdk::BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let cfg = parse_config(&ctx.config, self.id())?;
             if cfg.server.is_none() {
@@ -81,10 +84,8 @@ impl Extension for IrcExtension {
                 .services
                 .get_named::<dyn ToolRegistryHandle>(TOOL_REGISTRY_SERVICE)
             {
-                registry.register_tool(
-                    irc_send_spec(),
-                    Arc::new(IrcSendTool { cfg: cfg.clone() }),
-                )?;
+                registry
+                    .register_tool(irc_send_spec(), Arc::new(IrcSendTool { cfg: cfg.clone() }))?;
             }
             Ok(())
         })
@@ -336,7 +337,11 @@ async fn run(
         );
         // Hand the worker the fresh sender so it (and any queued reply) targets
         // the live link. If the worker is gone the extension is shutting down.
-        if worker_tx.send(WorkerMsg::Sender(conn.sender())).await.is_err() {
+        if worker_tx
+            .send(WorkerMsg::Sender(conn.sender()))
+            .await
+            .is_err()
+        {
             break;
         }
         match serve(cfg, shutdown, &worker_tx, conn).await {
@@ -528,10 +533,7 @@ async fn handle_reply(
     incoming: Incoming,
 ) -> Option<Incoming> {
     let Incoming {
-        pm,
-        conv,
-        bot_nick,
-        ..
+        pm, conv, bot_nick, ..
     } = incoming;
 
     if let Conversation::Dm(nick) = &conv {
@@ -590,14 +592,23 @@ async fn handle_reply(
     let mut request_lines = vec![strip_mention(&pm.text, &bot_nick).to_string()];
     let mut carry = None;
     if !debounce.is_zero() {
-        carry = coalesce_followups(rx, &conv, &pm.sender, &bot_nick, debounce, &mut request_lines, sender).await;
+        carry = coalesce_followups(
+            rx,
+            &conv,
+            &pm.sender,
+            &bot_nick,
+            debounce,
+            &mut request_lines,
+            sender,
+        )
+        .await;
     }
 
     // Pickup ack: send a `👀` once the full burst has been coalesced, right
-    // before the turn runs — this lands after a human's multi-line paste instead
-    // of in the middle of it. Best-effort: a failed send is logged and swallowed
-    // so it can never block or delay the turn.
-    if should_ack(is_bot, cfg.effective_ack()) {
+    // before the turn runs — this lands after a multi-line paste instead of in
+    // the middle of it. Best-effort: a failed send is logged and swallowed so it
+    // can never block or delay the turn.
+    if should_ack(cfg.effective_ack()) {
         if let Some(s) = sender.as_ref() {
             if let Err(err) = send_reply(s, &target, ACK_TEXT).await {
                 tracing::warn!(error = %err, target, "irc pickup ack failed");
@@ -725,13 +736,10 @@ fn sender_is_bot(sender: &str, humans: &[String]) -> bool {
 }
 
 /// Decide whether a picked-up message should get a `👀` pickup ack once its
-/// burst has been coalesced. Only known humans are acked, and only when the ack
-/// is enabled. Bots are never acked: this single rule keeps the ack off
-/// bot-to-bot traffic and keeps it aligned with the loop guard, which only ever
-/// stays silent on bots. The caller invokes this post-gate (after the loop guard
-/// and after coalescing) so a `true` here implies a reply will follow.
-fn should_ack(sender_is_bot: bool, ack_enabled: bool) -> bool {
-    ack_enabled && !sender_is_bot
+/// burst has been coalesced. The caller invokes this post-gate (after the loop
+/// guard and after coalescing) so a `true` here implies a reply will follow.
+fn should_ack(ack_enabled: bool) -> bool {
+    ack_enabled
 }
 
 /// Buffer an ambient message into the conversation's context ring (bounded to
@@ -830,7 +838,8 @@ async fn observe_privmsg_rejection(conn: &mut Connection, target: &str) -> Resul
 fn is_privmsg_rejection(command: &str) -> bool {
     matches!(
         command,
-        "401" | "403"
+        "401"
+            | "403"
             | "404"
             | "405"
             | "407"
@@ -845,7 +854,9 @@ fn is_privmsg_rejection(command: &str) -> bool {
 }
 
 fn message_mentions_target(params: &[String], target: &str) -> bool {
-    params.iter().any(|param| param.eq_ignore_ascii_case(target))
+    params
+        .iter()
+        .any(|param| param.eq_ignore_ascii_case(target))
 }
 
 /// Ensure a session exists for `conv`, creating it (and its on-disk dir) lazily.
@@ -1010,8 +1021,20 @@ mod tests {
     async fn coalesce_folds_rapid_same_conversation_lines() {
         let (tx, mut rx) = mpsc::channel::<WorkerMsg>(16);
         // Enqueue two rapid follow-ups from the same DM sender.
-        tx.send(WorkerMsg::Msg(reply_incoming("thinh", "darbot", "Deepseek is..."))).await.unwrap();
-        tx.send(WorkerMsg::Msg(reply_incoming("thinh", "darbot", "Test with 40 tweets"))).await.unwrap();
+        tx.send(WorkerMsg::Msg(reply_incoming(
+            "thinh",
+            "darbot",
+            "Deepseek is...",
+        )))
+        .await
+        .unwrap();
+        tx.send(WorkerMsg::Msg(reply_incoming(
+            "thinh",
+            "darbot",
+            "Test with 40 tweets",
+        )))
+        .await
+        .unwrap();
         drop(tx); // close so the window ends after draining
 
         let conv = Conversation::Dm("thinh".into());
@@ -1035,7 +1058,10 @@ mod tests {
 
         let mut state = empty_state();
         let prompt = build_prompt(&mut state, &conv, &pm("thinh", "darbot", "x"), &lines);
-        assert_eq!(prompt, "<thinh> First, verify\nDeepseek is...\nTest with 40 tweets");
+        assert_eq!(
+            prompt,
+            "<thinh> First, verify\nDeepseek is...\nTest with 40 tweets"
+        );
     }
 
     /// A line for a DIFFERENT conversation encountered during the window is not
@@ -1043,7 +1069,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn coalesce_returns_cross_conversation_line_as_carry() {
         let (tx, mut rx) = mpsc::channel::<WorkerMsg>(16);
-        tx.send(WorkerMsg::Msg(reply_incoming("alice", "darbot", "other DM"))).await.unwrap();
+        tx.send(WorkerMsg::Msg(reply_incoming(
+            "alice", "darbot", "other DM",
+        )))
+        .await
+        .unwrap();
         drop(tx);
 
         let conv = Conversation::Dm("thinh".into());
@@ -1072,13 +1102,21 @@ mod tests {
     async fn coalesce_folds_channel_paste_from_same_sender() {
         let (tx, mut rx) = mpsc::channel::<WorkerMsg>(16);
         // A same-sender follow-up with no mention: ContextOnly.
-        tx.send(WorkerMsg::Msg(channel_incoming("thinh", "darbot", "plain follow-up line")))
-            .await
-            .unwrap();
+        tx.send(WorkerMsg::Msg(channel_incoming(
+            "thinh",
+            "darbot",
+            "plain follow-up line",
+        )))
+        .await
+        .unwrap();
         // A same-sender follow-up that re-addresses the bot: Reply.
-        tx.send(WorkerMsg::Msg(channel_incoming("thinh", "darbot", "darbot: more")))
-            .await
-            .unwrap();
+        tx.send(WorkerMsg::Msg(channel_incoming(
+            "thinh",
+            "darbot",
+            "darbot: more",
+        )))
+        .await
+        .unwrap();
         drop(tx);
 
         let conv = Conversation::Channel("#room".into());
@@ -1107,9 +1145,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn coalesce_carries_different_sender_channel_line() {
         let (tx, mut rx) = mpsc::channel::<WorkerMsg>(16);
-        tx.send(WorkerMsg::Msg(channel_incoming("alice", "darbot", "darbot: butting in")))
-            .await
-            .unwrap();
+        tx.send(WorkerMsg::Msg(channel_incoming(
+            "alice",
+            "darbot",
+            "darbot: butting in",
+        )))
+        .await
+        .unwrap();
         drop(tx);
 
         let conv = Conversation::Channel("#room".into());
@@ -1135,9 +1177,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn coalesce_sender_match_is_case_insensitive() {
         let (tx, mut rx) = mpsc::channel::<WorkerMsg>(16);
-        tx.send(WorkerMsg::Msg(channel_incoming("THINH", "darbot", "darbot: more")))
-            .await
-            .unwrap();
+        tx.send(WorkerMsg::Msg(channel_incoming(
+            "THINH",
+            "darbot",
+            "darbot: more",
+        )))
+        .await
+        .unwrap();
         drop(tx);
 
         let conv = Conversation::Channel("#room".into());
@@ -1153,7 +1199,10 @@ mod tests {
             &mut sender,
         )
         .await;
-        assert!(carry.is_none(), "case-insensitive same-sender line must fold in");
+        assert!(
+            carry.is_none(),
+            "case-insensitive same-sender line must fold in"
+        );
         assert_eq!(lines, vec!["darbot: first line", "more"]);
     }
 
@@ -1239,41 +1288,38 @@ mod tests {
     }
 
     #[test]
-    fn should_ack_only_humans_when_enabled() {
+    fn should_ack_all_messages_when_enabled() {
         let humans = vec!["alice".to_string()];
         let cfg = IrcConfig {
             humans: humans.clone(),
             ..IrcConfig::default()
         };
-        // Default config => ack enabled.
         assert!(cfg.effective_ack());
-        // Human sender, ack on => acked.
-        assert!(should_ack(sender_is_bot("alice", &humans), cfg.effective_ack()));
-        // Bot sender, ack on => never acked.
-        assert!(!should_ack(sender_is_bot("otheragent", &humans), cfg.effective_ack()));
+        assert!(!sender_is_bot("alice", &humans));
+        assert!(should_ack(cfg.effective_ack()));
+        // A2A classification still feeds loop guard, but no longer excludes ack.
+        assert!(sender_is_bot("otheragent", &humans));
+        assert!(should_ack(cfg.effective_ack()));
     }
 
     #[test]
-    fn should_ack_off_suppresses_even_for_humans() {
-        let humans = vec!["alice".to_string()];
+    fn should_ack_off_suppresses_all_messages() {
         let cfg = IrcConfig {
-            humans: humans.clone(),
             ack: Some(false),
             ..IrcConfig::default()
         };
         assert!(!cfg.effective_ack());
-        // Even a known human gets no ack when the toggle is off.
-        assert!(!should_ack(sender_is_bot("alice", &humans), cfg.effective_ack()));
-        assert!(!should_ack(sender_is_bot("otheragent", &humans), cfg.effective_ack()));
+        assert!(!should_ack(cfg.effective_ack()));
     }
 
     #[test]
-    fn should_ack_empty_humans_never_acks() {
-        // Fail-closed classification: with no known humans, every sender is a bot,
-        // so the ack never fires even with the toggle on.
+    fn should_ack_empty_humans() {
+        // Fail-closed classification still makes every sender a bot for the loop
+        // guard, but does not affect acknowledgements.
         let cfg = IrcConfig::default();
         assert!(cfg.effective_ack());
-        assert!(!should_ack(sender_is_bot("anyone", &cfg.humans), cfg.effective_ack()));
+        assert!(sender_is_bot("anyone", &cfg.humans));
+        assert!(should_ack(cfg.effective_ack()));
     }
 
     #[test]

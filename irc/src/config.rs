@@ -85,9 +85,9 @@ pub struct IrcConfig {
     /// `IRC_CONTEXT_WINDOW` only when unset in yaml. Use
     /// [`IrcConfig::effective_context_window`] for the resolved value.
     pub(crate) context_window: Option<usize>,
-    /// Send an immediate `👀` acknowledgement the moment a human's message is
-    /// picked up for a reply (before the agent turn runs). Falls back to
-    /// `IRC_ACK` only when unset in yaml. Defaults to true. Use
+    /// Send an immediate `👀` acknowledgement when a message is picked up for a
+    /// reply (before the agent turn runs). Falls back to `IRC_ACK` only when
+    /// unset in yaml. Defaults to true. Use
     /// [`IrcConfig::effective_ack`] for the resolved value.
     pub(crate) ack: Option<bool>,
     /// Debounce window in milliseconds for coalescing rapid successive lines
@@ -185,8 +185,7 @@ impl IrcConfig {
                 .collect();
         }
         if self.mention_required.is_none() {
-            self.mention_required =
-                env_opt("IRC_MENTION_REQUIRED").and_then(|v| v.parse().ok());
+            self.mention_required = env_opt("IRC_MENTION_REQUIRED").and_then(|v| v.parse().ok());
         }
         if self.allowed_users.is_empty() {
             self.allowed_users = env_list("IRC_ALLOWED_USERS");
@@ -235,8 +234,7 @@ impl IrcConfig {
     }
 
     /// Resolved pickup-ack setting: the yaml/env value if set, else the default
-    /// (true). When true, a `👀` is sent the instant a human's message is picked
-    /// up for a reply.
+    /// (true). When true, a `👀` is sent when a message is picked up for a reply.
     pub fn effective_ack(&self) -> bool {
         self.ack.unwrap_or(true)
     }
@@ -381,8 +379,7 @@ mod tests {
 
     #[test]
     fn channels_list_form_parses() {
-        let cfg: IrcConfig =
-            serde_json::from_value(json!({"channels": ["#a", "#b"]})).unwrap();
+        let cfg: IrcConfig = serde_json::from_value(json!({"channels": ["#a", "#b"]})).unwrap();
         assert_eq!(cfg.channels.len(), 2);
         assert_eq!(cfg.channels[0].name, "#a");
         assert!(cfg.channels[0].mention_required.is_none());

@@ -49,7 +49,7 @@ extensions:
     humans: ["alice", "bob"]
     max_bot_turns: 4    # hard cap on consecutive bot-to-bot turns per channel
     context_window: 30  # ambient messages retained per conversation
-    ack: true           # optional, default true; send an immediate 👀 when a human's message is picked up
+    ack: true           # optional, default true; send an immediate 👀 when a message is picked up
     debounce_ms: 1500   # optional, default 1500; coalesce rapid successive lines from the same
                         # sender (e.g. a pasted multi-line DM or channel message) into one turn. 0 disables.
     # optional: pin a cap-chat backend service id. Omit to auto-follow the
@@ -91,7 +91,7 @@ IRC_DEBOUNCE_MS=1500
 | `backend` | string | auto-follow runner, else `irc-pi` | cap-chat backend service id; unregistered id falls back to `irc-pi` |
 | `max_bot_turns` | int | `4` | hard cap on consecutive bot-to-bot turns per channel before going silent |
 | `context_window` | int | `30` | ambient (context-only) messages retained per conversation |
-| `ack` | bool | `true` | send an immediate `👀` to the reply target the moment a human's message is picked up, before the agent turn runs (human-only, best-effort; or `IRC_ACK`) |
+| `ack` | bool | `true` | send an immediate `👀` to the reply target when a message is picked up, before the agent turn runs (best-effort; or `IRC_ACK`) |
 
 The loop-guard classifies channel senders using the `humans` list, which is **independent** of `allowed_users` (a DM-only authorization gate). Any channel sender **not** on `humans` counts as a bot toward the consecutive-bot-turn cap. With an empty `humans` list (the default) there are no known humans, so the cap is fail-closed: it applies to every channel sender and can never be silently disabled. List your channel humans explicitly to let human-driven exchanges run uncapped (a human message resets the per-channel counter).
 

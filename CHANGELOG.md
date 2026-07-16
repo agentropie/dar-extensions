@@ -44,8 +44,8 @@
 - **irc, telegram:** agent system context (skills, environment) is now shared
   with the SDK chat helper so extension-driven turns carry the same grounding as
   native ones. (ALG-315)
-- **irc:** a 👀 reaction acknowledges a human message the moment the agent picks
-  it up. (ALG-318)
+- **irc:** a 👀 reaction acknowledges a message the moment the agent picks it
+  up. (ALG-318)
 - **telegram:** self-clearing 👀 acknowledgement plus a typing indicator while a
   turn is in flight. (ALG-319)
 - **telegram:** agent replies render as rich Markdown with an automatic
