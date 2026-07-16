@@ -17,6 +17,7 @@ mod config;
 mod conn;
 mod loop_guard;
 mod proto;
+mod session;
 mod split;
 
 use std::collections::{HashMap, VecDeque};
@@ -223,15 +224,14 @@ fn parse_config(config: &ConfigStore, id: &str) -> Result<IrcConfig> {
 
 /// One live agent conversation, keyed by [`Conversation`].
 struct ChatConn {
+    directory: std::path::PathBuf,
     session: Box<dyn ChatSession>,
     rx: mpsc::Receiver<ChatEvent>,
-    /// Bounded ring of recent ambient (context-only) messages awaiting flush
-    /// into the next turn's prompt.
-    ambient: VecDeque<String>,
 }
 
 struct ChannelState {
     sessions: HashMap<Conversation, ChatConn>,
+    ambient: HashMap<Conversation, VecDeque<String>>,
     guard: LoopGuard,
 }
 
@@ -431,6 +431,7 @@ async fn worker_loop(
 ) {
     let mut state = ChannelState {
         sessions: HashMap::new(),
+        ambient: HashMap::new(),
         guard: LoopGuard::new(cfg.effective_max_bot_turns()),
     };
     let mut sender: Option<conn::Sender> = None;
@@ -467,7 +468,7 @@ async fn worker_loop(
         match incoming.verdict {
             Verdict::Ignore => continue,
             Verdict::ContextOnly => {
-                ingest_context(ctx, &mut state, cfg, session_dir, &incoming).await;
+                ingest_context(&mut state, cfg, &incoming);
             }
             Verdict::Reply => {
                 carry = handle_reply(
@@ -490,13 +491,7 @@ async fn worker_loop(
 
 /// Ingest an ambient (context-only) channel line: a human resets the loop-guard,
 /// and the line is buffered as bounded context for the next turn.
-async fn ingest_context(
-    ctx: &StartCtx,
-    state: &mut ChannelState,
-    cfg: &IrcConfig,
-    session_dir: &Path,
-    incoming: &Incoming,
-) {
+fn ingest_context(state: &mut ChannelState, cfg: &IrcConfig, incoming: &Incoming) {
     if let Conversation::Channel(ch) = &incoming.conv {
         if !sender_is_bot(&incoming.pm.sender, &cfg.humans) {
             state.guard.note_human(ch);
@@ -507,11 +502,7 @@ async fn ingest_context(
         &incoming.conv,
         &incoming.pm,
         cfg.effective_context_window(),
-        ctx,
-        session_dir,
-        cfg,
-    )
-    .await;
+    );
 }
 
 /// Handle a message that addresses the bot: authorize, apply the loop-guard,
@@ -555,16 +546,7 @@ async fn handle_reply(
             consecutive_bot_turns = state.guard.count(&guard_key),
             "irc bot-to-bot cap reached; staying silent"
         );
-        buffer_ambient(
-            state,
-            &conv,
-            &pm,
-            cfg.effective_context_window(),
-            ctx,
-            session_dir,
-            cfg,
-        )
-        .await;
+        buffer_ambient(state, &conv, &pm, cfg.effective_context_window());
         return None;
     }
 
@@ -574,6 +556,63 @@ async fn handle_reply(
         &format!("message from {} in {}", pm.sender, guard_key),
     );
     let target = conv.reply_target(&pm.sender);
+    let command_text = strip_mention(&pm.text, &bot_nick);
+    if session::is_reset_command(command_text) {
+        if !session::reset_authorized(&pm.sender, &cfg.sessions.reset_users) {
+            deliver(
+                sender,
+                pending,
+                &target,
+                "Not authorized to reset this session.".into(),
+            )
+            .await;
+            return None;
+        }
+        let store = session::Store::new(session_dir, &conv.key());
+        match store.reset(session::now()) {
+            Ok(_) => {
+                state.sessions.remove(&conv);
+                state.ambient.remove(&conv);
+                deliver(sender, pending, &target, session::RESET_REPLY.into()).await;
+            }
+            Err(error) => {
+                deliver(
+                    sender,
+                    pending,
+                    &target,
+                    format!("Failed to reset session: {error}"),
+                )
+                .await
+            }
+        }
+        return None;
+    }
+
+    let store = session::Store::new(session_dir, &conv.key());
+    let prepared = match store.prepare(cfg.sessions.idle_minutes, session::now()) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            deliver(
+                sender,
+                pending,
+                &target,
+                format!("Failed to prepare session: {error}"),
+            )
+            .await;
+            return None;
+        }
+    };
+    let differs = state
+        .sessions
+        .get(&conv)
+        .is_some_and(|conn| conn.directory != prepared.directory);
+    if prepared.expired || differs {
+        state.sessions.remove(&conv);
+    }
+    if prepared.expired {
+        state.ambient.remove(&conv);
+        deliver(sender, pending, &target, session::EXPIRED_NOTICE.into()).await;
+    }
 
     // Coalesce rapid successive lines from the SAME conversation AND sender into
     // one prompt. A pasted multi-line DM (or channel message) arrives as several
@@ -621,7 +660,7 @@ async fn handle_reply(
         ctx,
         shutdown,
         state,
-        session_dir,
+        &prepared.directory,
         cfg.backend.as_deref(),
         &conv,
         prompt,
@@ -653,9 +692,12 @@ async fn coalesce_followups(
     loop {
         match tokio::time::timeout(debounce, rx.recv()).await {
             Ok(Some(WorkerMsg::Msg(next))) => {
+                let reset_followup = next.verdict == Verdict::Reply
+                    && session::is_reset_command(strip_mention(&next.pm.text, bot_nick));
                 let same_burst = &next.conv == conv
                     && next.pm.sender.eq_ignore_ascii_case(burst_sender)
-                    && matches!(next.verdict, Verdict::Reply | Verdict::ContextOnly);
+                    && matches!(next.verdict, Verdict::Reply | Verdict::ContextOnly)
+                    && !reset_followup;
                 if same_burst {
                     request_lines.push(strip_mention(&next.pm.text, bot_nick).to_string());
                     // Keep waiting: this resets the window by looping.
@@ -742,32 +784,15 @@ fn should_ack(ack_enabled: bool) -> bool {
     ack_enabled
 }
 
-/// Buffer an ambient message into the conversation's context ring (bounded to
-/// `window`), opening the session lazily so context accrues even before the first
-/// reply.
-async fn buffer_ambient(
-    state: &mut ChannelState,
-    conv: &Conversation,
-    pm: &PrivMsg,
-    window: usize,
-    ctx: &StartCtx,
-    session_dir: &Path,
-    cfg: &IrcConfig,
-) {
+/// Buffer ambient context without opening or touching a backend session.
+fn buffer_ambient(state: &mut ChannelState, conv: &Conversation, pm: &PrivMsg, window: usize) {
     if window == 0 {
         return;
     }
-    if ensure_session(ctx, state, session_dir, cfg.backend.as_deref(), conv)
-        .await
-        .is_err()
-    {
-        return;
-    }
-    let conn = state.sessions.get_mut(conv).expect("session ensured");
-    conn.ambient
-        .push_back(format!("<{}> {}", pm.sender, pm.text));
-    while conn.ambient.len() > window {
-        conn.ambient.pop_front();
+    let ambient = state.ambient.entry(conv.clone()).or_default();
+    ambient.push_back(format!("<{}> {}", pm.sender, pm.text));
+    while ambient.len() > window {
+        ambient.pop_front();
     }
 }
 
@@ -787,11 +812,7 @@ fn build_prompt(
         .filter(|l| !l.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
-    let ambient = state
-        .sessions
-        .get_mut(conv)
-        .map(|c| std::mem::take(&mut c.ambient))
-        .unwrap_or_default();
+    let ambient = state.ambient.remove(conv).unwrap_or_default();
     if ambient.is_empty() {
         format!("<{}> {}", pm.sender, request)
     } else {
@@ -863,17 +884,14 @@ fn message_mentions_target(params: &[String], target: &str) -> bool {
 async fn ensure_session(
     ctx: &StartCtx,
     state: &mut ChannelState,
-    base_dir: &Path,
+    directory: &Path,
     configured: Option<&str>,
     conv: &Conversation,
 ) -> Result<()> {
     if state.sessions.contains_key(conv) {
         return Ok(());
     }
-    let dir = base_dir.join(conv.key());
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating session dir {}", dir.display()))?;
-    let connection = open_session(ctx, &dir, configured).await?;
+    let connection = open_session(ctx, directory, configured).await?;
     state.sessions.insert(conv.clone(), connection);
     Ok(())
 }
@@ -882,12 +900,12 @@ async fn run_turn(
     ctx: &StartCtx,
     shutdown: &mut ShutdownToken,
     state: &mut ChannelState,
-    base_dir: &Path,
+    directory: &Path,
     configured: Option<&str>,
     conv: &Conversation,
     text: String,
 ) -> String {
-    if let Err(err) = ensure_session(ctx, state, base_dir, configured, conv).await {
+    if let Err(err) = ensure_session(ctx, state, directory, configured, conv).await {
         return format!("Failed to start agent session: {err}");
     }
 
@@ -961,9 +979,9 @@ async fn open_session(
     let (tx, rx) = mpsc::channel(256);
     let session = backend.open(params, tx).await?;
     Ok(ChatConn {
+        directory: session_dir.to_path_buf(),
         session,
         rx,
-        ambient: VecDeque::new(),
     })
 }
 
@@ -1010,8 +1028,122 @@ mod tests {
     fn empty_state() -> ChannelState {
         ChannelState {
             sessions: HashMap::new(),
+            ambient: HashMap::new(),
             guard: LoopGuard::new(4),
         }
+    }
+
+    fn test_ctx(root: &Path) -> (StartCtx, ShutdownToken) {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let paths = host_api::HostPaths::new(root).unwrap();
+        let register = host_api::RegisterCtx {
+            bus: host_api::EventBus::new(),
+            http: host_api::HttpRegistry::disabled(),
+            foreground: host_api::ForegroundRegistry::default(),
+            services: host_api::ServiceRegistry::default(),
+            paths: paths.clone(),
+            config: host_api::ConfigStore::default(),
+            shutdown: host_api::ShutdownToken::new(shutdown_rx.clone()),
+        };
+        let config = register.config.clone();
+        let host = register.into_start_services().unwrap();
+        let shutdown = host_api::ShutdownToken::new(shutdown_rx);
+        (
+            StartCtx {
+                shutdown: shutdown.clone(),
+                paths,
+                config,
+                host,
+            },
+            shutdown,
+        )
+    }
+
+    #[tokio::test]
+    async fn unauthorized_and_capped_resets_never_rotate_or_dispatch() {
+        let root = std::env::temp_dir().join(format!(
+            "irc-reset-routing-{}-{}",
+            std::process::id(),
+            session::now()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let sessions = root.join("sessions");
+        let (ctx, mut shutdown) = test_ctx(&root);
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut sender = None;
+        let mut pending = VecDeque::new();
+        let mut state = empty_state();
+        let conv = Conversation::Channel("#room".into());
+        state
+            .ambient
+            .insert(conv.clone(), VecDeque::from(["keep ambient".into()]));
+        let cfg = IrcConfig {
+            humans: vec!["alice".into()],
+            sessions: session::SessionsConfig {
+                reset_users: vec!["bob".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let carry = handle_reply(
+            &ctx,
+            &mut shutdown,
+            &mut state,
+            &cfg,
+            &sessions,
+            &mut rx,
+            &mut sender,
+            &mut pending,
+            Duration::ZERO,
+            channel_incoming("alice", "darbot", "darbot: /new"),
+        )
+        .await;
+        assert!(carry.is_none());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].text, "Not authorized to reset this session.");
+        assert_eq!(state.ambient[&conv], ["keep ambient"]);
+        assert!(!sessions.exists());
+
+        drop(tx);
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut state = ChannelState {
+            sessions: HashMap::new(),
+            ambient: HashMap::new(),
+            guard: LoopGuard::new(0),
+        };
+        let mut pending = VecDeque::new();
+        let cfg = IrcConfig::default();
+        handle_reply(
+            &ctx,
+            &mut shutdown,
+            &mut state,
+            &cfg,
+            &sessions,
+            &mut rx,
+            &mut sender,
+            &mut pending,
+            Duration::ZERO,
+            channel_incoming("otheragent", "darbot", "darbot: /reset"),
+        )
+        .await;
+        assert!(pending.is_empty());
+        assert!(!sessions.exists());
+        drop(tx);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ambient_is_bounded_drained_and_backend_independent() {
+        let mut state = empty_state();
+        let conv = Conversation::Channel("#room".into());
+        buffer_ambient(&mut state, &conv, &pm("a", "#room", "one"), 2);
+        buffer_ambient(&mut state, &conv, &pm("b", "#room", "two"), 2);
+        buffer_ambient(&mut state, &conv, &pm("c", "#room", "three"), 2);
+        assert!(state.sessions.is_empty());
+        let prompt = build_prompt(&mut state, &conv, &pm("d", "#room", "x"), &["ask".into()]);
+        assert!(!prompt.contains("one"));
+        assert!(prompt.contains("<b> two\n<c> three"));
+        assert!(!state.ambient.contains_key(&conv));
     }
 
     /// Rapid successive lines from the SAME conversation are coalesced within the
@@ -1062,6 +1194,55 @@ mod tests {
             prompt,
             "<thinh> First, verify\nDeepseek is...\nTest with 40 tweets"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalesce_carries_addressed_reset_but_folds_bare_context_reset() {
+        let (tx, mut rx) = mpsc::channel::<WorkerMsg>(16);
+        tx.send(WorkerMsg::Msg(channel_incoming(
+            "thinh",
+            "darbot",
+            "darbot: /reset",
+        )))
+        .await
+        .unwrap();
+        drop(tx);
+        let conv = Conversation::Channel("#room".into());
+        let mut lines = vec!["first".to_string()];
+        let mut sender = None;
+        let carry = coalesce_followups(
+            &mut rx,
+            &conv,
+            "thinh",
+            "darbot",
+            Duration::from_millis(1500),
+            &mut lines,
+            &mut sender,
+        )
+        .await
+        .expect("addressed reset must run through ordered command handling");
+        assert_eq!(carry.verdict, Verdict::Reply);
+        assert_eq!(lines, ["first"]);
+
+        let (tx, mut rx) = mpsc::channel::<WorkerMsg>(16);
+        tx.send(WorkerMsg::Msg(channel_incoming(
+            "thinh", "darbot", "/reset",
+        )))
+        .await
+        .unwrap();
+        drop(tx);
+        let carry = coalesce_followups(
+            &mut rx,
+            &conv,
+            "thinh",
+            "darbot",
+            Duration::from_millis(1500),
+            &mut lines,
+            &mut sender,
+        )
+        .await;
+        assert!(carry.is_none());
+        assert_eq!(lines, ["first", "/reset"]);
     }
 
     /// A line for a DIFFERENT conversation encountered during the window is not
@@ -1243,6 +1424,24 @@ mod tests {
             ..IrcConfig::default()
         };
         assert!(off.effective_debounce().is_zero());
+    }
+
+    #[test]
+    fn reset_command_follows_mention_routing_and_stripping() {
+        let mentioned = pm("alice", "#room", "darbot: /new");
+        assert_eq!(classify(&mentioned, "darbot", true).0, Verdict::Reply);
+        assert!(session::is_reset_command(strip_mention(
+            &mentioned.text,
+            "darbot"
+        )));
+
+        let bare = pm("alice", "#room", "/new");
+        assert_eq!(classify(&bare, "darbot", true).0, Verdict::ContextOnly);
+        assert_eq!(classify(&bare, "darbot", false).0, Verdict::Reply);
+        assert!(session::is_reset_command(strip_mention(
+            &bare.text, "darbot"
+        )));
+        assert!(!session::is_reset_command("/new please"));
     }
 
     #[test]

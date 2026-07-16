@@ -854,6 +854,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dar-extension-sdk",
+ "dar-host-api",
  "serde",
  "serde_json",
  "tokio",

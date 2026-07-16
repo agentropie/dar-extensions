@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
+use crate::session::SessionsConfig;
+
 /// Default secure IRC port (TLS).
 pub const DEFAULT_PORT: u16 = 6697;
 /// Default hard cap on consecutive bot-authored turns with no human message.
@@ -96,6 +98,8 @@ pub struct IrcConfig {
     /// [`DEFAULT_DEBOUNCE_MS`]. `0` disables coalescing. Use
     /// [`IrcConfig::effective_debounce`] for the resolved value.
     pub(crate) debounce_ms: Option<u64>,
+    /// Session idle expiry and reset authorization. Configured only in agent.yaml.
+    pub sessions: SessionsConfig,
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -319,6 +323,21 @@ mod tests {
         assert_eq!(cfg.effective_max_bot_turns(), DEFAULT_MAX_BOT_TURNS);
         assert_eq!(cfg.effective_context_window(), DEFAULT_CONTEXT_WINDOW);
         assert!(cfg.channels.is_empty());
+        assert_eq!(
+            cfg.sessions.idle_minutes,
+            crate::session::DEFAULT_IDLE_MINUTES
+        );
+        assert!(cfg.sessions.reset_users.is_empty());
+    }
+
+    #[test]
+    fn sessions_parse_zero_and_reset_users() {
+        let cfg: IrcConfig = serde_json::from_value(json!({
+            "sessions": { "idle_minutes": 0, "reset_users": ["Alice"] }
+        }))
+        .unwrap();
+        assert_eq!(cfg.sessions.idle_minutes, 0);
+        assert_eq!(cfg.sessions.reset_users, ["Alice"]);
     }
 
     #[test]

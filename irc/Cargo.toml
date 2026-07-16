@@ -21,6 +21,7 @@ webpki-roots = "1"
 tracing = "0.1"
 
 [dev-dependencies]
+dar-host-api = { path = "../../dar/crates/host-api" }
 # Enables tokio's paused virtual clock (`time::pause`/`advance`) so timeout-based
 # behaviour (the idle read timeout) is tested deterministically without sleeping.
 tokio = { version = "1.43", features = ["test-util"] }

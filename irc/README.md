@@ -7,7 +7,7 @@ A standalone dar extension that makes an agent reachable over IRC — primarily 
 - Connects to an IRC server over TCP (TLS by default), registers (`PASS`/`NICK`/`USER`), optionally `IDENTIFY`s to NickServ, retries the nick with a suffix on a `433` collision, and `JOIN`s the configured channels. `PING` is answered transparently; a dropped link auto-reconnects with exponential backoff.
 - **Turns run off the socket read path.** A dedicated read loop only parses lines and answers `PING`; a separate long-lived worker task owns all sessions and runs agent turns, so the connection stays healthy (keepalives answered) even during a multi-minute tool/model turn. Replies produced while a link is down are queued and retried on reconnect instead of being silently lost. Rapid successive lines from the same sender — e.g. a pasted multi-line DM, or a multi-line channel paste — are coalesced within `debounce_ms` into a single turn rather than spawning serial turns. Coalescing is keyed by conversation *and* sender, so distinct senders in the same channel are never merged.
 - **Mention-gating in channels:** configurable per-channel (default: true). When enabled the agent replies only when addressed by nick (`nick: ...` or `nick, ...`, case-insensitive); when disabled it replies to every channel message. Unaddressed channel traffic is still ingested as bounded ambient context. DMs are always answered.
-- **Bot-to-bot loop guard:** a hard per-channel cap on consecutive bot-authored turns with no intervening human message. Once the cap is hit the agent stays silent in that channel until a human speaks again. Per-channel isolated; DMs are never gated. This is the non-negotiable backstop against runaway token cost in agent-to-agent exchanges. The guard is **fail-closed**: senders not on the `humans` list always count as bots, so with an empty `humans` list (the default) every sender — including real people — counts toward the cap. Operators who want uncapped human-driven exchanges must list their humans explicitly in `humans`.
+- **Bot-to-bot loop guard:** a hard per-channel cap on consecutive bot-authored turns with no intervening human message. Once the cap is hit the agent stays silent in that channel until a human speaks again. Channel and DM conversations are isolated; both are gated. This is the non-negotiable backstop against runaway token cost in agent-to-agent exchanges. The guard is **fail-closed**: senders not on the `humans` list always count as bots, so with an empty `humans` list (the default) every sender — including real people — counts toward the cap. Operators who want uncapped human-driven exchanges must list their humans explicitly in `humans`.
 - For each addressed message, opens (or reuses) a `ChatBackend` session keyed by conversation (channel name, or sender nick for DMs), sends the turn, accumulates the assistant `Delta` events until `TurnFinished`, then markdown-strips and splits the reply into IRC-safe lines (~450 chars / 400 bytes, on word boundaries, multibyte-safe) and sends them paced to avoid flood kicks.
 - CTCP `ACTION` (`/me`) messages are normalized to plain text context.
 - Model/provider come from the orchestrator's `RunSnapshot` when linked; otherwise the backend defaults apply.
@@ -52,6 +52,9 @@ extensions:
     ack: true           # optional, default true; send an immediate 👀 when a message is picked up
     debounce_ms: 1500   # optional, default 1500; coalesce rapid successive lines from the same
                         # sender (e.g. a pasted multi-line DM or channel message) into one turn. 0 disables.
+    sessions:
+      idle_minutes: 360 # rotate after idle time on next accepted turn; 0 disables
+      reset_users: ["alice"] # exact /new or /reset authorization; empty = anyone
     # optional: pin a cap-chat backend service id. Omit to auto-follow the
     # orchestrator runner backend (only registered under `foreground: tui`),
     # else use the bundled `irc-pi`. An unregistered id falls back to `irc-pi`.
@@ -89,9 +92,13 @@ IRC_DEBOUNCE_MS=1500
 | `allowed_users` | list of string | `[]` (everyone) | DM nick allowlist, case-insensitive (or `IRC_ALLOWED_USERS`) |
 | `humans` | list of string | `[]` (none) | channel human nicks for the loop-guard; unlisted senders count as bots toward the cap (or `IRC_HUMANS`) |
 | `backend` | string | auto-follow runner, else `irc-pi` | cap-chat backend service id; unregistered id falls back to `irc-pi` |
-| `max_bot_turns` | int | `4` | hard cap on consecutive bot-to-bot turns per channel before going silent |
+| `max_bot_turns` | int | `4` | hard cap on consecutive bot-to-bot turns per channel or DM before going silent |
 | `context_window` | int | `30` | ambient (context-only) messages retained per conversation |
 | `ack` | bool | `true` | send an immediate `👀` to the reply target when a message is picked up, before the agent turn runs (best-effort; or `IRC_ACK`) |
+| `sessions.idle_minutes` | int | `360` | lazy idle expiry based only on accepted agent-turn messages; ambient traffic does not refresh it; `0` disables |
+| `sessions.reset_users` | list of string | `[]` (everyone) | case-insensitive authorization for exact `/new` and `/reset` after normal mention stripping |
+
+With `mention_required: true`, reset commands require normal bot addressing (for example `darbot: /new`); with it disabled, bare `/new` works. Unauthorized exact commands receive a denial and do not run an agent turn. Reset and expiry retain old generation directories on disk but make them inactive.
 
 The loop-guard classifies channel senders using the `humans` list, which is **independent** of `allowed_users` (a DM-only authorization gate). Any channel sender **not** on `humans` counts as a bot toward the consecutive-bot-turn cap. With an empty `humans` list (the default) there are no known humans, so the cap is fail-closed: it applies to every channel sender and can never be silently disabled. List your channel humans explicitly to let human-driven exchanges run uncapped (a human message resets the per-channel counter).
 
