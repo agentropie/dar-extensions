@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.0] - 2026-07-19
+
+Tracks dar v0.4.0: extension crates now require `dar-extension-sdk = "0.4"`.
 
 ### Added
 

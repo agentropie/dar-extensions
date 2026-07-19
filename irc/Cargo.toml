@@ -11,7 +11,7 @@ requires_stock = ["chat-pi"]
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-dar-extension-sdk = "0.3"
+dar-extension-sdk = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.43", features = ["macros", "rt", "sync", "time", "io-util", "net"] }
