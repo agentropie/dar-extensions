@@ -23,9 +23,7 @@ tracing = "0.1"
 url = "2"
 
 [dev-dependencies]
-dar-host-api = { path = "../../dar/crates/host-api" }
+dar-host-api = "0.4"
 
 [workspace]
 
-[patch.crates-io]
-dar-extension-sdk = { path = "../../dar/crates/extension-sdk" }

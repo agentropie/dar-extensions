@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- All crates now consume `dar-extension-sdk` (and dev-only `dar-host-api`) from
+  crates.io; the temporary `[patch]` / path-dependency sections pointing at a
+  local dar checkout are gone, so the repo builds standalone.
+
 ## [0.4.0] - 2026-07-19
 
 Tracks dar v0.4.0: extension crates now require `dar-extension-sdk = "0.4"`.

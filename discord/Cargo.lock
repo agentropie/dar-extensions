@@ -355,6 +355,8 @@ dependencies = [
 [[package]]
 name = "dar-artifacts"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6799d967ee85b9dedf1d541b0d4652df3994ebd4beb0c44267202a91b020d61e"
 dependencies = [
  "fs2",
  "hex",
@@ -368,6 +370,8 @@ dependencies = [
 [[package]]
 name = "dar-cap-chat"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e87303793797079f4ee5ee7b08c989047cc31d23011f93d03e14ff6a173b53d"
 dependencies = [
  "anyhow",
  "dar-artifacts",
@@ -379,6 +383,8 @@ dependencies = [
 [[package]]
 name = "dar-cap-runner"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87e626e02cfc471b8ce5290acb03b21d9a15818509763041e65d9df70d56867f"
 dependencies = [
  "anyhow",
  "chrono",
@@ -390,6 +396,8 @@ dependencies = [
 [[package]]
 name = "dar-extension-sdk"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d4802bd9be4bf9988f95d02a10faaa2e55a668dc60f5a0d6a9d3358715a315f"
 dependencies = [
  "anyhow",
  "dar-artifacts",
@@ -405,6 +413,8 @@ dependencies = [
 [[package]]
 name = "dar-host-api"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fef03ee10717e9656ed1af6bf6b57eb95aef099a5749e8ce7a712d267f370a10"
 dependencies = [
  "anyhow",
  "axum",
@@ -416,6 +426,8 @@ dependencies = [
 [[package]]
 name = "dar-orchestrator-api"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ec2b7cd1399e96ac1a4670fe70584b14b687b0bf1972f42ce83a08a69da4b9f"
 dependencies = [
  "chrono",
  "serde",
@@ -425,6 +437,8 @@ dependencies = [
 [[package]]
 name = "dar-tool-registry"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b441e523b904f5c689aad753bf46abbc831f9801d7954ba3459dd18a50f9059b"
 dependencies = [
  "anyhow",
  "async-trait",

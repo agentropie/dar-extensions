@@ -11,7 +11,7 @@ requires_stock = ["chat-pi"]
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-dar-extension-sdk = { path = "/Users/thinh/code/agentropy/dar/crates/extension-sdk" }
+dar-extension-sdk = "0.4"
 futures-util = "0.3"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
