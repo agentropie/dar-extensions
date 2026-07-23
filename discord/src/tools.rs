@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use dar_extension_sdk::tools::{ToolExecutor, ToolOutcome, ToolSpec};
+use dar_extension_sdk::deliver::{DeliverySink, Destination};
 use serde_json::{json, Value};
 
 use crate::config::DiscordConfig;
@@ -168,6 +169,18 @@ impl DiscordSendTool {
 impl ToolExecutor for DiscordSendTool {
     async fn execute(&self, args: Value) -> Result<ToolOutcome> {
         self.send(args).await
+    }
+}
+
+#[async_trait]
+impl DeliverySink for DiscordSendTool {
+    async fn deliver(&self, dest: &Destination, text: &str) -> Result<()> {
+        let mut args = json!({"text": text});
+        if let Some(channel) = &dest.channel { args["channel"] = json!(channel); }
+        if let Some(user) = &dest.user { args["user"] = json!(user); }
+        let outcome = self.execute(args).await?;
+        if outcome.is_error { anyhow::bail!("{}", outcome.text); }
+        Ok(())
     }
 }
 
