@@ -4,6 +4,8 @@
 
 ### Changed
 
+- IRC, Slack, Telegram, and Discord now expose scheduler delivery sinks so cron results can be sent to explicit channel or user destinations by the runtime.
+
 - All crates now consume `dar-extension-sdk` (and dev-only `dar-host-api`) from
   crates.io; the temporary `[patch]` / path-dependency sections pointing at a
   local dar checkout are gone, so the repo builds standalone.

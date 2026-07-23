@@ -28,6 +28,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use dar_extension_sdk::chat::{ChatBackend, ChatEvent, ChatRole, ChatSession};
+use dar_extension_sdk::deliver::{DeliverySink, Destination};
 use dar_extension_sdk::tools::{
     ToolExecutor, ToolOutcome, ToolRegistryHandle, ToolSpec, TOOL_REGISTRY_SERVICE,
 };
@@ -88,6 +89,7 @@ impl Extension for IrcExtension {
                 registry
                     .register_tool(irc_send_spec(), Arc::new(IrcSendTool { cfg: cfg.clone() }))?;
             }
+            ctx.services.service::<dyn DeliverySink>("irc", Arc::new(IrcSendTool { cfg: cfg.clone() }))?;
             Ok(())
         })
     }
@@ -204,6 +206,16 @@ impl ToolExecutor for IrcSendTool {
             ));
         }
         Ok(ToolOutcome::ok(format!("sent IRC message to {target}")))
+    }
+}
+
+#[async_trait]
+impl DeliverySink for IrcSendTool {
+    async fn deliver(&self, dest: &Destination, text: &str) -> Result<()> {
+        let target = dest.channel.as_deref().or(dest.user.as_deref()).ok_or_else(|| anyhow::anyhow!("irc delivery requires channel or user"))?;
+        let outcome = self.execute(json!({"target": target, "text": text})).await?;
+        if outcome.is_error { bail!("{}", outcome.text); }
+        Ok(())
     }
 }
 

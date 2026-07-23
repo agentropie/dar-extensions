@@ -18,6 +18,7 @@ use dar_extension_sdk::tools::{
     ToolExecutor, ToolOutcome, ToolRegistryHandle, ToolSpec, TOOL_REGISTRY_SERVICE,
 };
 use dar_extension_sdk::{ConfigStore, Extension, RegisterCtx, ShutdownToken, StartCtx};
+use dar_extension_sdk::deliver::{DeliverySink, Destination};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -82,6 +83,8 @@ impl Extension for TelegramExtension {
                     Arc::new(TelegramSendTool::new(token)?),
                 )?;
             }
+            let token = resolve_token(&cfg).expect("token checked above");
+            ctx.services.service::<dyn DeliverySink>("telegram", Arc::new(TelegramSendTool::new(token)?))?;
             Ok(())
         })
     }
@@ -188,6 +191,17 @@ impl ToolExecutor for TelegramSendTool {
         Ok(ToolOutcome::ok(format!(
             "sent Telegram message to chat {chat_id}"
         )))
+    }
+}
+
+#[async_trait]
+impl DeliverySink for TelegramSendTool {
+    async fn deliver(&self, dest: &Destination, text: &str) -> Result<()> {
+        let user = dest.user.as_deref().ok_or_else(|| anyhow::anyhow!("telegram delivery requires user"))?;
+        let chat_id: i64 = user.parse().context("telegram user must be a numeric chat id")?;
+        let outcome = self.execute(json!({"chat_id": chat_id, "text": text})).await?;
+        if outcome.is_error { bail!("{}", outcome.text); }
+        Ok(())
     }
 }
 

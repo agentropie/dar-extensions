@@ -32,6 +32,7 @@ impl Extension for DiscordExtension {
         Box::pin(async move {
             let cfg = config::parse(&ctx.config, self.id())?;
             let token = config::token(&cfg)?;
+            ctx.services.service::<dyn dar_extension_sdk::deliver::DeliverySink>("discord", tools::DiscordSendTool::new(token.clone(), cfg.clone()))?;
             if let Ok(registry) = ctx
                 .services
                 .get_named::<dyn ToolRegistryHandle>(TOOL_REGISTRY_SERVICE)
