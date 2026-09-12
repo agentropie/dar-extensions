@@ -2,7 +2,10 @@
 
 ## [Unreleased]
 
+- Requires the published Dar SDK 0.5 for attributed proactive turns; local dependency overrides are no longer needed.
+
 ### Fixed
+- Background completion replies now arrive proactively without shifting subsequent responses by one message. Chat workers keep receiving events independently of polling, preserve queued message acknowledgements, and close obsolete sessions on reset, expiry, or shutdown. Pending input is bounded with an explicit busy response.
 - Upgrade compatibility (ALG-347): existing sessions stored in the old `sessions/<chat_id>/` layout are now migrated into a generation on the first message after upgrade, preserving prior chat context instead of silently starting empty.
 
 ### Added

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use dar_extension_sdk::chat::{ChatBackend, ChatEvent, ChatRole, ChatSession};
+use dar_extension_sdk::chat::{ChatBackend, ChatEvent, ChatSession};
 use dar_extension_sdk::tools::{
     ToolExecutor, ToolOutcome, ToolRegistryHandle, ToolSpec, TOOL_REGISTRY_SERVICE,
 };
@@ -27,13 +27,14 @@ mod ack;
 mod markdown;
 mod session;
 mod stream;
-use ack::{AckGuard, BotApi};
+mod worker;
+use ack::BotApi;
 use markdown::{render_chunks, Chunk, ParseMode};
 use session::{
     parse_reset_command, SessionStore, SessionsConfig, SystemTime, TimeSource, EXPIRED_NOTICE,
     RESET_REPLY,
 };
-use stream::{EditResult, LiveTurn, RealClock, StreamApi};
+use stream::{EditResult, StreamApi};
 /// Long-poll timeout (seconds) the Telegram server holds an empty `getUpdates`.
 const POLL_TIMEOUT_SECS: u64 = 30;
 
@@ -364,7 +365,7 @@ async fn run(
         base: base.clone(),
     });
     let mut offset: i64 = 0;
-    let mut sessions: HashMap<i64, ChatConn> = HashMap::new();
+    let mut sessions: HashMap<i64, worker::Worker> = HashMap::new();
     let clock = SystemTime;
 
     dar_extension_sdk::log::event(
@@ -423,7 +424,7 @@ async fn run(
                     if parse_reset_command(&text).is_some() {
                         match store.reset(clock.unix_secs()) {
                             Ok(_) => {
-                                sessions.remove(&chat_id);
+                                if let Some(worker) = sessions.remove(&chat_id) { worker.stop().await; }
                                 let _ =
                                     send_message(&client, &base, chat_id, RESET_REPLY).await;
                             }
@@ -463,44 +464,31 @@ async fn run(
                     if prepared.rotated {
                         // Stale session: drop the live one and warn the user
                         // before the fresh turn produces its reply.
-                        sessions.remove(&chat_id);
+                        if let Some(worker) = sessions.remove(&chat_id) { worker.stop().await; }
                         let _ = send_message(&client, &base, chat_id, EXPIRED_NOTICE).await;
                     }
 
-                    // Acknowledge the moment the message is picked up: the guard
-                    // adds the 👀 reaction + keeps typing alive, and guarantees
-                    // both clear on drop regardless of how the turn ends.
-                    let guard =
-                        AckGuard::start(Arc::clone(&bot_api), chat_id, message_id).await;
-                    let stream_api = TelegramStreamApi {
-                        client: client.clone(),
-                        base: base.clone(),
-                        chat_id,
-                    };
-                    let outcome = run_turn(
-                        ctx,
-                        shutdown,
-                        &mut sessions,
-                        &prepared.session_dir,
-                        cfg.backend.as_deref(),
-                        chat_id,
-                        text,
-                        &stream_api,
-                    )
-                    .await;
-                    if let Err(err) =
-                        finalize_reply(&client, &base, chat_id, &outcome).await
-                    {
-                        tracing::warn!(error = %err, "telegram sendMessage failed");
+                    if sessions.get(&chat_id).is_some_and(worker::Worker::is_finished) {
+                        if let Some(worker) = sessions.remove(&chat_id) { worker.stop().await; }
                     }
-                    // Reply delivered: clear 👀 and stop typing, awaiting the
-                    // clear so it lands before the next message is picked up.
-                    // (Error/panic paths fall back to the guard's Drop.)
-                    guard.finish().await;
+                    let worker = sessions.entry(chat_id).or_insert_with(|| {
+                        worker::Worker::start(
+                            ctx.clone(), prepared.session_dir.clone(), cfg.backend.clone(),
+                            Arc::clone(&bot_api), TelegramStreamApi {
+                                client: client.clone(), base: base.clone(), chat_id,
+                            },
+                        )
+                    });
+                    if !worker.submit(message_id, text) {
+                        let _ = send_message(&client, &base, chat_id,
+                            "Chat is busy; please retry your message shortly.").await;
+                    }
                 }
             }
         }
     }
+    for worker in sessions.values() { worker.cancel(); }
+    for (_, worker) in sessions { worker.stop().await; }
     Ok(())
 }
 
@@ -512,108 +500,6 @@ struct TurnOutcome {
     reply: String,
     /// Set when streaming already delivered assistant text into a live bubble.
     answer_msg: Option<i64>,
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_turn(
-    ctx: &StartCtx,
-    shutdown: &mut ShutdownToken,
-    sessions: &mut HashMap<i64, ChatConn>,
-    session_dir: &Path,
-    configured: Option<&str>,
-    chat_id: i64,
-    text: String,
-    stream_api: &dyn StreamApi,
-) -> TurnOutcome {
-    if let std::collections::hash_map::Entry::Vacant(slot) = sessions.entry(chat_id) {
-        if let Err(err) = std::fs::create_dir_all(session_dir) {
-            return TurnOutcome {
-                reply: format!("Failed to create session dir: {err}"),
-                answer_msg: None,
-            };
-        }
-        match open_session(ctx, session_dir, configured).await {
-            Ok(conn) => {
-                slot.insert(conn);
-            }
-            Err(err) => {
-                return TurnOutcome {
-                    reply: format!("Failed to start agent session: {err}"),
-                    answer_msg: None,
-                }
-            }
-        }
-    }
-
-    let conn = sessions.get_mut(&chat_id).expect("session just inserted");
-    if let Err(err) = conn.session.send_turn(text).await {
-        sessions.remove(&chat_id);
-        return TurnOutcome {
-            reply: format!("Failed to send message: {err}"),
-            answer_msg: None,
-        };
-    }
-
-    // The live bubbles (answer + tool status) are UI-only and never touch the
-    // agent's conversation history: they only mirror events as they arrive.
-    let mut live = LiveTurn::new(stream_api, RealClock);
-    let mut error_reply = String::new();
-    let mut drop_session = false;
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => break,
-            event = conn.rx.recv() => match event {
-                Some(ChatEvent::Delta { role: ChatRole::Assistant, text }) => {
-                    live.push_text(&text).await;
-                }
-                Some(ChatEvent::ToolCall { name, args, .. }) => {
-                    // Flush pre-tool assistant text, then show what's running.
-                    live.tool_started(&name, &args).await;
-                }
-                Some(ChatEvent::TurnFinished { ok: true, .. }) => break,
-                Some(ChatEvent::TurnFinished { ok: false, error }) => {
-                    if live.answer().is_empty() {
-                        error_reply = format!(
-                            "(turn failed: {})",
-                            error.unwrap_or_else(|| "unknown".into())
-                        );
-                    }
-                    break;
-                }
-                Some(ChatEvent::SessionClosed { error }) => {
-                    drop_session = true;
-                    if live.answer().is_empty() {
-                        error_reply = format!("(session closed: {})", error.unwrap_or_default());
-                    }
-                    break;
-                }
-                Some(_) => {}
-                None => {
-                    drop_session = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    // Collapse the status bubble and flush the final streamed preview.
-    live.finish().await;
-
-    if drop_session {
-        sessions.remove(&chat_id);
-    }
-
-    let reply = if !live.answer().trim().is_empty() {
-        live.answer().to_string()
-    } else if !error_reply.is_empty() {
-        error_reply
-    } else {
-        "(no response)".to_string()
-    };
-    TurnOutcome {
-        reply,
-        answer_msg: live.answer_message_id(),
-    }
 }
 
 /// Deliver the final answer without duplicating the streamed preview.

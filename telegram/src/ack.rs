@@ -49,27 +49,24 @@ impl AckGuard {
     /// Add the `👀` reaction, send the first typing action, and start the
     /// background refresh that keeps typing alive for the rest of the turn.
     pub async fn start(api: Arc<dyn BotApi>, chat_id: i64, message_id: i64) -> Self {
-        api.set_reaction(chat_id, message_id, Some(WORKING_EMOJI))
+        // Construct before the first await so cancellation during setup still
+        // clears a reaction that Telegram may already have accepted.
+        let mut guard = Self { api, chat_id, message_id, refresh: None, cleared: false };
+        guard.api.set_reaction(chat_id, message_id, Some(WORKING_EMOJI))
             .await;
-        api.send_chat_action(chat_id, TYPING_ACTION).await;
+        guard.api.send_chat_action(chat_id, TYPING_ACTION).await;
 
-        let refresh_api = Arc::clone(&api);
-        let refresh = tokio::spawn(async move {
+        let refresh_api = Arc::clone(&guard.api);
+        guard.refresh = Some(tokio::spawn(async move {
             // The first typing action was already sent above; sleep, then keep
             // re-sending so the indicator never lapses on a long turn.
             loop {
                 tokio::time::sleep(TYPING_REFRESH).await;
                 refresh_api.send_chat_action(chat_id, TYPING_ACTION).await;
             }
-        });
+        }));
 
-        Self {
-            api,
-            chat_id,
-            message_id,
-            refresh: Some(refresh),
-            cleared: false,
-        }
+        guard
     }
 
     /// Stop typing and clear the `👀` reaction, awaiting the clear so it is
@@ -298,4 +295,26 @@ mod tests {
         assert!(saw_clear, "reaction clear must fire on panic unwind");
         assert!(api.calls().contains(&clear_call()));
     }
+    #[tokio::test]
+    async fn cancellation_during_initial_typing_clears_added_reaction() {
+        struct HangingApi { tx: mpsc::UnboundedSender<bool> }
+        #[async_trait]
+        impl BotApi for HangingApi {
+            async fn set_reaction(&self, _: i64, _: i64, emoji: Option<&str>) {
+                self.tx.send(emoji.is_some()).unwrap();
+            }
+            async fn send_chat_action(&self, _: i64, _: &str) {
+                std::future::pending::<()>().await;
+            }
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            AckGuard::start(Arc::new(HangingApi { tx }), 1, 2).await
+        });
+        assert_eq!(rx.recv().await, Some(true));
+        task.abort();
+        let _ = task.await;
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap(), Some(false));
+    }
+
 }

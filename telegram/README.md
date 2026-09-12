@@ -5,7 +5,8 @@ A standalone dar extension that makes an agent reachable for chat over a Telegra
 ## How it works
 
 - Long-polls Telegram `getUpdates` with a 30-second server-side timeout.
-- For each text message, opens (or reuses) a `ChatBackend` chat session keyed by Telegram chat id and sends the message as a turn.
+- Each chat generation has a worker that continuously reads its backend events, including proactive replies after background work; delivery does not wait for another incoming message. Polling and other chats continue while a turn runs.
+- Up to 16 messages per chat can be pending; further messages receive a busy notice and must be retried. Reset and expiry close the old worker before announcing the replacement.
 - Streams the reply live while the turn runs: the first assistant text creates one **answer bubble** that is then edited in place (rate-limited to ~1s / 200 chars) instead of spamming a message per token. A separate **tool-status bubble** shows the tool currently running as `name · short target` (e.g. `read · /etc/hosts`), never the full argument JSON. At each tool boundary the visible answer text is flushed first, so a long or stuck tool run can't hide text the assistant already produced. On turn finish the status bubble collapses to a summary like `Used 3 tools: read, bash, edit`, and the answer bubble is finalized with the rich-markdown reply (falling back to a chunked `sendMessage` for multi-part replies, still capped at 4096 chars). Streaming is UI-only and never alters the agent's conversation history; a failed edit falls back to a fresh send so the final answer always lands.
 - Model/provider come from the orchestrator's `RunSnapshot` when linked; otherwise the backend defaults apply.
 - One session per chat = independent conversation context, persisted append-only by generation under `<agent>/data/telegram/sessions/<chat_id>/<generation_id>/`, with a `current.json` pointer tracking the live generation and last inbound time.
@@ -56,6 +57,15 @@ Alternatively, put `TELEGRAM_BOT_TOKEN=...` in the agent's `.env`. Get your nume
 ## Limitations
 
 - Text messages only — no media, voice, or inline keyboards.
-- Messages are processed sequentially: a long agent turn delays other users.
-- Plain-text replies only — no Markdown formatting.
+- Each chat processes turns in order; long turns do not block other chats.
 - Long-poll only — no webhook mode.
+
+## SDK dependency
+
+Telegram requires `dar-extension-sdk` 0.5 and a Dar build with the matching Pi backend changes. The SDK resolves from crates.io; no local Cargo override is required:
+
+```sh
+cargo test --manifest-path telegram/Cargo.toml --locked
+```
+
+Run from the `dar-extensions` root.
