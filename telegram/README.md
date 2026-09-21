@@ -12,7 +12,7 @@ A standalone dar extension that makes an agent reachable for chat over a Telegra
 - One session per chat = independent conversation context, persisted append-only by generation under `<agent>/data/telegram/sessions/<chat_id>/<generation_id>/`, with a `current.json` pointer tracking the live generation and last inbound time.
 - Idle expiry: after `sessions.idle_minutes` of no inbound messages (default 360; `0` disables), the next message rotates to a fresh generation and the user first sees `Previous session expired; starting fresh.` before the reply. Old generation directories are kept for audit/debug.
 - `/new` and `/reset` (also `/new@bot` / `/reset@bot` for group chats) start a fresh session and reply `Context cleared, new session started.` without running the agent. Only the exact command token resets — `/new please` is treated as a normal message.
-- Bundles the stock `pi` chat backend and registers it under its own id (`telegram-pi`), so the channel works under the default `foreground: logs` without requiring `foreground: tui`. When the orchestrator runner's backend is registered as a `dyn ChatBackend` it is used instead; `telegram-pi` is the final fallback.
+- Declares `requires_stock = ["chat-pi"]` in `Cargo.toml`, so the composer links the stock `pi` chat backend into the agent binary and the channel works under the default `foreground: logs` without requiring `foreground: tui`. Backend selection: `extensions.telegram.backend` if set, else the orchestrator's `runner.use` when that id is registered as a `dyn ChatBackend`, else `pi`.
 
 ## Install
 
@@ -33,10 +33,10 @@ extensions:
     # optional: restrict to specific Telegram numeric user ids (empty/omitted = anyone)
     allowed_users: [12345678]
     # optional: pin a cap-chat backend service id to drive. Omit to auto-follow
-    # the orchestrator's runner backend (only registered under `foreground: tui`),
-    # else use the bundled `telegram-pi` backend. An unregistered id falls back to
-    # `telegram-pi` automatically.
-    # backend: telegram-pi
+    # the orchestrator's runner backend when it is registered as a chat backend,
+    # else use the stock `pi` backend. A configured id must be registered:
+    # an unknown id fails the session open with "chat backend '<id>' not registered".
+    # backend: pi
     # optional: Telegram session lifecycle
     sessions:
       # idle minutes before a chat's context expires; 0 disables idle expiry
@@ -51,7 +51,7 @@ Alternatively, put `TELEGRAM_BOT_TOKEN=...` in the agent's `.env`. Get your nume
 |-----|------|---------|---------|
 | `bot_token` | string | none | BotFather token (or `TELEGRAM_BOT_TOKEN` env) |
 | `allowed_users` | list of int | `[]` (everyone) | whitelist of Telegram user ids |
-| `backend` | string | auto-follow orchestrator runner, else `telegram-pi` | cap-chat backend service id to drive; a configured-but-unregistered id falls back to `telegram-pi` |
+| `backend` | string | auto-follow orchestrator runner, else `pi` | cap-chat backend service id to drive; a configured-but-unregistered id errors at session open |
 | `sessions.idle_minutes` | int | `360` | idle minutes before a chat's context expires and rotates to a fresh generation; `0` disables idle expiry |
 
 ## Limitations
