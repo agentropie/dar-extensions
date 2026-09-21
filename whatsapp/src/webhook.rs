@@ -100,6 +100,15 @@ async fn verify(State(state): State<WebhookState>, Query(query): Query<VerifyQue
 }
 
 async fn inbound(State(state): State<WebhookState>, headers: HeaderMap, body: Body) -> Response {
+    inbound_impl(state, headers, body).await
+}
+
+#[cfg(test)]
+pub async fn handle_inbound(state: WebhookState, headers: HeaderMap, body: Body) -> Response {
+    inbound_impl(state, headers, body).await
+}
+
+async fn inbound_impl(state: WebhookState, headers: HeaderMap, body: Body) -> Response {
     let Some(secret) = state.app_secret.filter(|s| !s.is_empty()) else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };

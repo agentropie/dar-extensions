@@ -609,7 +609,92 @@ pub fn adapt_markdown(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dar_extension_sdk::chat::{BoxFuture, ChatSession, ChatSessionParams};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FakeBackend;
+    struct FakeSession {
+        events: mpsc::Sender<ChatEvent>,
+    }
+    impl ChatBackend for FakeBackend {
+        fn open<'a>(
+            &'a self,
+            _params: ChatSessionParams,
+            events: mpsc::Sender<ChatEvent>,
+        ) -> BoxFuture<'a, Result<Box<dyn ChatSession>>> {
+            Box::pin(async move { Ok(Box::new(FakeSession { events }) as Box<dyn ChatSession>) })
+        }
+    }
+    impl ChatSession for FakeSession {
+        fn send_turn(&mut self, prompt: String) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async move {
+                assert_eq!(prompt, "hello");
+                self.events
+                    .send(ChatEvent::Delta {
+                        role: ChatRole::Assistant,
+                        text: "agent reply".into(),
+                    })
+                    .await?;
+                self.events
+                    .send(ChatEvent::TurnFinished {
+                        ok: true,
+                        error: None,
+                    })
+                    .await?;
+                Ok(())
+            })
+        }
+        fn abort(&mut self) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn close(self: Box<Self>) -> BoxFuture<'static, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn test_ctx(root: &Path) -> (StartCtx, watch::Sender<bool>) {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let paths = host_api::HostPaths::new(root).unwrap();
+        let mut register = host_api::RegisterCtx {
+            bus: host_api::EventBus::new(),
+            http: host_api::HttpRegistry::disabled(),
+            foreground: host_api::ForegroundRegistry::default(),
+            services: host_api::ServiceRegistry::default(),
+            paths: paths.clone(),
+            config: host_api::ConfigStore::default(),
+            shutdown: host_api::ShutdownToken::new(shutdown_rx.clone()),
+        };
+        register
+            .services
+            .service::<dyn ChatBackend>("pi", Arc::new(FakeBackend))
+            .unwrap();
+        let config = register.config.clone();
+        let host = register.into_start_services().unwrap();
+        (
+            StartCtx {
+                shutdown: host_api::ShutdownToken::new(shutdown_rx),
+                paths,
+                config,
+                host,
+            },
+            shutdown_tx,
+        )
+    }
+
+    fn signed_headers(body: &[u8]) -> axum::http::HeaderMap {
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"secret").unwrap();
+        mac.update(body);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-hub-signature-256",
+            format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+                .parse()
+                .unwrap(),
+        );
+        headers
+    }
     #[test]
     fn adapts_markdown() {
         assert_eq!(adapt_markdown("# **Hi**\n**yes**"), "*Hi*\n*yes*");
@@ -665,5 +750,77 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn signed_webhook_roundtrip_replies_once_with_context() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let captured = Arc::clone(&requests);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/messages",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    captured.lock().unwrap().push(body);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let graph = Arc::new(Graph::with_base(format!("http://{address}/messages")).unwrap());
+        let (tx, mut rx) = mpsc::channel(2);
+        let webhook = WebhookState {
+            verify_token: Some("verify".into()),
+            app_secret: Some("secret".into()),
+            phone_number_id: "phone".into(),
+            inbound: tx,
+            dedup: Default::default(),
+        };
+        let payload = br#"{"entry":[{"changes":[{"field":"messages","value":{"metadata":{"phone_number_id":"phone"},"messages":[{"from":"3361","id":"wamid-1","type":"text","text":{"body":"hello"}}]}}]}]}"#;
+        assert_eq!(
+            webhook::handle_inbound(
+                webhook.clone(),
+                signed_headers(payload),
+                axum::body::Body::from(payload.as_slice())
+            )
+            .await
+            .status(),
+            axum::http::StatusCode::OK
+        );
+        let incoming = rx.recv().await.unwrap();
+        assert_eq!(
+            webhook::handle_inbound(
+                webhook,
+                signed_headers(payload),
+                axum::body::Body::from(payload.as_slice())
+            )
+            .await
+            .status(),
+            axum::http::StatusCode::OK
+        );
+        assert!(rx.try_recv().is_err());
+
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown_tx) = test_ctx(temp.path());
+        let cfg = WhatsAppConfig::default();
+        let mut state = DispatcherState {
+            statuses: HashMap::new(),
+            sessions: HashMap::new(),
+            status_slots: Arc::new(Semaphore::new(1)),
+        };
+        process(&ctx, &cfg, &graph, temp.path(), incoming, &mut state).await;
+        let sent = requests.lock().unwrap();
+        let replies = sent
+            .iter()
+            .filter(|request| request.get("type").and_then(Value::as_str) == Some("text"))
+            .collect::<Vec<_>>();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            *replies[0],
+            json!({"messaging_product":"whatsapp","recipient_type":"individual","to":"3361","type":"text","text":{"body":"agent reply","preview_url":true},"context":{"message_id":"wamid-1"}})
+        );
+        server.abort();
     }
 }

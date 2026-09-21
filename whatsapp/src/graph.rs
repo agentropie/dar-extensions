@@ -19,6 +19,14 @@ impl Graph {
             token,
         })
     }
+    #[cfg(test)]
+    pub fn with_base(base: String) -> Result<Self> {
+        Ok(Self {
+            client: Client::builder().timeout(Duration::from_secs(30)).build()?,
+            base,
+            token: "test-token".into(),
+        })
+    }
     async fn post(&self, body: Value) -> Result<()> {
         let response = self
             .client
@@ -82,11 +90,102 @@ pub fn chunks(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+    use std::sync::{Arc, Mutex};
+
+    type Responses = Arc<Mutex<Vec<(StatusCode, Value)>>>;
+
+    async fn mock_graph(
+        State(responses): State<Responses>,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, String) {
+        let (status, expected) = responses.lock().unwrap().remove(0);
+        assert_eq!(body, expected);
+        (
+            status,
+            if status.is_success() {
+                "ok"
+            } else {
+                "window closed"
+            }
+            .into(),
+        )
+    }
+
+    async fn graph_with_responses(
+        responses: Vec<(StatusCode, Value)>,
+    ) -> (Graph, Responses, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let responses = Arc::new(Mutex::new(responses));
+        let app = Router::new()
+            .route("/messages", post(mock_graph))
+            .with_state(Arc::clone(&responses));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            Graph::with_base(format!("http://{address}/messages")).unwrap(),
+            responses,
+            task,
+        )
+    }
+
     #[test]
     fn unicode_chunks_at_chars() {
         let s = "💬".repeat(MAX_CHARS + 1);
         let got = chunks(&s);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].chars().count(), MAX_CHARS);
+    }
+
+    #[tokio::test]
+    async fn sends_recipient_and_reply_context_only_on_first_chunk() {
+        let first = "x".repeat(MAX_CHARS);
+        let second = "y";
+        let (graph, responses, server) = graph_with_responses(vec![
+            (StatusCode::OK, json!({"messaging_product":"whatsapp","recipient_type":"individual","to":"3361","type":"text","text":{"body":first,"preview_url":true},"context":{"message_id":"wamid-1"}})),
+            (StatusCode::OK, json!({"messaging_product":"whatsapp","recipient_type":"individual","to":"3361","type":"text","text":{"body":second,"preview_url":true}})),
+        ]).await;
+        graph
+            .send_text("3361", &format!("{first}{second}"), Some("wamid-1"))
+            .await
+            .unwrap();
+        assert!(responses.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn surfaces_first_and_partial_graph_failures() {
+        let payload = |body: String| json!({"messaging_product":"whatsapp","recipient_type":"individual","to":"3361","type":"text","text":{"body":body,"preview_url":true}});
+        let (graph, responses, server) =
+            graph_with_responses(vec![(StatusCode::BAD_REQUEST, payload("x".into()))]).await;
+        let error = graph
+            .send_text("3361", "x", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("400 Bad Request"), "{error}");
+        assert!(error.contains("window closed"), "{error}");
+        assert!(responses.lock().unwrap().is_empty());
+        server.abort();
+
+        let first = "x".repeat(MAX_CHARS);
+        let second = "y".repeat(MAX_CHARS);
+        let (graph, responses, server) = graph_with_responses(vec![
+            (StatusCode::OK, payload(first.clone())),
+            (StatusCode::BAD_REQUEST, payload(second.clone())),
+            (StatusCode::OK, payload("z".into())),
+        ])
+        .await;
+        let error = graph
+            .send_text("3361", &format!("{first}{second}z"), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("partial delivery: 1 of 3 chunks accepted"));
+        assert!(error.contains("window closed"));
+        assert_eq!(responses.lock().unwrap().len(), 1);
+        server.abort();
     }
 }
