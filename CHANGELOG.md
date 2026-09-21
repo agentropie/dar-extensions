@@ -10,6 +10,10 @@
   crates.io; the temporary `[patch]` / path-dependency sections pointing at a
   local dar checkout are gone, so the repo builds standalone.
 
+### Added
+
+- **whatsapp:** WhatsApp Business Cloud API extension with signed webhooks, Graph API text delivery, session persistence, and a `whatsapp_send_message` tool. (ALG-428)
+
 ## [0.4.0] - 2026-07-19
 
 Tracks dar v0.4.0: extension crates now require `dar-extension-sdk = "0.4"`.
