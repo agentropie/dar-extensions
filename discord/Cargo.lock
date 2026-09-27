@@ -369,15 +369,26 @@ dependencies = [
 
 [[package]]
 name = "dar-cap-chat"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e87303793797079f4ee5ee7b08c989047cc31d23011f93d03e14ff6a173b53d"
+checksum = "8f2403faf8e092854986496103da5efe7c793d41c1a2221aa3d75bd8d32d1f65"
 dependencies = [
  "anyhow",
  "dar-artifacts",
  "dar-cap-runner",
+ "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "dar-cap-deliver"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0173ec7ac287112fd7f5ea9711f101b06a21e0beca273aa76f7cd99ab507a185"
+dependencies = [
+ "anyhow",
+ "async-trait",
 ]
 
 [[package]]
@@ -395,17 +406,19 @@ dependencies = [
 
 [[package]]
 name = "dar-extension-sdk"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d4802bd9be4bf9988f95d02a10faaa2e55a668dc60f5a0d6a9d3358715a315f"
+checksum = "af033d5e9676bc541167243f55db0ed604dfcd3f3be1db442061410758395f0e"
 dependencies = [
  "anyhow",
  "dar-artifacts",
  "dar-cap-chat",
+ "dar-cap-deliver",
  "dar-host-api",
  "dar-orchestrator-api",
  "dar-tool-registry",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tracing",
 ]
