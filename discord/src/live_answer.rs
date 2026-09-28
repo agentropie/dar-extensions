@@ -44,12 +44,12 @@ impl LiveAnswer {
             self.dirty = true;
             Ok(())
         } else {
-            self.flush(answer).await
+            self.flush(answer, false).await
         }
     }
     pub async fn finish(&mut self, answer: &str) -> Result<()> {
         if self.dirty || self.messages.is_empty() {
-            self.flush(answer).await?;
+            self.flush(answer, true).await?;
         }
         Ok(())
     }
@@ -63,11 +63,13 @@ impl LiveAnswer {
     }
     pub async fn flush_if_due(&mut self, answer: &str) -> Result<()> {
         if self.dirty {
-            self.flush(answer).await?;
+            self.flush(answer, false).await?;
         }
         Ok(())
     }
-    async fn flush(&mut self, answer: &str) -> Result<()> {
+    /// `last`: final flush. Otherwise, a newly posted message clears typing,
+    /// so re-send it to show the reply is still streaming.
+    async fn flush(&mut self, answer: &str, last: bool) -> Result<()> {
         for (index, content) in markdown::chunk(&markdown::render(answer))
             .iter()
             .enumerate()
@@ -111,11 +113,24 @@ impl LiveAnswer {
                 response.ok_or_else(|| last_error.expect("a failed request has an error"))?;
             if index == self.messages.len() {
                 self.messages.push(response.json::<Posted>().await?.id);
+                if !last {
+                    self.typing().await;
+                }
             }
         }
         self.last = Some(Instant::now());
         self.dirty = false;
         Ok(())
+    }
+}
+impl LiveAnswer {
+    async fn typing(&self) {
+        let _ = self
+            .client
+            .post(format!("{}/channels/{}/typing", self.base, self.channel))
+            .header("Authorization", format!("Bot {}", self.token))
+            .send()
+            .await;
     }
 }
 #[derive(Deserialize)]
@@ -146,7 +161,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for method in ["POST", "PATCH"] {
+            // New message post clears typing, so typing is re-sent before edits.
+            for method in [
+                "POST /channels/c/messages ",
+                "POST /channels/c/typing ",
+                "PATCH",
+            ] {
                 let (mut s, _) = listener.accept().await.unwrap();
                 assert!(request(&mut s).await.starts_with(method));
                 let body = r#"{"id":"1"}"#;

@@ -409,18 +409,13 @@ async fn handle_message(env: &ConnectionEnv<'_>, bot_user_id: Option<&str>, mess
     }
     let turns = Arc::clone(turns);
     tokio::spawn(async move {
-        // Discord typing expires after ~10s; refresh until reply text starts.
-        // Posting clears it, but later edits do not, so stop refreshing then.
-        let replying = CancellationToken::new();
+        // Discord typing expires after ~10s and edits don't clear it, so keep
+        // it alive for the whole turn; it may linger briefly after the reply.
         let typing = async {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
-                if replying.is_cancelled() {
-                    break;
-                }
                 delivery.typing().await;
             }
-            std::future::pending::<()>().await
         };
         let answered = answer(AnswerRequest {
             ctx,
@@ -438,7 +433,6 @@ async fn handle_message(env: &ConnectionEnv<'_>, bot_user_id: Option<&str>, mess
             text: prompt,
             attachments,
             cancel,
-            replying: replying.clone(),
         });
         let result = tokio::select! {
             result = answered => result,
@@ -551,7 +545,6 @@ struct AnswerRequest {
     text: String,
     attachments: Vec<attachments::Attachment>,
     cancel: CancellationToken,
-    replying: CancellationToken,
 }
 
 async fn answer(request: AnswerRequest) -> Result<()> {
@@ -571,7 +564,6 @@ async fn answer(request: AnswerRequest) -> Result<()> {
         text,
         attachments,
         cancel,
-        replying,
     } = request;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -602,7 +594,7 @@ async fn answer(request: AnswerRequest) -> Result<()> {
     loop {
         tokio::select! {
             _ = cancel.cancelled() => { chat.abort().await?; aborted = true; break },
-            event = tokio::time::timeout(Duration::from_secs(60), rx.recv()) => match event.context("agent response timed out")? { Some(ChatEvent::Delta { role: ChatRole::Assistant, text }) => { replying.cancel(); reply.push_str(&text); live.push(&reply).await? }, Some(ChatEvent::TurnFinished { .. } | ChatEvent::SessionClosed { .. }) | None => break, Some(_) => {} },
+            event = tokio::time::timeout(Duration::from_secs(60), rx.recv()) => match event.context("agent response timed out")? { Some(ChatEvent::Delta { role: ChatRole::Assistant, text }) => { reply.push_str(&text); live.push(&reply).await? }, Some(ChatEvent::TurnFinished { .. } | ChatEvent::SessionClosed { .. }) | None => break, Some(_) => {} },
             _ = live.wait_for_flush() => live.flush_if_due(&reply).await?
         }
     }
