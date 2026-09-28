@@ -176,7 +176,11 @@ async fn run_connection(
                 let Some(value) = parse_message(message?)? else { continue };
                 if gateway_requests_reconnect(&value) { anyhow::bail!("Discord gateway requested reconnect"); }
                 if let Some(seq) = value["s"].as_i64() { sequence = Some(seq); }
-                if value["t"] == "READY" { bot_user_id = value["d"]["user"]["id"].as_str().map(str::to_owned); }
+                if value["t"] == "READY" {
+                    bot_user_id = value["d"]["user"]["id"].as_str().map(str::to_owned);
+                    let name = value["d"]["user"]["username"].as_str().unwrap_or("?");
+                    dar_extension_sdk::log::event("-", "discord", &format!("connected as @{name}"));
+                }
                 if update_thread_event(env.threads, value["t"].as_str(), &value["d"]).await {
                     continue;
                 }
@@ -280,6 +284,18 @@ async fn handle_message(env: &ConnectionEnv<'_>, bot_user_id: Option<&str>, mess
         },
     );
     let addressing::RouteDecision::Dispatch { text, session_key } = route else {
+        if let (Some(guild), Some(bot)) = (message["guild_id"].as_str(), bot_user_id) {
+            if content.contains(&format!("<@{bot}>")) || content.contains(&format!("<@!{bot}>")) {
+                dar_extension_sdk::log::event(
+                    "-",
+                    "discord",
+                    &format!(
+                        "ignored mention in guild {guild} channel {}: not configured or sender not allowed",
+                        parent_channel_id.as_deref().unwrap_or(channel_id)
+                    ),
+                );
+            }
+        }
         return;
     };
     if content.trim().is_empty() && attachments.is_empty() {
@@ -296,6 +312,16 @@ async fn handle_message(env: &ConnectionEnv<'_>, bot_user_id: Option<&str>, mess
     };
     let delivery =
         delivery::Delivery::new(client.clone(), token, channel, message_id, &cfg.ack_emoji);
+    let author = message["author"]["id"].as_str().unwrap_or("?");
+    let source = match message["guild_id"].as_str() {
+        Some(guild) => format!("guild {guild} channel {channel}"),
+        None => format!("DM channel {channel}"),
+    };
+    dar_extension_sdk::log::event(
+        "-",
+        "discord",
+        &format!("message from {source} (user {author})"),
+    );
     if let Err(error) = delivery.acknowledge().await {
         delivery.failure(&error).await;
         return;
