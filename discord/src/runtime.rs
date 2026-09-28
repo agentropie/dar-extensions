@@ -88,7 +88,7 @@ pub async fn run(
         let mut shutdown = ctx.shutdown.clone();
         let socket = match tokio::select! {
             _ = shutdown.cancelled() => { stop_turns(&turns).await; return Ok(()); }
-            result = tokio_tungstenite::connect_async(format!("{gateway}?v=10&encoding=json")) => result,
+            result = tokio_tungstenite::connect_async(format!("{}/?v=10&encoding=json", gateway.trim_end_matches('/'))) => result,
         } {
             Ok((socket, _)) => socket,
             Err(error) => {
