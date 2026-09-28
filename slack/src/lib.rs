@@ -32,7 +32,11 @@ impl Extension for SlackExtension {
             let cfg = config::parse_config(&ctx.config, self.id())?;
             let tokens = cfg.tokens()?;
             let client = api::SlackClient::new(tokens.bot)?;
-            ctx.services.service::<dyn dar_extension_sdk::deliver::DeliverySink>("slack", tools::SlackTool::new(client.clone(), cfg.clone(), tools::ToolKind::Send))?;
+            ctx.services
+                .service::<dyn dar_extension_sdk::deliver::DeliverySink>(
+                    "slack",
+                    tools::SlackTool::new(client.clone(), cfg.clone(), tools::ToolKind::Send),
+                )?;
             if let Ok(registry) = ctx
                 .services
                 .get_named::<dyn dar_extension_sdk::tools::ToolRegistryHandle>(

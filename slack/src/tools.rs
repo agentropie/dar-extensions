@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use dar_extension_sdk::tools::{ToolExecutor, ToolOutcome, ToolSpec};
 use dar_extension_sdk::deliver::{DeliverySink, Destination};
+use dar_extension_sdk::tools::{ToolExecutor, ToolOutcome, ToolSpec};
 use serde_json::{json, Value};
 
 use crate::{api::SlackClient, config::SlackConfig};
@@ -69,9 +69,16 @@ impl ToolExecutor for SlackTool {
 #[async_trait]
 impl DeliverySink for SlackTool {
     async fn deliver(&self, dest: &Destination, text: &str) -> Result<()> {
-        let channel = dest.channel.as_deref().ok_or_else(|| anyhow::anyhow!("slack delivery requires channel"))?;
-        let outcome = self.execute(json!({"channel": channel, "text": text})).await?;
-        if outcome.is_error { anyhow::bail!("{}", outcome.text); }
+        let channel = dest
+            .channel
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("slack delivery requires channel"))?;
+        let outcome = self
+            .execute(json!({"channel": channel, "text": text}))
+            .await?;
+        if outcome.is_error {
+            anyhow::bail!("{}", outcome.text);
+        }
         Ok(())
     }
 }
