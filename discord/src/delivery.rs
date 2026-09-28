@@ -35,6 +35,16 @@ impl Delivery {
         self.reaction(&self.ack, "PUT").await
     }
 
+    /// Best-effort typing indicator; Discord shows it for ~10s.
+    pub async fn typing(&self) {
+        let _ = self
+            .client
+            .post(format!("{}/channels/{}/typing", self.base, self.channel))
+            .header("Authorization", format!("Bot {}", self.token))
+            .send()
+            .await;
+    }
+
     pub async fn failure(&self, _cause: &anyhow::Error) {
         let text = "Sorry, I couldn't complete that request. Please try again.".to_owned();
         if self.post(&text).await.is_err() {
