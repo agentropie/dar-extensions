@@ -281,6 +281,11 @@ async fn handle_message(env: &ConnectionEnv<'_>, bot_user_id: Option<&str>, mess
             webhook_id: message["webhook_id"].as_str(),
             text: content,
             has_attachments: !attachments.is_empty(),
+            mentions_bot: bot_user_id.is_some_and(|bot| {
+                message["mentions"]
+                    .as_array()
+                    .is_some_and(|mentions| mentions.iter().any(|m| m["id"] == bot))
+            }),
         },
     );
     let addressing::RouteDecision::Dispatch { text, session_key } = route else {
@@ -614,7 +619,7 @@ mod tests {
                 Some("b1"),
                 &addressing::InboundMessage {
                     guild_id: Some("g1"), channel_id: "t1", parent_channel_id: parent_id.as_deref(), thread_engaged: false,
-                    author_id: "u1", author_is_bot: false, webhook_id: None, text: "<@b1> hello", has_attachments: false,
+                    author_id: "u1", author_is_bot: false, webhook_id: None, text: "<@b1> hello", has_attachments: false, mentions_bot: false,
                 },
             ),
             addressing::RouteDecision::Dispatch { session_key, .. }

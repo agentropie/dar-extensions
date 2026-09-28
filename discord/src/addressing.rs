@@ -11,6 +11,8 @@ pub struct InboundMessage<'a> {
     pub webhook_id: Option<&'a str>,
     pub text: &'a str,
     pub has_attachments: bool,
+    /// Bot is in Discord's `mentions` array (includes pinging replies).
+    pub mentions_bot: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -55,6 +57,7 @@ pub fn route(
         return RouteDecision::Ignore;
     }
     let (mentioned, text) = strip_mention(message.text, bot_user_id);
+    let mentioned = mentioned || message.mentions_bot;
     if channel.require_mention
         && !mentioned
         && !(message.parent_channel_id.is_some() && message.thread_engaged)
@@ -127,6 +130,7 @@ mod tests {
             webhook_id: None,
             text,
             has_attachments: false,
+            mentions_bot: false,
         }
     }
 
@@ -283,5 +287,16 @@ mod tests {
         let parent = route(&cfg, Some("b1"), &message(Some("g1"), "c1", "<@b1> hello"));
         thread.text = "<@b1> hello";
         assert_ne!(parent, route(&cfg, Some("b1"), &thread));
+    }
+
+    #[test]
+    fn pinging_reply_counts_as_mention() {
+        let mut reply = message(Some("g1"), "c1", "what's your workspace?");
+        assert_eq!(route(&config(), Some("b1"), &reply), RouteDecision::Ignore);
+        reply.mentions_bot = true;
+        assert!(matches!(
+            route(&config(), Some("b1"), &reply),
+            RouteDecision::Dispatch { text, .. } if text == "what's your workspace?"
+        ));
     }
 }
