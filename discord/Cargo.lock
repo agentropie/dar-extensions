@@ -493,6 +493,7 @@ dependencies = [
  "dar-host-api",
  "futures-util",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

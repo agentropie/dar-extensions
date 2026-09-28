@@ -69,6 +69,8 @@ impl Extension for SlackExtension {
         Box::pin(async move {
             let cfg = config::parse_config(&ctx.config, self.id())?;
             cfg.tokens()?;
+            // Host may enable both ring and aws-lc-rs; pick one explicitly.
+            let _ = rustls::crypto::ring::default_provider().install_default();
             tokio::spawn(async move {
                 if let Err(error) = runtime::run(ctx, cfg).await {
                     dar_extension_sdk::log::event(

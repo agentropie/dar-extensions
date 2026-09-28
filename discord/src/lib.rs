@@ -32,6 +32,8 @@ impl Extension for DiscordExtension {
         Box::pin(async move {
             let cfg = config::parse(&ctx.config, self.id())?;
             let token = config::token(&cfg)?;
+            // Host may enable both ring and aws-lc-rs; pick one explicitly.
+            let _ = rustls::crypto::ring::default_provider().install_default();
             ctx.services
                 .service::<dyn dar_extension_sdk::deliver::DeliverySink>(
                     "discord",
