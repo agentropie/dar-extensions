@@ -351,6 +351,13 @@ async fn handle_message(env: &ConnectionEnv<'_>, bot_user_id: Option<&str>, mess
     if let Some(turn) = turns.lock().await.remove(&session_key) {
         turn.stop().await;
     }
+    // In-memory history is empty after restart; backfill once per conversation.
+    if cfg.fetch_history && history.claim_seed(&history_key) {
+        match fetch_history(client, token, channel, message_id, cfg.history_limit).await {
+            Ok(older) => history.seed(&history_key, older),
+            Err(error) => tracing::warn!(%error, "discord history fetch failed"),
+        }
+    }
     match session::prepare_activity(
         data,
         &session_key,
@@ -449,6 +456,42 @@ async fn handle_message(env: &ConnectionEnv<'_>, bot_user_id: Option<&str>, mess
             turns.remove(&session_key);
         }
     });
+}
+
+/// Recent human messages before `before`, oldest first, formatted like live history.
+async fn fetch_history(
+    client: &reqwest::Client,
+    token: &str,
+    channel: &str,
+    before: &str,
+    limit: usize,
+) -> Result<Vec<(String, String)>> {
+    let limit = if limit == 0 { 50 } else { limit.min(50) };
+    let messages: Vec<Value> = client
+        .get(format!(
+            "https://discord.com/api/v10/channels/{channel}/messages?before={before}&limit={limit}"
+        ))
+        .header("Authorization", format!("Bot {token}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(messages
+        .iter()
+        .rev()
+        .filter(|m| !m["author"]["bot"].as_bool().unwrap_or(false) && m["webhook_id"].is_null())
+        .filter_map(|m| {
+            let id = m["id"].as_str()?.to_owned();
+            let content = m["content"].as_str().unwrap_or("");
+            let has_attachments = m["attachments"].as_array().is_some_and(|a| !a.is_empty());
+            match (content.trim().is_empty(), has_attachments) {
+                (false, _) => Some((id, content.to_owned())),
+                (true, true) => Some((id, "[attachment]".to_owned())),
+                (true, false) => None,
+            }
+        })
+        .collect())
 }
 
 async fn update_thread(threads: &Arc<Mutex<Threads>>, thread: &Value) {

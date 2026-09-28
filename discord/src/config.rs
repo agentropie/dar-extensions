@@ -11,6 +11,7 @@ pub struct DiscordConfig {
     pub ack_emoji: String,
     pub history_limit: usize,
     pub clear_history_after_reply: bool,
+    pub fetch_history: bool,
     pub sessions: SessionsConfig,
     pub guilds: HashMap<String, GuildConfig>,
 }
@@ -23,6 +24,7 @@ impl Default for DiscordConfig {
             ack_emoji: "👀".into(),
             history_limit: 20,
             clear_history_after_reply: false,
+            fetch_history: true,
             sessions: SessionsConfig::default(),
             guilds: HashMap::new(),
         }
