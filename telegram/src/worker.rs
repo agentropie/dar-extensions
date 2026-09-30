@@ -181,6 +181,8 @@ async fn render_events(
     let mut active = None;
     let mut live = LiveTurn::new(api, RealClock);
     let mut origin = None;
+    // NO_REPLY or loop guard: the current turn delivers nothing.
+    let mut silent = false;
     loop {
         tokio::select! {
             inbound = input.recv() => {
@@ -207,9 +209,12 @@ async fn render_events(
                 match event {
                     ChatEvent::Delta { role: ChatRole::Assistant, text } => live.push_text(&text).await,
                     ChatEvent::ToolCall { name, args, .. } => live.tool_started(&name, &args).await,
+                    ChatEvent::Silent { .. } => silent = true,
                     ChatEvent::TurnFinished { ok, error } => {
                         live.finish().await;
-                        let reply = if !live.answer().trim().is_empty() {
+                        let reply = if std::mem::take(&mut silent) {
+                            String::new()
+                        } else if !live.answer().trim().is_empty() {
                             live.answer().to_string()
                         } else if !ok {
                             format!("(turn failed: {})", error.unwrap_or_else(|| "unknown".into()))
@@ -652,5 +657,35 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(f.closed.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(*f.api.reactions.lock().unwrap(), [(1, true), (1, false)]);
+    }
+
+    #[tokio::test]
+    async fn silent_turn_posts_nothing_and_clears_ack() {
+        let mut f = Fixture::new(false);
+        f.submit(1, "don't reply").await;
+        f.start(TurnOrigin::Submitted).await;
+        f.events
+            .send(ChatEvent::Silent {
+                reason: None,
+                text: "NO_REPLY".into(),
+            })
+            .await
+            .unwrap();
+        f.events
+            .send(ChatEvent::TurnFinished {
+                ok: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+        // Next turn still delivers, proving the silent one posted nothing.
+        f.submit(2, "next").await;
+        f.start(TurnOrigin::Submitted).await;
+        f.finish("reply").await;
+        assert_eq!(f.replies(1).await, ["reply"]);
+        let mut reactions = f.api.reactions.lock().unwrap().clone();
+        reactions.sort();
+        assert_eq!(reactions, [(1, false), (1, true), (2, false), (2, true)]);
+        f.stop().await;
     }
 }

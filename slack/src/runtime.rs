@@ -842,32 +842,47 @@ async fn handle_message(
             }
         }
     }
-    let (mut answer, artifacts, closed, agent_succeeded, live_displayed, live_succeeded) =
-        match run_turn(
-            sessions.get_mut(&key_string).expect("session inserted"),
-            prompt,
-            &mut env.ctx.shutdown.clone(),
-            control_rx,
-            TurnDisplay {
-                client: env.client.clone(),
-                channel: incoming.channel_id.clone(),
-                thread_ts: reply_thread_ts.clone(),
-                show_thinking: env.cfg.show_thinking,
-                delete_thinking_on_complete: env.cfg.delete_thinking_on_complete,
-            },
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => (
-                "Agent response failed.".into(),
-                Vec::new(),
-                true,
-                false,
-                false,
-                true,
-            ),
-        };
+    let TurnResult {
+        mut answer,
+        artifacts,
+        closed,
+        agent_succeeded,
+        live_displayed,
+        live_succeeded,
+        silent,
+    } = match run_turn(
+        sessions.get_mut(&key_string).expect("session inserted"),
+        prompt,
+        &mut env.ctx.shutdown.clone(),
+        control_rx,
+        TurnDisplay {
+            client: env.client.clone(),
+            channel: incoming.channel_id.clone(),
+            thread_ts: reply_thread_ts.clone(),
+            show_thinking: env.cfg.show_thinking,
+            delete_thinking_on_complete: env.cfg.delete_thinking_on_complete,
+        },
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => TurnResult {
+            answer: "Agent response failed.".into(),
+            artifacts: Vec::new(),
+            closed: true,
+            agent_succeeded: false,
+            live_displayed: false,
+            live_succeeded: true,
+            silent: false,
+        },
+    };
+    if silent {
+        if closed {
+            sessions.remove(&key_string);
+        }
+        finish_reaction(env.client, env.cfg, &incoming).await;
+        return;
+    }
     if answer.trim().is_empty() {
         answer = "Agent completed without a text response.".into();
     }
@@ -1058,7 +1073,7 @@ async fn run_turn(
     shutdown: &mut dar_extension_sdk::ShutdownToken,
     control_rx: &mut mpsc::Receiver<Control>,
     display: TurnDisplay,
-) -> Result<(String, Vec<ArtifactReady>, bool, bool, bool, bool)> {
+) -> Result<TurnResult> {
     let thinking = display.show_thinking.then(|| {
         Thinking::start(
             display.client.clone(),
@@ -1080,6 +1095,7 @@ async fn run_turn(
     }
     let mut answer = String::new();
     let mut artifacts = Vec::new();
+    let mut silent = false;
     let result = loop {
         tokio::select! {
             _ = live_answer.wait_for_flush() => {
@@ -1106,6 +1122,7 @@ async fn run_turn(
                 Some(ChatEvent::Delta { role: ChatRole::Thinking, text }) => {
                     if let Some(thinking) = &thinking { thinking.append(text); }
                 }
+                Some(ChatEvent::Silent { .. }) => silent = true,
                 Some(ChatEvent::TurnFinished { ok, error }) => {
                     if !ok && answer.is_empty() {
                         answer = format!("Agent turn failed: {}", error.unwrap_or_else(|| "unknown error".into()));
@@ -1124,14 +1141,26 @@ async fn run_turn(
         thinking.finish().await;
     }
     let (live_displayed, live_succeeded) = live_answer.finish(&result.0).await;
-    Ok((
-        result.0,
+    Ok(TurnResult {
+        answer: result.0,
         artifacts,
-        result.1,
-        result.2,
+        closed: result.1,
+        agent_succeeded: result.2,
         live_displayed,
         live_succeeded,
-    ))
+        silent,
+    })
+}
+
+struct TurnResult {
+    answer: String,
+    artifacts: Vec<ArtifactReady>,
+    closed: bool,
+    agent_succeeded: bool,
+    live_displayed: bool,
+    live_succeeded: bool,
+    /// NO_REPLY or loop guard: deliver nothing.
+    silent: bool,
 }
 
 fn append_artifact(artifacts: &mut Vec<ArtifactReady>, artifact: ArtifactReady) {
@@ -1655,5 +1684,64 @@ mod tests {
             is_reaction: false,
         };
         assert!(!command_allowed(&cfg, &incoming));
+    }
+
+    struct SilentSession(mpsc::Sender<ChatEvent>);
+    impl ChatSession for SilentSession {
+        fn send_turn(&mut self, _: String) -> dar_extension_sdk::chat::BoxFuture<'_, Result<()>> {
+            let tx = self.0.clone();
+            Box::pin(async move {
+                tx.send(ChatEvent::Silent {
+                    reason: None,
+                    text: "NO_REPLY".into(),
+                })
+                .await?;
+                tx.send(ChatEvent::TurnFinished {
+                    ok: true,
+                    error: None,
+                })
+                .await?;
+                Ok(())
+            })
+        }
+        fn abort(&mut self) -> dar_extension_sdk::chat::BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn close(self: Box<Self>) -> dar_extension_sdk::chat::BoxFuture<'static, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn silent_turn_displays_nothing() {
+        let (tx, rx) = mpsc::channel(8);
+        let (_artifact_tx, artifacts) = mpsc::channel(1);
+        let mut conn = ChatConn {
+            session: Box::new(SilentSession(tx)),
+            rx,
+            artifacts,
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (_control_tx, mut control_rx) = mpsc::channel(1);
+        // Unreachable API: any post would fail and show in live_succeeded.
+        let client = SlackClient::with_base("xoxb-token".into(), "http://127.0.0.1:9/").unwrap();
+        let result = run_turn(
+            &mut conn,
+            "hi".into(),
+            &mut dar_extension_sdk::ShutdownToken::new(shutdown_rx),
+            &mut control_rx,
+            TurnDisplay {
+                client,
+                channel: "C".into(),
+                thread_ts: None,
+                show_thinking: false,
+                delete_thinking_on_complete: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(result.silent);
+        assert!(result.answer.is_empty());
+        assert!(!result.live_displayed && result.live_succeeded);
     }
 }

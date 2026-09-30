@@ -2,7 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- **all:** silent turns (`NO_REPLY` or loop-guard blocks, dar 0.6) post nothing, with no `(no response)` fallback; Discord removes its ack reaction.
+
 ### Changed
+
+- All crates now require `dar-extension-sdk = "0.6"`.
 
 - IRC, Slack, Telegram, and Discord now expose scheduler delivery sinks so cron results can be sent to explicit channel or user destinations by the runtime.
 

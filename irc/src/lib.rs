@@ -688,7 +688,10 @@ async fn handle_reply(
     )
     .await;
 
-    deliver(sender, pending, &target, reply).await;
+    // Empty = silent turn (NO_REPLY or loop guard): post nothing.
+    if !reply.is_empty() {
+        deliver(sender, pending, &target, reply).await;
+    }
     carry
 }
 
@@ -938,11 +941,13 @@ async fn run_turn(
 
     let mut reply = String::new();
     let mut drop_session = false;
+    let mut silent = false;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             event = conn.rx.recv() => match event {
                 Some(ChatEvent::Delta { role: ChatRole::Assistant, text }) => reply.push_str(&text),
+                Some(ChatEvent::Silent { .. }) => silent = true,
                 Some(ChatEvent::TurnFinished { ok: true, .. }) => break,
                 Some(ChatEvent::TurnFinished { ok: false, error }) => {
                     if reply.is_empty() {
@@ -969,7 +974,14 @@ async fn run_turn(
     if drop_session {
         state.sessions.remove(conv);
     }
-    if reply.trim().is_empty() {
+    final_reply(reply, silent)
+}
+
+/// Text to post for a finished turn; empty for a silent one.
+fn final_reply(reply: String, silent: bool) -> String {
+    if silent {
+        String::new()
+    } else if reply.trim().is_empty() {
         "(no response)".to_string()
     } else {
         reply
@@ -1078,6 +1090,13 @@ mod tests {
             },
             shutdown,
         )
+    }
+
+    #[test]
+    fn silent_turn_has_no_reply_or_fallback() {
+        assert_eq!(final_reply(String::new(), true), "");
+        assert_eq!(final_reply(String::new(), false), "(no response)");
+        assert_eq!(final_reply("hi".into(), false), "hi");
     }
 
     #[tokio::test]
