@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-30
+
+### Changed
+
+- Extension crate versions now follow repo releases (were stuck at `0.1.0`), so `dar build` shows the compiled release.
+
 ## [0.6.0] - 2026-09-30
 
 Tracks dar v0.6.0: extension crates now require `dar-extension-sdk = "0.6"`.
