@@ -43,7 +43,12 @@ impl Extension for DiscordExtension {
                 .services
                 .get_named::<dyn ToolRegistryHandle>(TOOL_REGISTRY_SERVICE)
             {
-                registry.register_tool(tools::spec(), tools::DiscordSendTool::new(token, cfg))?;
+                let tool = tools::DiscordSendTool::new(token, cfg);
+                registry.register_tool(
+                    tools::list_users_spec(),
+                    std::sync::Arc::new(tools::DiscordListUsersTool(std::sync::Arc::clone(&tool))),
+                )?;
+                registry.register_tool(tools::spec(), tool)?;
             }
             Ok(())
         })

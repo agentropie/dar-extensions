@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- **discord:** `discord_list_users` lists guild members with IDs, including bots (`bot: true`); needs the Server Members Intent.
+- **discord:** the agent now sees authors as `Name (<@id>)` / `Name (<@id>, bot)` in the current message and history, plus a hint to mention with `<@USER_ID>`, so it can @-mention other bots in agent-to-agent chat.
+
 ## [0.6.1] - 2026-09-30
 
 ### Changed

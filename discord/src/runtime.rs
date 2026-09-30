@@ -400,7 +400,7 @@ async fn handle_message(env: &ConnectionEnv<'_>, bot_user_id: Option<&str>, mess
     let root = root.to_path_buf();
     let channel = channel.to_owned();
     let history_message_id = message_id.to_owned();
-    let prompt = text;
+    let prompt = current_prompt(&message["author"], &text);
     let sender = turn_sender(message);
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
@@ -512,13 +512,31 @@ fn history_entry(message: &Value, bot_user_id: Option<&str>) -> Option<(String, 
         (true, true) => "[attachment]".to_owned(),
         (true, false) => return None,
     };
-    let text = if author["bot"].as_bool().unwrap_or(false) {
-        let name = author["username"].as_str().unwrap_or("?");
-        format!("[bot {name}] {text}")
-    } else {
-        text
-    };
+    let text = format!("{}: {text}", author_label(author));
     Some((message["id"].as_str()?.to_owned(), text))
+}
+
+/// How to address people from a reply; a bare name notifies nobody.
+const MENTION_HINT: &str = "To mention a user or another bot, write <@USER_ID>; a bare name does not notify them. Bots only respond when mentioned.";
+
+/// Agent-facing author label: `Name (<@id>)`, or `Name (<@id>, bot)`.
+fn author_label(author: &Value) -> String {
+    let id = author["id"].as_str().unwrap_or("?");
+    let name = author["global_name"]
+        .as_str()
+        .or(author["username"].as_str())
+        .unwrap_or("?");
+    let bot = if author["bot"].as_bool().unwrap_or(false) {
+        ", bot"
+    } else {
+        ""
+    };
+    format!("{name} (<@{id}>{bot})")
+}
+
+/// Current message as the agent reads it: who sent it and how to mention.
+fn current_prompt(author: &Value, text: &str) -> String {
+    format!("From {}:\n{text}\n\n({MENTION_HINT})", author_label(author))
 }
 
 async fn update_thread(threads: &Arc<Mutex<Threads>>, thread: &Value) {
@@ -1023,11 +1041,13 @@ mod tests {
             entry(
                 json!({"id": "1", "content": "hi", "author": {"id": "b2", "bot": true, "username": "Pal"}})
             ),
-            Some("[bot Pal] hi".into())
+            Some("Pal (<@b2>, bot): hi".into())
         );
         assert_eq!(
-            entry(json!({"id": "2", "content": "hi", "author": {"id": "u1"}})),
-            Some("hi".into())
+            entry(
+                json!({"id": "2", "content": "hi", "author": {"id": "u1", "username": "u", "global_name": "Thinh"}})
+            ),
+            Some("Thinh (<@u1>): hi".into())
         );
         assert_eq!(
             entry(json!({"id": "3", "content": "hi", "author": {"id": "b1", "bot": true}})),
@@ -1039,5 +1059,15 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn current_message_names_sender_with_mention_id() {
+        let prompt = current_prompt(
+            &json!({"id": "b2", "bot": true, "username": "Pom"}),
+            "hello",
+        );
+        assert!(prompt.starts_with("From Pom (<@b2>, bot):\nhello"));
+        assert!(prompt.contains("<@USER_ID>"));
     }
 }

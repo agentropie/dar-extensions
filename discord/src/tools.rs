@@ -30,6 +30,79 @@ pub fn spec() -> ToolSpec {
     .writes()
 }
 
+pub fn list_users_spec() -> ToolSpec {
+    ToolSpec::new(
+        "discord_list_users",
+        "List members (humans and bots) of the configured Discord guilds with their user IDs. To mention a user or bot, write <@id> in your message; a bare name does not notify them.",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "query": {"type": "string", "description": "Case-insensitive name filter."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Max users to return (default 100)."}
+            }
+        }),
+    )
+}
+
+/// Lists guild members for `discord_list_users`.
+pub struct DiscordListUsersTool(pub Arc<DiscordSendTool>);
+
+#[async_trait]
+impl ToolExecutor for DiscordListUsersTool {
+    async fn execute(&self, args: Value) -> Result<ToolOutcome> {
+        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+        let mut users = Vec::new();
+        for guild_id in self.0.config.guilds.keys() {
+            match self.0.guild_members(guild_id).await {
+                Ok(members) => users.extend(select_members(&members, guild_id, query)),
+                Err(error) if error.to_string().starts_with("HTTP 403") => {
+                    return Ok(api_error(
+                        "missing_members_intent",
+                        "Discord refused the member list; enable the Server Members Intent for this bot in the Discord developer portal",
+                        error,
+                    ))
+                }
+                Err(error) => {
+                    return Ok(api_error("discord_list_failed", "Discord member list failed", error))
+                }
+            }
+            if users.len() >= limit {
+                break;
+            }
+        }
+        users.truncate(limit);
+        Ok(ToolOutcome::ok(Value::Array(users).to_string()))
+    }
+}
+
+/// `{id, name, guildId, bot?}` for members matching `query` (bots included).
+fn select_members(members: &[Value], guild_id: &str, query: &str) -> Vec<Value> {
+    let query = query.to_lowercase();
+    members
+        .iter()
+        .filter_map(|member| {
+            let user = &member["user"];
+            let id = user["id"].as_str()?;
+            let name = member["nick"]
+                .as_str()
+                .or(user["global_name"].as_str())
+                .or(user["username"].as_str())
+                .unwrap_or(id);
+            let names = [name, user["username"].as_str().unwrap_or("")];
+            if !query.is_empty() && !names.iter().any(|n| n.to_lowercase().contains(&query)) {
+                return None;
+            }
+            let mut out = json!({"id": id, "name": name, "guildId": guild_id});
+            if user["bot"].as_bool().unwrap_or(false) {
+                out["bot"] = json!(true);
+            }
+            Some(out)
+        })
+        .collect()
+}
+
 pub struct DiscordSendTool {
     client: reqwest::Client,
     token: String,
@@ -146,6 +219,30 @@ impl DiscordSendTool {
             .ok_or_else(|| anyhow::anyhow!("Discord did not return a DM channel ID"))
     }
 
+    async fn guild_members(&self, guild_id: &str) -> Result<Vec<Value>> {
+        let mut members = Vec::new();
+        let mut after = "0".to_owned();
+        loop {
+            let page = self
+                .request(
+                    "GET",
+                    &format!("guilds/{guild_id}/members?limit=1000&after={after}"),
+                    None,
+                )
+                .await?;
+            let page = page.as_array().cloned().unwrap_or_default();
+            let full = page.len() == 1000;
+            match page.last().and_then(|m| m["user"]["id"].as_str()) {
+                Some(last) if full => after = last.to_owned(),
+                _ => {
+                    members.extend(page);
+                    return Ok(members);
+                }
+            }
+            members.extend(page);
+        }
+    }
+
     async fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
         let method = method.parse()?;
         let mut request = self
@@ -229,5 +326,25 @@ mod tests {
             .unwrap();
         assert!(invalid_user.is_error);
         assert_eq!(invalid_user.error.unwrap().code, "invalid_target");
+    }
+
+    #[test]
+    fn list_users_includes_bots_and_filters_by_name() {
+        let members = vec![
+            json!({"user": {"id": "1", "username": "iris", "bot": true}}),
+            json!({"user": {"id": "2", "username": "thinh", "global_name": "Thinh"}}),
+            json!({"nick": "Pom", "user": {"id": "3", "username": "pom_bot", "bot": true}}),
+        ];
+        let all = select_members(&members, "g", "");
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            all[0],
+            json!({"id": "1", "name": "iris", "guildId": "g", "bot": true})
+        );
+        assert_eq!(all[1], json!({"id": "2", "name": "Thinh", "guildId": "g"}));
+        assert_eq!(
+            select_members(&members, "g", "POM"),
+            [json!({"id": "3", "name": "Pom", "guildId": "g", "bot": true})]
+        );
     }
 }
