@@ -1,6 +1,6 @@
 # discord
 
-Discord extension for dar. DMs are accepted as before. Guild messages require an @mention by default, are stripped before forwarding, and each guild channel keeps an isolated session. Threads inherit their parent channel's addressing configuration, reply in the thread, and keep a separate session; after an accepted mention, follow-ups in that thread continue without another mention. Bot and webhook messages are ignored.
+Discord extension for dar. DMs are accepted as before. Guild messages require an @mention by default, are stripped before forwarding, and each guild channel keeps an isolated session. Threads inherit their parent channel's addressing configuration, reply in the thread, and keep a separate session; after an accepted mention, follow-ups in that thread continue without another mention. Webhook messages and the bot's own messages are always ignored; other bots are ignored unless `allow_bots` permits them (see [Other bots](#other-bots-allow_bots)).
 
 ## Install
 
@@ -15,6 +15,7 @@ extensions:
     ack_emoji: "ðŸ‘€" # optional immediate acknowledgement
     history_limit: 20 # recent prior messages included with each accepted turn; 0 keeps all buffered (max 50)
     fetch_history: true # backfill recent channel messages from Discord on first use after restart
+    allow_bots: false # true = any other bot may trigger the agent; or a list of bot user IDs
     clear_history_after_reply: false # set true to discard that channel/thread history after a successful reply
     sessions:
       idle_minutes: 360 # lazy expiry on next accepted turn; 0 disables
@@ -35,7 +36,21 @@ Every accepted message is immediately acknowledged with `ack_emoji` (default `ðŸ
 
 The gateway reconnects automatically after a disconnect, retrying after 1, 2, 4, 8, 16, then 30 seconds (maximum). A reconnect starts a fresh gateway session; messages sent while it was disconnected are not replayed and will not receive a delayed reply. On shutdown the gateway sends a close frame and all active agent turns are cancelled and awaited.
 
-Recent human messages are kept in memory per channel or thread (and per DM), including messages sent before the bot is mentioned. By default the most recent 20 prior messages are supplied as explicitly untrusted context and history is retained after replies. `history_limit: 0` uses all retained messages; the in-memory buffer is capped at 50 messages. Set `clear_history_after_reply: true` to clear that conversation's buffer only after a reply is delivered successfully; `/reset` also clears it. History is in memory; with `fetch_history: true` (default) the first accepted message in each conversation after a restart backfills up to `history_limit` (max 50) prior human messages from the Discord API. Set `fetch_history: false` to start empty after restarts.
+Recent human and other-bot messages are kept in memory per channel or thread (and per DM), including messages sent before the bot is mentioned. By default the most recent 20 prior messages are supplied as explicitly untrusted context and history is retained after replies. `history_limit: 0` uses all retained messages; the in-memory buffer is capped at 50 messages. Set `clear_history_after_reply: true` to clear that conversation's buffer only after a reply is delivered successfully; `/reset` also clears it. History is in memory; with `fetch_history: true` (default) the first accepted message in each conversation after a restart backfills up to `history_limit` (max 50) prior messages from the Discord API. Set `fetch_history: false` to start empty after restarts.
+
+## Other bots (`allow_bots`)
+
+`allow_bots` (top level only, no per-channel override) lets other bots trigger the agent, e.g. for agent-to-agent chat: `false` (default) ignores all bot authors, `true` accepts any bot, and a list accepts only those Discord bot user IDs.
+
+- Bots must always @mention this bot (a pinging reply counts), even in channels with `require_mention: false`, so two bots cannot chatter endlessly.
+- The bot's own messages and webhook messages never trigger a turn.
+- Other bots' messages are always recorded in channel history (labelled `[bot <name>]`), even when `allow_bots` is off, so a later human mention has that context.
+- Bot-triggered turns carry `sender = discord:<bot user id>` into dar's agent loop guard (`agent_loop:` in `agent.yaml`). The guard counts consecutive bot turns per channel/thread across restarts of the chat session; a human message resets it. Blocked turns post nothing.
+- Reading other bots' message text requires the **Message Content Intent**.
+
+## Silent turns
+
+When the agent replies `NO_REPLY` (or the loop guard blocks a turn) nothing is posted, not even `(no response)`, and the acknowledgement reaction is removed. Discord cannot cancel a typing indicator, so it may linger for a few seconds.
 
 ## Agent tool
 

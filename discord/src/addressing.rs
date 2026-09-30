@@ -29,10 +29,12 @@ pub fn route(
     bot_user_id: Option<&str>,
     message: &InboundMessage<'_>,
 ) -> RouteDecision {
-    if message.author_is_bot
-        || message.webhook_id.is_some()
+    if message.webhook_id.is_some()
         || message.channel_id.is_empty()
         || message.author_id.is_empty()
+        // Never answer ourselves, whatever allow_bots says: self-loop.
+        || bot_user_id == Some(message.author_id)
+        || (message.author_is_bot && !config.allow_bots.allows(message.author_id))
     {
         return RouteDecision::Ignore;
     }
@@ -58,6 +60,11 @@ pub fn route(
     }
     let (mentioned, text) = strip_mention(message.text, bot_user_id);
     let mentioned = mentioned || message.mentions_bot;
+    // Bots must always mention us, even where humans needn't: stops two
+    // reply-to-everything bots from chattering endlessly.
+    if message.author_is_bot && !mentioned {
+        return RouteDecision::Ignore;
+    }
     if channel.require_mention
         && !mentioned
         && !(message.parent_channel_id.is_some() && message.thread_engaged)
@@ -298,5 +305,71 @@ mod tests {
             route(&config(), Some("b1"), &reply),
             RouteDecision::Dispatch { text, .. } if text == "what's your workspace?"
         ));
+    }
+
+    fn bot(text: &str) -> InboundMessage<'_> {
+        let mut bot = message(Some("g1"), "c1", text);
+        bot.author_id = "b2";
+        bot.author_is_bot = true;
+        bot
+    }
+
+    fn dispatched(decision: RouteDecision) -> bool {
+        matches!(decision, RouteDecision::Dispatch { .. })
+    }
+
+    #[test]
+    fn allow_bots_true_and_allowlist_gate_bot_authors() {
+        let mut cfg = config();
+        assert!(
+            !dispatched(route(&cfg, Some("b1"), &bot("<@b1> hi"))),
+            "default false"
+        );
+        cfg.allow_bots = crate::config::AllowBots::All(true);
+        assert!(dispatched(route(&cfg, Some("b1"), &bot("<@b1> hi"))));
+        cfg.allow_bots = crate::config::AllowBots::Only(vec!["b2".into()]);
+        assert!(
+            dispatched(route(&cfg, Some("b1"), &bot("<@b1> hi"))),
+            "allowlist hit"
+        );
+        cfg.allow_bots = crate::config::AllowBots::Only(vec!["b3".into()]);
+        assert!(
+            !dispatched(route(&cfg, Some("b1"), &bot("<@b1> hi"))),
+            "allowlist miss"
+        );
+    }
+
+    #[test]
+    fn self_and_webhooks_ignored_even_when_bots_allowed() {
+        let mut cfg = config();
+        cfg.allow_bots = crate::config::AllowBots::All(true);
+        let mut own = bot("<@b1> hi");
+        own.author_id = "b1";
+        assert_eq!(route(&cfg, Some("b1"), &own), RouteDecision::Ignore);
+        let mut hook = bot("<@b1> hi");
+        hook.webhook_id = Some("hook");
+        assert_eq!(route(&cfg, Some("b1"), &hook), RouteDecision::Ignore);
+    }
+
+    #[test]
+    fn bots_need_mention_even_without_require_mention() {
+        let mut cfg = config();
+        cfg.allow_bots = crate::config::AllowBots::All(true);
+        cfg.guilds
+            .get_mut("g1")
+            .unwrap()
+            .channels
+            .get_mut("c1")
+            .unwrap()
+            .require_mention = false;
+        assert!(dispatched(route(
+            &cfg,
+            Some("b1"),
+            &message(Some("g1"), "c1", "hi")
+        )));
+        assert_eq!(route(&cfg, Some("b1"), &bot("hi")), RouteDecision::Ignore);
+        let mut reply = bot("hi");
+        reply.mentions_bot = true;
+        assert!(dispatched(route(&cfg, Some("b1"), &reply)));
     }
 }

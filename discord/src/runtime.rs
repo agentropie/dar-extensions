@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use dar_extension_sdk::{
-    chat::{ChatBackend, ChatEvent, ChatRole},
+    chat::{AgentSender, ChatBackend, ChatEvent, ChatRole},
     StartCtx,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -51,7 +51,13 @@ struct ConnectionEnv<'a> {
     threads: &'a Arc<Mutex<Threads>>,
     history: &'a Arc<History>,
     next_turn: &'a AtomicU64,
+    guards: &'a Guards,
 }
+
+/// Loop guard per conversation. Each Discord turn opens a fresh chat
+/// session, so the backend's per-session guard never accumulates; keep one
+/// here that outlives sessions.
+type Guards = Arc<std::sync::Mutex<HashMap<session::SessionKey, cap_chat::LoopGuard>>>;
 
 pub async fn run(
     ctx: StartCtx,
@@ -65,6 +71,7 @@ pub async fn run(
     let threads = Arc::new(Mutex::new(Threads::default()));
     let history = Arc::new(History::default());
     let next_turn = AtomicU64::new(0);
+    let guards = Guards::default();
     let mut delay = Duration::from_secs(1);
     loop {
         if ctx.shutdown.is_cancelled() {
@@ -112,6 +119,7 @@ pub async fn run(
                 threads: &threads,
                 history: &history,
                 next_turn: &next_turn,
+                guards: &guards,
             },
             socket,
         )
@@ -232,6 +240,7 @@ async fn handle_message(env: &ConnectionEnv<'_>, bot_user_id: Option<&str>, mess
     let threads = env.threads;
     let history = env.history;
     let next_turn = env.next_turn;
+    let guards = Arc::clone(env.guards);
     let attachments = attachments::parse(message["attachments"].as_array());
     let content = message["content"].as_str().unwrap_or("");
     if let Some(thread) = message.get("thread") {
@@ -255,18 +264,8 @@ async fn handle_message(env: &ConnectionEnv<'_>, bot_user_id: Option<&str>, mess
         parent_channel_id.as_deref(),
         message["author"]["id"].as_str(),
     );
-    if !message["author"]["bot"].as_bool().unwrap_or(false)
-        && message["webhook_id"].as_str().is_none()
-        && (!content.trim().is_empty() || !attachments.is_empty())
-    {
-        if let Some(message_id) = message["id"].as_str() {
-            let history_text = if content.trim().is_empty() {
-                "[attachment]".to_owned()
-            } else {
-                content.to_owned()
-            };
-            history.add(&history_key, message_id.to_owned(), history_text);
-        }
+    if let Some((message_id, history_text)) = history_entry(message, bot_user_id) {
+        history.add(&history_key, message_id, history_text);
     }
     let route = addressing::route(
         cfg,
@@ -353,7 +352,16 @@ async fn handle_message(env: &ConnectionEnv<'_>, bot_user_id: Option<&str>, mess
     }
     // In-memory history is empty after restart; backfill once per conversation.
     if cfg.fetch_history && history.claim_seed(&history_key) {
-        match fetch_history(client, token, channel, message_id, cfg.history_limit).await {
+        match fetch_history(
+            client,
+            token,
+            channel,
+            message_id,
+            cfg.history_limit,
+            bot_user_id,
+        )
+        .await
+        {
             Ok(older) => history.seed(&history_key, older),
             Err(error) => tracing::warn!(%error, "discord history fetch failed"),
         }
@@ -393,6 +401,7 @@ async fn handle_message(env: &ConnectionEnv<'_>, bot_user_id: Option<&str>, mess
     let channel = channel.to_owned();
     let history_message_id = message_id.to_owned();
     let prompt = text;
+    let sender = turn_sender(message);
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
     let id = next_turn.fetch_add(1, Ordering::Relaxed);
@@ -433,15 +442,22 @@ async fn handle_message(env: &ConnectionEnv<'_>, bot_user_id: Option<&str>, mess
             text: prompt,
             attachments,
             cancel,
+            sender,
+            guards,
         });
         let result = tokio::select! {
             result = answered => result,
             () = typing => unreachable!(),
         };
-        if let Err(error) = result {
-            if !task_cancel.is_cancelled() {
-                tracing::warn!(%error, "discord turn failed");
-                delivery.failure(&error).await;
+        match result {
+            // Silent turn: nothing posted, so drop the ack too.
+            Ok(true) => delivery.unacknowledge().await,
+            Ok(false) => {}
+            Err(error) => {
+                if !task_cancel.is_cancelled() {
+                    tracing::warn!(%error, "discord turn failed");
+                    delivery.failure(&error).await;
+                }
             }
         }
         let _ = done_tx.send(());
@@ -459,6 +475,7 @@ async fn fetch_history(
     channel: &str,
     before: &str,
     limit: usize,
+    bot_user_id: Option<&str>,
 ) -> Result<Vec<(String, String)>> {
     let limit = if limit == 0 { 50 } else { limit.min(50) };
     let messages: Vec<Value> = client
@@ -474,18 +491,34 @@ async fn fetch_history(
     Ok(messages
         .iter()
         .rev()
-        .filter(|m| !m["author"]["bot"].as_bool().unwrap_or(false) && m["webhook_id"].is_null())
-        .filter_map(|m| {
-            let id = m["id"].as_str()?.to_owned();
-            let content = m["content"].as_str().unwrap_or("");
-            let has_attachments = m["attachments"].as_array().is_some_and(|a| !a.is_empty());
-            match (content.trim().is_empty(), has_attachments) {
-                (false, _) => Some((id, content.to_owned())),
-                (true, true) => Some((id, "[attachment]".to_owned())),
-                (true, false) => None,
-            }
-        })
+        .filter_map(|m| history_entry(m, bot_user_id))
         .collect())
+}
+
+/// History entry for a message: humans and other bots (labelled, so the
+/// agent can tell them apart); never our own bot or webhooks.
+fn history_entry(message: &Value, bot_user_id: Option<&str>) -> Option<(String, String)> {
+    let author = &message["author"];
+    let own = bot_user_id.is_some_and(|bot| author["id"] == bot);
+    if own || !message["webhook_id"].is_null() {
+        return None;
+    }
+    let content = message["content"].as_str().unwrap_or("");
+    let has_attachments = message["attachments"]
+        .as_array()
+        .is_some_and(|a| !a.is_empty());
+    let text = match (content.trim().is_empty(), has_attachments) {
+        (false, _) => content.to_owned(),
+        (true, true) => "[attachment]".to_owned(),
+        (true, false) => return None,
+    };
+    let text = if author["bot"].as_bool().unwrap_or(false) {
+        let name = author["username"].as_str().unwrap_or("?");
+        format!("[bot {name}] {text}")
+    } else {
+        text
+    };
+    Some((message["id"].as_str()?.to_owned(), text))
 }
 
 async fn update_thread(threads: &Arc<Mutex<Threads>>, thread: &Value) {
@@ -545,9 +578,26 @@ struct AnswerRequest {
     text: String,
     attachments: Vec<attachments::Attachment>,
     cancel: CancellationToken,
+    sender: Option<AgentSender>,
+    guards: Guards,
 }
 
-async fn answer(request: AnswerRequest) -> Result<()> {
+/// Loop-guard author for a turn: other bots are agents; humans are `None`.
+fn turn_sender(message: &Value) -> Option<AgentSender> {
+    message["author"]["bot"]
+        .as_bool()
+        .unwrap_or(false)
+        .then(|| AgentSender {
+            agent_id: format!(
+                "discord:{}",
+                message["author"]["id"].as_str().unwrap_or("?")
+            ),
+            hops: None,
+        })
+}
+
+/// Ok(true) = silent turn (NO_REPLY or loop guard): nothing was posted.
+async fn answer(request: AnswerRequest) -> Result<bool> {
     let AnswerRequest {
         ctx,
         configured,
@@ -564,6 +614,8 @@ async fn answer(request: AnswerRequest) -> Result<()> {
         text,
         attachments,
         cancel,
+        sender,
+        guards,
     } = request;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -581,8 +633,22 @@ async fn answer(request: AnswerRequest) -> Result<()> {
     let params = dar_extension_sdk::chat::agent_session_params(&ctx, &dir)
         .resume_session_id(session::resume_id(&dir))
         .build();
-    let mut chat = tokio::select! { _ = cancel.cancelled() => return Ok(()), result = backend.open(params, tx) => result? };
-    tokio::select! { _ = cancel.cancelled() => { chat.abort().await?; chat.close().await?; return Ok(()) }, result = tokio::time::timeout(Duration::from_secs(60), chat.send_turn(text)) => result.context("agent queue timed out")?? };
+    let admitted = guards
+        .lock()
+        .expect("loop guard lock poisoned")
+        .entry(session_key.clone())
+        .or_insert_with(|| cap_chat::LoopGuard::new(params.agent_loop))
+        .admit(sender.as_ref());
+    if let Err(reason) = admitted {
+        dar_extension_sdk::log::event(
+            "-",
+            "discord",
+            &format!("loop guard dropped turn ({})", reason.as_str()),
+        );
+        return Ok(true);
+    }
+    let mut chat = tokio::select! { _ = cancel.cancelled() => return Ok(false), result = backend.open(params, tx) => result? };
+    tokio::select! { _ = cancel.cancelled() => { chat.abort().await?; chat.close().await?; return Ok(false) }, result = tokio::time::timeout(Duration::from_secs(60), chat.send_turn_from(text, sender)) => result.context("agent queue timed out")?? };
     let mut reply = String::new();
     let mut live = live_answer::LiveAnswer::new(
         reqwest::Client::new(),
@@ -591,16 +657,20 @@ async fn answer(request: AnswerRequest) -> Result<()> {
         &channel,
     );
     let mut aborted = false;
+    let mut silent = false;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => { chat.abort().await?; aborted = true; break },
-            event = tokio::time::timeout(Duration::from_secs(60), rx.recv()) => match event.context("agent response timed out")? { Some(ChatEvent::Delta { role: ChatRole::Assistant, text }) => { reply.push_str(&text); live.push(&reply).await? }, Some(ChatEvent::TurnFinished { .. } | ChatEvent::SessionClosed { .. }) | None => break, Some(_) => {} },
+            event = tokio::time::timeout(Duration::from_secs(60), rx.recv()) => match event.context("agent response timed out")? { Some(ChatEvent::Delta { role: ChatRole::Assistant, text }) => { reply.push_str(&text); live.push(&reply).await? }, Some(ChatEvent::Silent { .. }) => silent = true, Some(ChatEvent::TurnFinished { .. } | ChatEvent::SessionClosed { .. }) | None => break, Some(_) => {} },
             _ = live.wait_for_flush() => live.flush_if_due(&reply).await?
         }
     }
     chat.close().await?;
     if aborted {
-        return Ok(());
+        return Ok(false);
+    }
+    if silent {
+        return Ok(true);
     }
     if reply.trim().is_empty() {
         reply = "(no response)".into()
@@ -609,7 +679,7 @@ async fn answer(request: AnswerRequest) -> Result<()> {
     if clear_history_after_reply {
         history.clear(&history_key);
     }
-    Ok(())
+    Ok(false)
 }
 
 async fn next_json<S>(read: &mut S) -> Result<Value>
@@ -777,6 +847,7 @@ mod tests {
                     threads: &Arc::new(Mutex::new(Threads::default())),
                     history: &Arc::new(History::default()),
                     next_turn: &AtomicU64::new(0),
+                    guards: &Guards::default(),
                 },
                 socket,
             )
@@ -789,5 +860,184 @@ mod tests {
             .unwrap()
             .is_ok());
         assert!(server.await.unwrap());
+    }
+
+    /// Backend whose sessions finish every turn silently (like NO_REPLY).
+    struct SilentBackend {
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    struct SilentSession(mpsc::Sender<ChatEvent>);
+    impl ChatBackend for SilentBackend {
+        fn open<'a>(
+            &'a self,
+            _: dar_extension_sdk::chat::ChatSessionParams,
+            tx: mpsc::Sender<ChatEvent>,
+        ) -> dar_extension_sdk::chat::BoxFuture<
+            'a,
+            Result<Box<dyn dar_extension_sdk::chat::ChatSession>>,
+        > {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(Box::new(SilentSession(tx)) as Box<_>) })
+        }
+    }
+    impl dar_extension_sdk::chat::ChatSession for SilentSession {
+        fn send_turn(&mut self, _: String) -> dar_extension_sdk::chat::BoxFuture<'_, Result<()>> {
+            let tx = self.0.clone();
+            Box::pin(async move {
+                tx.send(ChatEvent::Silent {
+                    reason: None,
+                    text: "NO_REPLY".into(),
+                })
+                .await?;
+                tx.send(ChatEvent::TurnFinished {
+                    ok: true,
+                    error: None,
+                })
+                .await?;
+                Ok(())
+            })
+        }
+        fn abort(&mut self) -> dar_extension_sdk::chat::BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn close(self: Box<Self>) -> dar_extension_sdk::chat::BoxFuture<'static, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn silent_ctx(
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (StartCtx, tokio::sync::watch::Sender<bool>) {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let root = std::env::temp_dir().join(format!(
+            "discord-silent-test-{}-{}",
+            std::process::id(),
+            opens.as_ref() as *const _ as usize
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = host_api::HostPaths::new(&root).unwrap();
+        let mut register = host_api::RegisterCtx {
+            bus: host_api::EventBus::new(),
+            http: host_api::HttpRegistry::disabled(),
+            foreground: host_api::ForegroundRegistry::default(),
+            services: host_api::ServiceRegistry::default(),
+            paths: paths.clone(),
+            config: host_api::ConfigStore::default(),
+            shutdown: host_api::ShutdownToken::new(shutdown_rx.clone()),
+        };
+        register
+            .services
+            .service::<dyn ChatBackend>("silent", Arc::new(SilentBackend { opens }))
+            .unwrap();
+        let config = register.config.clone();
+        let host = register.into_start_services().unwrap();
+        let ctx = StartCtx {
+            shutdown: host_api::ShutdownToken::new(shutdown_rx),
+            paths,
+            config,
+            host,
+        };
+        (ctx, shutdown_tx)
+    }
+
+    fn request(ctx: &StartCtx, guards: &Guards, sender: Option<AgentSender>) -> AnswerRequest {
+        AnswerRequest {
+            ctx: ctx.clone(),
+            configured: Some("silent".into()),
+            data: ctx.paths.root().to_path_buf(),
+            root: ctx.paths.root().to_path_buf(),
+            token: "token".into(),
+            channel: "c1".into(),
+            session_key: session::SessionKey::guild_channel("g1", "c1"),
+            history_key: "h".into(),
+            history_message_id: "m".into(),
+            history: Arc::new(History::default()),
+            history_limit: 20,
+            clear_history_after_reply: false,
+            text: "hi".into(),
+            attachments: vec![],
+            cancel: CancellationToken::new(),
+            sender,
+            guards: Arc::clone(guards),
+        }
+    }
+
+    #[tokio::test]
+    async fn silent_turn_posts_nothing() {
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (ctx, _shutdown) = silent_ctx(Arc::clone(&opens));
+        // No Discord server exists here: any post would fail the turn.
+        assert!(answer(request(&ctx, &Guards::default(), None))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn loop_guard_spans_turns_and_humans_reset_it() {
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (ctx, _shutdown) = silent_ctx(Arc::clone(&opens));
+        let guards = Guards::default();
+        let bot = || {
+            Some(AgentSender {
+                agent_id: "discord:b2".into(),
+                hops: None,
+            })
+        };
+        let limit = dar_extension_sdk::chat::AgentLoopConfig::default().max_agent_turns as usize;
+        for _ in 0..limit {
+            answer(request(&ctx, &guards, bot())).await.unwrap();
+        }
+        assert_eq!(opens.load(Ordering::SeqCst), limit);
+        assert!(answer(request(&ctx, &guards, bot())).await.unwrap());
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            limit,
+            "blocked turn opens no session"
+        );
+        answer(request(&ctx, &guards, None)).await.unwrap();
+        answer(request(&ctx, &guards, bot())).await.unwrap();
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            limit + 2,
+            "human turn reset the count"
+        );
+    }
+
+    #[test]
+    fn sender_only_for_bot_authors() {
+        let bot = json!({"author": {"id": "b2", "bot": true}});
+        assert_eq!(
+            turn_sender(&bot),
+            Some(AgentSender {
+                agent_id: "discord:b2".into(),
+                hops: None
+            })
+        );
+        assert_eq!(turn_sender(&json!({"author": {"id": "u1"}})), None);
+    }
+
+    #[test]
+    fn history_keeps_other_bots_but_not_self_or_webhooks() {
+        let entry = |v: Value| history_entry(&v, Some("b1")).map(|(_, text)| text);
+        assert_eq!(
+            entry(
+                json!({"id": "1", "content": "hi", "author": {"id": "b2", "bot": true, "username": "Pal"}})
+            ),
+            Some("[bot Pal] hi".into())
+        );
+        assert_eq!(
+            entry(json!({"id": "2", "content": "hi", "author": {"id": "u1"}})),
+            Some("hi".into())
+        );
+        assert_eq!(
+            entry(json!({"id": "3", "content": "hi", "author": {"id": "b1", "bot": true}})),
+            None
+        );
+        assert_eq!(
+            entry(
+                json!({"id": "4", "content": "hi", "webhook_id": "w", "author": {"id": "w", "bot": true}})
+            ),
+            None
+        );
     }
 }

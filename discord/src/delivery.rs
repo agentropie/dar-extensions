@@ -35,6 +35,11 @@ impl Delivery {
         self.reaction(&self.ack, "PUT").await
     }
 
+    /// Best-effort removal of the ack reaction.
+    pub async fn unacknowledge(&self) {
+        let _ = self.reaction(&self.ack, "DELETE").await;
+    }
+
     /// Best-effort typing indicator; Discord shows it for ~10s.
     pub async fn typing(&self) {
         let _ = self

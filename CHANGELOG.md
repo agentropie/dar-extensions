@@ -4,6 +4,7 @@
 
 ### Added
 
+- **discord:** `allow_bots` (`true` or a list of bot user IDs) lets other bots trigger the agent when they @mention it; bot turns pass a `sender` to dar's agent loop guard, kept per conversation across turns. Other bots' messages are always recorded in channel history; the bot's own messages and webhooks never are.
 - **all:** silent turns (`NO_REPLY` or loop-guard blocks, dar 0.6) post nothing, with no `(no response)` fallback; Discord removes its ack reaction.
 
 ### Changed

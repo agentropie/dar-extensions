@@ -12,6 +12,7 @@ pub struct DiscordConfig {
     pub history_limit: usize,
     pub clear_history_after_reply: bool,
     pub fetch_history: bool,
+    pub allow_bots: AllowBots,
     pub sessions: SessionsConfig,
     pub guilds: HashMap<String, GuildConfig>,
 }
@@ -25,8 +26,33 @@ impl Default for DiscordConfig {
             history_limit: 20,
             clear_history_after_reply: false,
             fetch_history: true,
+            allow_bots: AllowBots::default(),
             sessions: SessionsConfig::default(),
             guilds: HashMap::new(),
+        }
+    }
+}
+
+/// Which other bots may trigger the agent: `false` (default), `true` (any),
+/// or a list of Discord bot user IDs.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum AllowBots {
+    All(bool),
+    Only(Vec<String>),
+}
+
+impl Default for AllowBots {
+    fn default() -> Self {
+        Self::All(false)
+    }
+}
+
+impl AllowBots {
+    pub fn allows(&self, bot_id: &str) -> bool {
+        match self {
+            Self::All(all) => *all,
+            Self::Only(ids) => ids.iter().any(|id| id == bot_id),
         }
     }
 }
@@ -94,6 +120,18 @@ pub fn token(config: &DiscordConfig) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parses_allow_bots_forms() {
+        let parse = |v| {
+            serde_json::from_value::<DiscordConfig>(v)
+                .unwrap()
+                .allow_bots
+        };
+        assert_eq!(DiscordConfig::default().allow_bots, AllowBots::All(false));
+        assert!(parse(serde_json::json!({"allow_bots": true})).allows("x"));
+        let only = parse(serde_json::json!({"allow_bots": ["b2"]}));
+        assert!(only.allows("b2") && !only.allows("b3"));
+    }
     #[test]
     fn missing_token_is_clear() {
         assert!(token(&DiscordConfig::default())
