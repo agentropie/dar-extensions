@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-09-30
+
 ### Added
 
 - **discord:** `discord_list_users` lists guild members with IDs, including bots (`bot: true`); needs the Server Members Intent.
