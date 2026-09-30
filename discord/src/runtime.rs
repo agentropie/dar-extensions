@@ -665,6 +665,8 @@ async fn answer(request: AnswerRequest) -> Result<bool> {
         );
         return Ok(true);
     }
+    // Bot-triggered replies never stream (see LiveAnswer::without_streaming).
+    let bot_triggered = sender.is_some();
     let mut chat = tokio::select! { _ = cancel.cancelled() => return Ok(false), result = backend.open(params, tx) => result? };
     tokio::select! { _ = cancel.cancelled() => { chat.abort().await?; chat.close().await?; return Ok(false) }, result = tokio::time::timeout(Duration::from_secs(60), chat.send_turn_from(text, sender)) => result.context("agent queue timed out")?? };
     let mut reply = String::new();
@@ -674,6 +676,9 @@ async fn answer(request: AnswerRequest) -> Result<bool> {
         &token,
         &channel,
     );
+    if bot_triggered {
+        live = live.without_streaming();
+    }
     let mut aborted = false;
     let mut silent = false;
     loop {

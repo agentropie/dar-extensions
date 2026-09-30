@@ -47,6 +47,7 @@ Recent human and other-bot messages are kept in memory per channel or thread (an
 - Other bots' messages are always recorded in channel history (labelled `Name (<@id>, bot)`), even when `allow_bots` is off, so a later human mention has that context.
 - Bot-triggered turns carry `sender = discord:<bot user id>` into dar's agent loop guard (`agent_loop:` in `agent.yaml`). The guard counts consecutive bot turns per channel/thread across restarts of the chat session; a human message resets it. Blocked turns post nothing.
 - Reading other bots' message text requires the **Message Content Intent**.
+- Replies to bot-triggered turns are never streamed: the full reply is posted once (split only past Discord's length limit), because bots act on new messages only and would miss edits. Human-triggered replies still stream.
 
 ## Silent turns
 

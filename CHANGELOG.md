@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **discord:** replies to other bots are posted once, complete, instead of streamed via edits; receiving bots act only on the first version and missed later text such as the `<@id>` mention.
+
 ## [0.6.2] - 2026-09-30
 
 ### Added

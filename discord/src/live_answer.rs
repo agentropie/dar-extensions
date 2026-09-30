@@ -18,6 +18,7 @@ pub struct LiveAnswer {
     messages: Vec<String>,
     last: Option<Instant>,
     dirty: bool,
+    stream: bool,
 }
 impl LiveAnswer {
     pub fn new(
@@ -34,12 +35,20 @@ impl LiveAnswer {
             messages: vec![],
             last: None,
             dirty: false,
+            stream: true,
         }
     }
+    /// Post only complete messages on `finish`, never edits. Other bots act
+    /// on MESSAGE_CREATE only, so a streamed reply reaches them half-written.
+    pub fn without_streaming(mut self) -> Self {
+        self.stream = false;
+        self
+    }
     pub async fn push(&mut self, answer: &str) -> Result<()> {
-        if self
-            .last
-            .is_some_and(|last| last.elapsed() < UPDATE_INTERVAL)
+        if !self.stream
+            || self
+                .last
+                .is_some_and(|last| last.elapsed() < UPDATE_INTERVAL)
         {
             self.dirty = true;
             Ok(())
@@ -54,7 +63,7 @@ impl LiveAnswer {
         Ok(())
     }
     pub async fn wait_for_flush(&self) {
-        let Some(last) = self.dirty.then_some(self.last).flatten() else {
+        let Some(last) = (self.dirty && self.stream).then_some(self.last).flatten() else {
             future::pending::<()>().await;
             return;
         };
@@ -192,6 +201,52 @@ mod tests {
         answer.push("one two").await.unwrap();
         answer.wait_for_flush().await;
         answer.flush_if_due("one two").await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unstreamed_answer_posts_once_complete() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut req = request(&mut s).await;
+            assert!(req.starts_with("POST /channels/c/messages "));
+            while !req.contains("one two three") {
+                let mut x = [0; 1024];
+                let n = s.read(&mut x).await.unwrap();
+                req.push_str(std::str::from_utf8(&x[..n]).unwrap());
+            }
+            let body = r#"{"id":"1"}"#;
+            s.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            // No further request (edit or typing) may follow.
+            let next = tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
+            assert!(next.is_err(), "unexpected extra request");
+        });
+        let mut answer = LiveAnswer::new(
+            reqwest::Client::new(),
+            format!("http://{address}"),
+            "t",
+            "c",
+        )
+        .without_streaming();
+        for text in ["one", "one two", "one two three"] {
+            answer.push(text).await.unwrap();
+        }
+        tokio::select! {
+            _ = answer.wait_for_flush() => panic!("unstreamed answer must not flush early"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        answer.finish("one two three").await.unwrap();
         server.await.unwrap();
     }
 }
