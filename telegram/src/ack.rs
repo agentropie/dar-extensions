@@ -51,8 +51,16 @@ impl AckGuard {
     pub async fn start(api: Arc<dyn BotApi>, chat_id: i64, message_id: i64) -> Self {
         // Construct before the first await so cancellation during setup still
         // clears a reaction that Telegram may already have accepted.
-        let mut guard = Self { api, chat_id, message_id, refresh: None, cleared: false };
-        guard.api.set_reaction(chat_id, message_id, Some(WORKING_EMOJI))
+        let mut guard = Self {
+            api,
+            chat_id,
+            message_id,
+            refresh: None,
+            cleared: false,
+        };
+        guard
+            .api
+            .set_reaction(chat_id, message_id, Some(WORKING_EMOJI))
             .await;
         guard.api.send_chat_action(chat_id, TYPING_ACTION).await;
 
@@ -297,7 +305,9 @@ mod tests {
     }
     #[tokio::test]
     async fn cancellation_during_initial_typing_clears_added_reaction() {
-        struct HangingApi { tx: mpsc::UnboundedSender<bool> }
+        struct HangingApi {
+            tx: mpsc::UnboundedSender<bool>,
+        }
         #[async_trait]
         impl BotApi for HangingApi {
             async fn set_reaction(&self, _: i64, _: i64, emoji: Option<&str>) {
@@ -308,13 +318,16 @@ mod tests {
             }
         }
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(async move {
-            AckGuard::start(Arc::new(HangingApi { tx }), 1, 2).await
-        });
+        let task =
+            tokio::spawn(async move { AckGuard::start(Arc::new(HangingApi { tx }), 1, 2).await });
         assert_eq!(rx.recv().await, Some(true));
         task.abort();
         let _ = task.await;
-        assert_eq!(tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap(), Some(false));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap(),
+            Some(false)
+        );
     }
-
 }
