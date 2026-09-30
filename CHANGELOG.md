@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-30
+
+Tracks dar v0.6.0: extension crates now require `dar-extension-sdk = "0.6"`.
+
 ### Added
 
 - **discord:** `allow_bots` (`true` or a list of bot user IDs) lets other bots trigger the agent when they @mention it; bot turns pass a `sender` to dar's agent loop guard, kept per conversation across turns. Other bots' messages are always recorded in channel history; the bot's own messages and webhooks never are.
