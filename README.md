@@ -1,6 +1,6 @@
 # dar-extensions
 
-External extensions for dar agents: [irc](irc), [slack](slack), [telegram](telegram). Each crate is standalone — its own `Cargo.toml` and `[workspace]` — and depends only on `dar-extension-sdk`.
+External extensions for dar agents: [irc](irc), [slack](slack), [telegram](telegram), [whatsapp](whatsapp). Each crate is standalone — its own `Cargo.toml` and `[workspace]` — and depends only on `dar-extension-sdk`.
 
 ## Using an extension with an agent
 
@@ -34,6 +34,7 @@ Flip side: if an agent runs only `--workflow` processes (no default-workflow pro
 | [irc](irc) | Makes an agent reachable over IRC — shared team channels holding both humans and multiple agents, and private DMs. |
 | [slack](slack) | Slack Socket Mode extension for one self-contained agent. |
 | [telegram](telegram) | Makes an agent reachable for chat over a Telegram bot. |
+| [whatsapp](whatsapp) | Makes an agent reachable through WhatsApp Business Cloud API webhooks. |
 # Scheduler delivery sinks
 
 The IRC, Slack, Telegram, and Discord extensions register runtime delivery
