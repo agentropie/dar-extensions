@@ -79,8 +79,13 @@ struct VerifyQuery {
     #[serde(rename = "hub.challenge")]
     challenge: Option<String>,
 }
+fn log(message: &str) {
+    dar_extension_sdk::log::event("-", "whatsapp", message);
+}
+
 async fn verify(State(state): State<WebhookState>, Query(query): Query<VerifyQuery>) -> Response {
     let Some(expected) = state.verify_token.filter(|t| !t.is_empty()) else {
+        log("whatsapp webhook verify: 503 (verify_token unset)");
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     if query.mode.as_deref() != Some("subscribe")
@@ -89,8 +94,10 @@ async fn verify(State(state): State<WebhookState>, Query(query): Query<VerifyQue
             expected.as_bytes(),
         )
     {
+        log("whatsapp webhook verify: 403 (bad mode or token)");
         return StatusCode::FORBIDDEN.into_response();
     }
+    log("whatsapp webhook verify: 200");
     (
         StatusCode::OK,
         [("content-type", "text/plain")],
@@ -110,30 +117,46 @@ pub async fn handle_inbound(state: WebhookState, headers: HeaderMap, body: Body)
 
 async fn inbound_impl(state: WebhookState, headers: HeaderMap, body: Body) -> Response {
     let Some(secret) = state.app_secret.filter(|s| !s.is_empty()) else {
+        log("whatsapp webhook: 503 (app_secret unset)");
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let raw = match to_bytes(body, MAX_BODY).await {
         Ok(raw) => raw,
-        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(_) => {
+            log("whatsapp webhook: 413 (body too large)");
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
     };
     let signature = headers
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
     if !verify_signature(&secret, &raw, signature) {
+        log("whatsapp webhook: 401 (bad signature)");
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let payload: Value = match serde_json::from_slice::<Value>(&raw) {
         Ok(v) if v.is_object() => v,
-        _ => return StatusCode::BAD_REQUEST.into_response(),
+        _ => {
+            log("whatsapp webhook: 400 (malformed JSON)");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
     };
-    for message in parse_payload(&payload, &state.phone_number_id) {
+    let messages = parse_payload(&payload, &state.phone_number_id);
+    if messages.is_empty() {
+        log("whatsapp webhook: 200 (no text DMs; ignored)");
+    }
+    for message in messages {
         let fresh = state
             .dedup
             .lock()
             .expect("dedup poisoned")
             .insert(&message.wamid);
         if !fresh {
+            log(&format!(
+                "whatsapp webhook: duplicate from {}; ignored",
+                message.wa_id
+            ));
             continue;
         }
         if state.inbound.try_send(message.clone()).is_err() {
@@ -142,8 +165,16 @@ async fn inbound_impl(state: WebhookState, headers: HeaderMap, body: Body) -> Re
                 .lock()
                 .expect("dedup poisoned")
                 .remove(&message.wamid);
+            log(&format!(
+                "whatsapp webhook: 503 (queue full) from {}",
+                message.wa_id
+            ));
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
+        log(&format!(
+            "whatsapp webhook: message from {} queued",
+            message.wa_id
+        ));
     }
     StatusCode::OK.into_response()
 }
