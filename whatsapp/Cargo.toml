@@ -12,7 +12,7 @@ requires_stock = ["chat-pi"]
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
-dar-extension-sdk = "0.4"
+dar-extension-sdk = "0.6"
 hex = "0.4"
 hmac = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -23,7 +23,7 @@ tokio = { version = "1.43", features = ["macros", "rt", "sync", "time", "net"] }
 tracing = "0.1"
 
 [dev-dependencies]
-dar-host-api = "0.4"
+dar-host-api = "0.6"
 tempfile = "3"
 
 [workspace]
