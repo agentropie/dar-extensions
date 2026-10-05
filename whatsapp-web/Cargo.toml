@@ -1,0 +1,25 @@
+[package]
+name = "whatsapp-web"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+
+[package.metadata.dar]
+factory = "whatsapp_web::extension"
+requires_stock = ["chat-pi"]
+
+[dependencies]
+anyhow = "1"
+dar-extension-sdk = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.43", features = ["macros", "rt", "sync", "time"] }
+tracing = "0.1"
+whatsapp-rust = { git = "https://github.com/jlucaso1/whatsapp-rust", rev = "93e5c7f75cdad98472efd218d9bff8a464cf47a7", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "tokio-native", "ureq-client"] }
+
+[dev-dependencies]
+dar-host-api = "0.6"
+tempfile = "3"
+tokio = { version = "1.43", features = ["test-util"] }
+
+[workspace]
