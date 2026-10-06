@@ -13,6 +13,12 @@ extensions:
     allowed_users: ["33698765432"] # sender phones (DMs and groups); omitted/empty allows all
     allowed_groups: ["120363000000000000"] # group id (JID user part); omitted/empty allows all groups
     # backend: pi
+    # sessions:
+    #   idle_minutes: 1440 # optional; omitted or 0 = sessions never expire
+    # messages: # optional replies to commands (defaults shown)
+    #   stopped: "Stopped."
+    #   new_session: "New session started."
+    #   compacted: "Compacted."
 ```
 
 On first start, the agent creates `<agent>/.whatsapp-web/session.db` and logs the eight-character pairing code to the agent log and TUI Logs tab. Enter it in WhatsApp Business → Linked devices → Link with phone number. The first QR is also rendered once in the Logs tab as fallback (later rotations go only to `logs/agent.log`). These pairing values are sensitive; keep agent logs private. Subsequent starts reuse the SQLite session and skip the pairing request; the Logs tab shows `Connected as +<phone>` on each (re)connect. If WhatsApp unlinks the device, a `Logged out by WhatsApp` line appears: delete `.whatsapp-web/session.db` and restart to pair again. The extension writes a `.gitignore` inside `.whatsapp-web/` to exclude its contents. Deleting the agent or its session store removes this linked-device identity. `phone_number` can be omitted for QR-only pairing. Legacy `bridge_port` and `proxy_url` fields have no effect with the in-process library.
@@ -24,6 +30,22 @@ Each turn's text starts with a metadata header, e.g. `[WhatsApp group "Family" (
 Media (image, video, audio/voice, document, sticker) is downloaded to `<session dir>/uploads/<message-id>-<name>` (max 25 MiB, 60 s) and described by an appended `Attachment metadata (untrusted data…)` JSON line; oversized or failed downloads are noted as skipped. A media message without text is a valid DM turn, and a group turn only if mentioned.
 
 Reactions never start a turn. Reactions and unaddressed group messages from allowed users and groups are kept (max 20 per session, oldest dropped) and prepended to that session's next turn under `(since your last reply)`.
+
+## Sessions, commands and compaction
+
+Each chat (`pn-<phone>`, `lid-<id>`, `group-<id>`) has generations under `<agent>/.whatsapp-web/<chat>/<generation>/` with a `current` pointer; uploads live in the current generation. Older chat directories without generations keep working and simply start at generation 1. When a session opens, the newest archived backend session in the current generation is resumed, so a dar restart continues the conversation (backends that cannot resume start fresh). A failed turn keeps the session; it is dropped and reopened (with resume) only if the backend reports the session closed, the turn times out or `send_turn` fails.
+
+`sessions.idle_minutes` is optional and has no default. When set, a message arriving after that many idle minutes (last activity is stored on disk, so it survives restarts) starts a new generation and logs `Session <chat> expired after <n> min idle; starting fresh`; the old transcript stays on disk.
+
+Chats are processed concurrently, one worker per chat, in message order. Commands must be the whole message, sent by an allowed user; in groups the agent must be @-mentioned and the rest of the text (mention removed) must be exactly the command. They never start a normal agent turn:
+
+- `/new` closes the session, starts a new generation, clears the chat's pending context and replies `messages.new_session`.
+- `/stop` aborts the chat's in-flight turn (partial output is discarded) and replies `messages.stopped`.
+- `/compact` sends `/compact` to the backend, does not relay its text, and replies `messages.compacted` on success (failures are only logged as `Compaction failed for <chat>: <error>`).
+
+Auto-compaction: after a successful turn whose latest backend context report is at least 80% of the context window, `/compact` is sent silently (log lines `Auto-compacting <chat> (<pct>% of context)` and `Compacted <chat>`). It does not fire again until a later report is below 80%. If the backend reports usage without a window, the Logs tab says once `Auto-compaction unavailable: backend did not report a context window`.
+
+Backend caveats: `chat-pi` and the built-in backend support `/compact`, `/stop` (real abort) and auto-compaction (the built-in backend needs `runner.context_window` set so it can report context usage). On `chat-opencode` and `chat-codex`, `/compact` is just sent to the model as text, no context usage is reported (so auto-compaction never fires), while `/stop` still aborts. Resume works where the backend archives its session (`chat-pi`, `chat-opencode`, built-in transcript resume); `chat-codex` starts fresh after a restart.
 
 ## Human setup runbook
 

@@ -14,7 +14,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinSet};
 use whatsapp_rust::{
     download::Downloadable,
     pair_code::PairCodeOptions,
@@ -28,6 +28,31 @@ struct Config {
     allowed_users: Vec<String>,
     allowed_groups: Vec<String>,
     backend: Option<String>,
+    sessions: Sessions,
+    messages: Messages,
+}
+/// Chat session lifetime. No `idle_minutes` (or 0) means sessions never expire.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct Sessions {
+    idle_minutes: Option<u64>,
+}
+/// Replies to the `/stop`, `/new` and `/compact` commands.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+struct Messages {
+    stopped: String,
+    new_session: String,
+    compacted: String,
+}
+impl Default for Messages {
+    fn default() -> Self {
+        Self {
+            stopped: "Stopped.".into(),
+            new_session: "New session started.".into(),
+            compacted: "Compacted.".into(),
+        }
+    }
 }
 fn digits(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|c| c.is_ascii_digit())
@@ -201,6 +226,13 @@ struct Header {
     reply: Option<Reply>,
     forwarded: bool,
 }
+/// Chat command, recognised only when the whole message is the command.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Command {
+    New,
+    Stop,
+    Compact,
+}
 #[derive(Clone)]
 struct Inbound {
     session_key: String,
@@ -208,6 +240,7 @@ struct Inbound {
     group: Option<String>,
     message_id: String,
     kind: Kind,
+    command: Option<Command>,
     header: Header,
     text: String,
 }
@@ -250,6 +283,36 @@ fn route(is_group: bool, mentioned: bool, has_content: bool) -> Option<Kind> {
         (false, _) => None,
         (true, true) => Some(Kind::Turn),
         (true, false) => Some(Kind::Unaddressed),
+    }
+}
+/// A group command must @-mention the bot; the mention tokens are removed before
+/// matching. DMs use the bare command.
+fn parse_command(text: &str, is_group: bool, bot_users: &[String]) -> Option<Command> {
+    let remaining = if is_group {
+        let tokens: Vec<_> = text.split_whitespace().collect();
+        let rest: Vec<_> = tokens
+            .iter()
+            .filter(|token| {
+                !bot_users
+                    .iter()
+                    .any(|bot| token.strip_prefix('@') == Some(bot.as_str()))
+            })
+            .collect();
+        if rest.len() == tokens.len() {
+            return None;
+        }
+        rest.iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        text.trim().to_owned()
+    };
+    match remaining.as_str() {
+        "/new" => Some(Command::New),
+        "/stop" => Some(Command::Stop),
+        "/compact" => Some(Command::Compact),
+        _ => None,
     }
 }
 /// Single-line text of at most `max` characters.
@@ -619,6 +682,9 @@ async fn from_message(message: &MessageContext) -> Option<Inbound> {
         Some((emoji, target)) => Kind::Reaction { emoji, target },
         None => route(source.is_group, mentioned, !text.is_empty() || has_media)?,
     };
+    let command = (kind == Kind::Turn && !has_media)
+        .then(|| parse_command(&text, source.is_group, &bot))
+        .flatten();
     let phone = sender_phone(message).await;
     let group = source
         .is_group
@@ -654,18 +720,23 @@ async fn from_message(message: &MessageContext) -> Option<Inbound> {
         group,
         message_id: message.info.id.to_string(),
         kind,
+        command,
         header,
         text,
     })
 }
 trait Transport: Clone + Send + Sync + 'static {
-    async fn read(&self) -> Result<()>;
-    async fn typing(&self, active: bool) -> Result<()>;
+    fn read(&self) -> impl std::future::Future<Output = Result<()>> + Send;
+    fn typing(&self, active: bool) -> impl std::future::Future<Output = Result<()>> + Send;
     /// Sends a reply quoting the inbound message and returns the sent message id.
-    async fn send(&self, text: String) -> Result<String>;
-    async fn group_subject(&self) -> Option<String>;
+    fn send(&self, text: String) -> impl std::future::Future<Output = Result<String>> + Send;
+    fn group_subject(&self) -> impl std::future::Future<Output = Option<String>> + Send;
     /// Downloads inbound media into `uploads`; failures become skipped entries.
-    async fn attachments(&self, uploads: &Path, message_id: &str) -> Vec<Attachment>;
+    fn attachments(
+        &self,
+        uploads: &Path,
+        message_id: &str,
+    ) -> impl std::future::Future<Output = Vec<Attachment>> + Send;
 }
 impl Transport for MessageContext {
     async fn read(&self) -> Result<()> {
@@ -707,9 +778,406 @@ impl Transport for MessageContext {
         saved
     }
 }
+const ACTIVITY_FILE: &str = "last_activity";
+const CURRENT_FILE: &str = "current";
+const COMPACT_PERCENT: u64 = 80;
+static NO_WINDOW_LOGGED: AtomicBool = AtomicBool::new(false);
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |value| value.as_secs())
+}
+fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temporary, text)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+fn read_number(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+/// Current generation of a chat; a chat without a `current` pointer is generation 1.
+fn current_generation(chat_dir: &Path) -> u64 {
+    read_number(&chat_dir.join(CURRENT_FILE))
+        .filter(|generation| *generation > 0)
+        .unwrap_or(1)
+}
+fn generation_dir(chat_dir: &Path) -> Result<std::path::PathBuf> {
+    let dir = chat_dir.join(current_generation(chat_dir).to_string());
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+/// Starts a new generation directory; the previous one stays on disk.
+fn rotate_generation(chat_dir: &Path) -> Result<()> {
+    let mut next = current_generation(chat_dir) + 1;
+    while chat_dir.join(next.to_string()).exists() {
+        next += 1;
+    }
+    std::fs::create_dir_all(chat_dir.join(next.to_string()))?;
+    write_atomic(&chat_dir.join(CURRENT_FILE), &next.to_string())
+}
+fn touch_activity(chat_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(chat_dir)?;
+    write_atomic(&chat_dir.join(ACTIVITY_FILE), &now_secs().to_string())
+}
+/// Idle minutes elapsed since the last recorded activity, when it reaches the TTL.
+fn idle_expired(chat_dir: &Path, idle_minutes: Option<u64>) -> Option<u64> {
+    let minutes = idle_minutes.filter(|minutes| *minutes > 0)?;
+    let last = read_number(&chat_dir.join(ACTIVITY_FILE))?;
+    (now_secs().saturating_sub(last) >= minutes.saturating_mul(60)).then_some(minutes)
+}
+fn over_compact_threshold(tokens_used: u64, context_window: u64) -> bool {
+    context_window > 0
+        && u128::from(tokens_used) * 100 >= u128::from(COMPACT_PERCENT) * u128::from(context_window)
+}
 struct Connection {
     session: Box<dyn dar_extension_sdk::chat::ChatSession>,
     events: mpsc::Receiver<ChatEvent>,
+    usage: Option<(u64, u64)>,
+    /// Auto-compaction may fire; cleared when it fires, set by a later usage below the threshold.
+    armed: bool,
+    /// The backend session is unusable and must be dropped and reopened.
+    closed: bool,
+}
+impl Connection {
+    fn record_usage(&mut self, tokens_used: u64, context_window: Option<u64>) {
+        let Some(window) = context_window else {
+            if !NO_WINDOW_LOGGED.swap(true, Ordering::Relaxed) {
+                dar_extension_sdk::log::event(
+                    "-",
+                    "whatsapp-web",
+                    "Auto-compaction unavailable: backend did not report a context window",
+                );
+            }
+            // An earlier windowed report is stale once a newer one lacks the window.
+            self.usage = None;
+            return;
+        };
+        self.usage = Some((tokens_used, window));
+        if !over_compact_threshold(tokens_used, window) {
+            self.armed = true;
+        }
+    }
+    /// Percent of the context used, when auto-compaction should fire now.
+    fn compact_percent(&self) -> Option<u64> {
+        let (tokens_used, window) = self.usage?;
+        (self.armed && over_compact_threshold(tokens_used, window))
+            .then(|| tokens_used.saturating_mul(100) / window)
+    }
+}
+struct TurnOutcome {
+    result: Result<String>,
+    stopped: bool,
+}
+/// State of one chat, owned by that chat's worker task.
+struct Chat<T> {
+    key: String,
+    connection: Option<Connection>,
+    notes: Notes,
+    rx: mpsc::UnboundedReceiver<(Inbound, T)>,
+    /// Messages that arrived during a turn and are processed after it, in order.
+    deferred: VecDeque<(Inbound, T)>,
+}
+/// Sends a command or turn reply; failures are logged, never fatal.
+async fn say<T: Transport>(transport: &T, text: &str) -> Option<String> {
+    match tokio::time::timeout(
+        Duration::from_secs(20),
+        transport.send(adapt_markdown(text)),
+    )
+    .await
+    {
+        Ok(Ok(id)) => Some(id),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "whatsapp-web reply failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("whatsapp-web reply timed out");
+            None
+        }
+    }
+}
+impl<T: Transport> Chat<T> {
+    fn new(key: String, rx: mpsc::UnboundedReceiver<(Inbound, T)>) -> Self {
+        Self {
+            key,
+            connection: None,
+            notes: Notes::default(),
+            rx,
+            deferred: VecDeque::new(),
+        }
+    }
+    async fn close_connection(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), connection.session.close()).await;
+        }
+    }
+    /// Opens the backend session if needed, resuming the newest one in `dir`.
+    async fn ensure_open(&mut self, ctx: &StartCtx, cfg: &Config, dir: &Path) -> Result<()> {
+        if self.connection.is_some() {
+            return Ok(());
+        }
+        let backend_id =
+            dar_extension_sdk::chat::resolve_agent_backend(ctx, cfg.backend.as_deref());
+        let backend = ctx
+            .host
+            .services
+            .get::<dyn ChatBackend>(&backend_id)
+            .with_context(|| format!("chat backend '{backend_id}' not registered"))?;
+        let (tx, events) = mpsc::channel(256);
+        let params = dar_extension_sdk::chat::agent_session_params(ctx, dir)
+            .resume_session_id(dar_extension_sdk::chat::archive::newest_session_id(
+                dir,
+                &backend_id,
+            ))
+            .build();
+        let session = tokio::time::timeout(Duration::from_secs(30), backend.open(params, tx))
+            .await
+            .context("chat backend open timed out")??;
+        self.connection = Some(Connection {
+            session,
+            events,
+            usage: None,
+            armed: true,
+            closed: false,
+        });
+        Ok(())
+    }
+    /// Applies the idle TTL, records activity and returns the current generation dir.
+    async fn begin(&mut self, root: &Path, cfg: &Config) -> Result<std::path::PathBuf> {
+        let chat_dir = root.join(&self.key);
+        std::fs::create_dir_all(&chat_dir)?;
+        if let Some(minutes) = idle_expired(&chat_dir, cfg.sessions.idle_minutes) {
+            self.close_connection().await;
+            rotate_generation(&chat_dir)?;
+            dar_extension_sdk::log::event(
+                "-",
+                "whatsapp-web",
+                &format!(
+                    "Session {} expired after {minutes} min idle; starting fresh",
+                    self.key
+                ),
+            );
+        }
+        touch_activity(&chat_dir)?;
+        generation_dir(&chat_dir)
+    }
+    /// Runs one backend turn. A `/stop` arriving meanwhile aborts it; any other
+    /// message waits in `deferred`.
+    async fn run_turn(
+        &mut self,
+        cfg: &Config,
+        prompt: String,
+        transport: &T,
+        typing: bool,
+    ) -> TurnOutcome {
+        let Some(connection) = self.connection.as_mut() else {
+            return TurnOutcome {
+                result: Err(anyhow::anyhow!("session missing")),
+                stopped: false,
+            };
+        };
+        let rx = &mut self.rx;
+        let deferred = &mut self.deferred;
+        let mut rx_open = true;
+        let mut stopped = false;
+        if typing {
+            let _ = tokio::time::timeout(Duration::from_secs(5), transport.typing(true)).await;
+        }
+        let mut tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
+        let result = tokio::time::timeout(Duration::from_secs(300), async {
+            if let Err(error) = connection.session.send_turn(prompt).await {
+                connection.closed = true;
+                return Err(error);
+            }
+            let mut reply = String::new();
+            let mut silent = false;
+            loop {
+                tokio::select! {
+                    event = connection.events.recv() => {
+                        let Some(event) = event else {
+                            connection.closed = true;
+                            bail!("backend event stream closed")
+                        };
+                        match event {
+                            ChatEvent::Delta { role: ChatRole::Assistant, text } if !silent => {
+                                reply.push_str(&text)
+                            }
+                            ChatEvent::Silent { .. } => {
+                                silent = true;
+                                reply.clear();
+                            }
+                            ChatEvent::ContextUsage { tokens_used, context_window } => {
+                                connection.record_usage(tokens_used, context_window)
+                            }
+                            ChatEvent::TurnFinished { ok: true, .. } => return Ok(reply),
+                            ChatEvent::TurnFinished { error, .. } => {
+                                bail!("{}", error.unwrap_or_else(|| "backend failed".into()))
+                            }
+                            ChatEvent::SessionClosed { error } => {
+                                connection.closed = true;
+                                bail!("{}", error.unwrap_or_else(|| "backend failed".into()))
+                            }
+                            _ => {}
+                        }
+                    }
+                    message = rx.recv(), if rx_open => match message {
+                        None => rx_open = false,
+                        Some((inbound, reply_to))
+                            if inbound.command == Some(Command::Stop)
+                                && allowed(cfg, inbound.phone.as_deref(), inbound.group.as_deref()) =>
+                        {
+                            stopped = true;
+                            if let Err(error) = connection.session.abort().await {
+                                tracing::warn!(%error, "whatsapp-web abort failed");
+                            }
+                            say(&reply_to, &cfg.messages.stopped).await;
+                        }
+                        Some(item) => deferred.push_back(item),
+                    },
+                    _ = tick.tick(), if typing => {
+                        let _ = tokio::time::timeout(Duration::from_secs(5), transport.typing(true)).await;
+                    }
+                }
+            }
+        })
+        .await;
+        let result = result.unwrap_or_else(|_| {
+            connection.closed = true;
+            Err(anyhow::anyhow!("chat turn timed out"))
+        });
+        if typing {
+            let _ = tokio::time::timeout(Duration::from_secs(5), transport.typing(false)).await;
+        }
+        if connection.closed {
+            self.close_connection().await;
+        }
+        TurnOutcome { result, stopped }
+    }
+    /// Sends `/compact` as a turn and discards the backend's text.
+    async fn compact(&mut self, cfg: &Config, root: &Path, transport: &T, typing: bool) -> bool {
+        let outcome = self
+            .run_turn(cfg, "/compact".into(), transport, typing)
+            .await;
+        let _ = touch_activity(&root.join(&self.key));
+        match outcome.result {
+            Ok(_) => {
+                dar_extension_sdk::log::event(
+                    "-",
+                    "whatsapp-web",
+                    &format!("Compacted {}", self.key),
+                );
+                true
+            }
+            Err(error) => {
+                if !outcome.stopped {
+                    dar_extension_sdk::log::event(
+                        "-",
+                        "whatsapp-web",
+                        &format!("Compaction failed for {}: {error:#}", self.key),
+                    );
+                }
+                false
+            }
+        }
+    }
+}
+/// One worker task per chat key; a chat's messages stay ordered, chats run concurrently.
+struct Workers<T: Transport> {
+    ctx: StartCtx,
+    cfg: Config,
+    root: std::path::PathBuf,
+    senders: HashMap<String, mpsc::UnboundedSender<(Inbound, T)>>,
+    tasks: JoinSet<()>,
+    /// Tells workers to close their sessions and exit, independent of host shutdown.
+    stop: tokio::sync::watch::Sender<bool>,
+}
+impl<T: Transport> Workers<T> {
+    fn new(ctx: StartCtx, cfg: Config, root: std::path::PathBuf) -> Self {
+        Self {
+            ctx,
+            cfg,
+            root,
+            senders: HashMap::new(),
+            tasks: JoinSet::new(),
+            stop: tokio::sync::watch::channel(false).0,
+        }
+    }
+    fn submit(&mut self, inbound: Inbound, transport: T) {
+        if !allowed(
+            &self.cfg,
+            inbound.phone.as_deref(),
+            inbound.group.as_deref(),
+        ) {
+            return;
+        }
+        let mut item = (inbound, transport);
+        if let Some(sender) = self.senders.get(&item.0.session_key) {
+            match sender.send(item) {
+                Ok(()) => return,
+                Err(returned) => item = returned.0,
+            }
+        }
+        let key = item.0.session_key.clone();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let _ = tx.send(item);
+        self.senders.insert(key.clone(), tx);
+        self.tasks.spawn(chat_worker(
+            self.ctx.clone(),
+            self.cfg.clone(),
+            self.root.clone(),
+            Chat::new(key, rx),
+            self.stop.subscribe(),
+        ));
+    }
+    /// Lets workers close their sessions, then aborts any that overrun `grace`.
+    async fn finish(mut self, grace: Duration) {
+        self.senders.clear();
+        let _ = self.stop.send(true);
+        let joined = tokio::time::timeout(grace, async {
+            while self.tasks.join_next().await.is_some() {}
+        })
+        .await;
+        if joined.is_err() {
+            self.tasks.abort_all();
+        }
+    }
+}
+async fn chat_worker<T: Transport>(
+    ctx: StartCtx,
+    cfg: Config,
+    root: std::path::PathBuf,
+    mut chat: Chat<T>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut shutdown = ctx.shutdown.clone();
+    loop {
+        let next = match chat.deferred.pop_front() {
+            Some(item) => item,
+            None => tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = stop.changed() => break,
+                item = chat.rx.recv() => match item {
+                    Some(item) => item,
+                    None => break,
+                },
+            },
+        };
+        let result = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = stop.changed() => break,
+            result = process(&mut chat, &ctx, &cfg, &root, next.0, next.1) => result,
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error, "whatsapp-web inbound turn failed");
+        }
+    }
+    if let Some(connection) = chat.connection.take() {
+        let _ = tokio::time::timeout(Duration::from_millis(100), connection.session.close()).await;
+    }
 }
 async fn dispatch(
     ctx: StartCtx,
@@ -719,8 +1187,7 @@ async fn dispatch(
     bot: Bot,
 ) {
     let mut handle = bot.spawn();
-    let mut sessions = HashMap::new();
-    let mut notes = Notes::default();
+    let mut workers = Workers::new(ctx.clone(), cfg, root);
     let mut shutdown = ctx.shutdown.clone();
     let mut completed = false;
     loop {
@@ -729,16 +1196,8 @@ async fn dispatch(
             outcome = &mut handle => { tracing::warn!(?outcome, "whatsapp-web connection stopped"); completed = true; break; },
             message = rx.recv() => {
                 let Some(message) = message else { break; };
-                let result = tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    result = async {
-                        if let Some(inbound) = from_message(&message).await {
-                            process(&ctx, &cfg, &root, inbound, message, &mut sessions, &mut notes).await
-                        } else { Ok(()) }
-                    } => result,
-                };
-                if let Err(error) = result {
-                    tracing::warn!(%error, "whatsapp-web inbound turn failed");
+                if let Some(inbound) = from_message(&message).await {
+                    workers.submit(inbound, message);
                 }
             }
         }
@@ -756,18 +1215,15 @@ async fn dispatch(
     {
         handle.abort();
     }
-    for (_, connection) in sessions {
-        let _ = tokio::time::timeout(Duration::from_millis(100), connection.session.close()).await;
-    }
+    workers.finish(Duration::from_millis(300)).await;
 }
 async fn process<T: Transport>(
+    chat: &mut Chat<T>,
     ctx: &StartCtx,
     cfg: &Config,
     root: &Path,
     inbound: Inbound,
     transport: T,
-    sessions: &mut HashMap<String, Connection>,
-    notes: &mut Notes,
 ) -> Result<()> {
     if !allowed(cfg, inbound.phone.as_deref(), inbound.group.as_deref()) {
         return Ok(());
@@ -775,17 +1231,18 @@ async fn process<T: Transport>(
     let label = sender_label(&inbound.header);
     match &inbound.kind {
         Kind::Reaction { emoji, target } => {
-            let quoted = notes
+            let quoted = chat
+                .notes
                 .text_of(target)
                 .map_or_else(|| format!("message {target}"), |t| format!("\"{t}\""));
-            notes.push(
+            chat.notes.push(
                 &inbound.session_key,
                 format!("{label} reacted {emoji} to {quoted}"),
             );
             return Ok(());
         }
         Kind::Unaddressed => {
-            notes.remember(&inbound.message_id, &inbound.text);
+            chat.notes.remember(&inbound.message_id, &inbound.text);
             let text = if inbound.text.is_empty() {
                 "[media]"
             } else {
@@ -796,11 +1253,15 @@ async fn process<T: Transport>(
                 inbound.header.time,
                 snippet(text, MAX_SNIPPET)
             );
-            notes.push(&inbound.session_key, line);
+            chat.notes.push(&inbound.session_key, line);
             return Ok(());
         }
-        Kind::Turn => notes.remember(&inbound.message_id, &inbound.text),
+        Kind::Turn => {}
     }
+    if let Some(command) = inbound.command {
+        return run_command(chat, ctx, cfg, root, command, &transport).await;
+    }
+    chat.notes.remember(&inbound.message_id, &inbound.text);
     let sender = match (&inbound.phone, &inbound.header.lid) {
         (Some(phone), _) => format!("phone {phone}"),
         (None, Some(lid)) => format!("lid {lid}"),
@@ -817,11 +1278,10 @@ async fn process<T: Transport>(
         &format!("message from {sender}{place}"),
     );
     let _ = tokio::time::timeout(Duration::from_secs(5), transport.read()).await;
-    let session_dir = root.join(&inbound.session_key);
-    std::fs::create_dir_all(&session_dir)?;
+    let session_dir = chat.begin(root, cfg).await?;
     let subject = match &inbound.group {
         Some(group) => {
-            if !notes.subjects.contains_key(group) {
+            if !chat.notes.subjects.contains_key(group) {
                 // Failures are cached as empty so a broken lookup is not retried every turn.
                 let subject =
                     tokio::time::timeout(Duration::from_secs(5), transport.group_subject())
@@ -829,105 +1289,111 @@ async fn process<T: Transport>(
                         .ok()
                         .flatten()
                         .unwrap_or_default();
-                notes.subjects.insert(group.clone(), subject);
+                chat.notes.subjects.insert(group.clone(), subject);
             }
-            notes.subjects.get(group).filter(|s| !s.is_empty()).cloned()
+            chat.notes
+                .subjects
+                .get(group)
+                .filter(|s| !s.is_empty())
+                .cloned()
         }
         None => None,
     };
     let attachments = transport
         .attachments(&session_dir.join("uploads"), &inbound.message_id)
         .await;
-    let mut prompt = notes.render(&inbound.session_key).unwrap_or_default();
+    let mut prompt = chat.notes.render(&inbound.session_key).unwrap_or_default();
     prompt.push_str(&header_text(&inbound.header, subject.as_deref()));
     if !inbound.text.is_empty() {
         prompt.push('\n');
         prompt.push_str(&inbound.text);
     }
     prompt.push_str(&attachment_suffix(&attachments));
-    if !sessions.contains_key(&inbound.session_key) {
-        let backend_id =
-            dar_extension_sdk::chat::resolve_agent_backend(ctx, cfg.backend.as_deref());
-        let backend = ctx
-            .host
-            .services
-            .get::<dyn ChatBackend>(&backend_id)
-            .with_context(|| format!("chat backend '{backend_id}' not registered"))?;
-        let (tx, events) = mpsc::channel(256);
-        let session = tokio::time::timeout(
-            Duration::from_secs(30),
-            backend.open(
-                dar_extension_sdk::chat::agent_session_params(ctx, &session_dir).build(),
-                tx,
-            ),
-        )
-        .await
-        .context("chat backend open timed out")??;
-        sessions.insert(inbound.session_key.clone(), Connection { session, events });
+    chat.ensure_open(ctx, cfg, &session_dir).await?;
+    let outcome = chat.run_turn(cfg, prompt, &transport, true).await;
+    if outcome.result.is_ok() {
+        chat.notes.pending.remove(&inbound.session_key);
     }
-    let connection = sessions
-        .get_mut(&inbound.session_key)
-        .context("session missing")?;
-    let _ = tokio::time::timeout(Duration::from_secs(5), transport.typing(true)).await;
-    let result = {
-        let turn = tokio::time::timeout(Duration::from_secs(300), turn(connection, prompt));
-        tokio::pin!(turn);
-        loop {
-            tokio::select! {
-                result = &mut turn => break result.context("chat turn timed out").and_then(|result| result),
-                _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                    let _ = tokio::time::timeout(Duration::from_secs(5), transport.typing(true)).await;
-                }
-            }
+    if let Err(error) = &outcome.result {
+        if !outcome.stopped {
+            dar_extension_sdk::log::event(
+                "-",
+                "whatsapp-web",
+                &format!("turn failed for {}: {error:#}", inbound.session_key),
+            );
         }
-    };
-    let _ = tokio::time::timeout(Duration::from_secs(5), transport.typing(false)).await;
-    if result.is_ok() {
-        notes.pending.remove(&inbound.session_key);
-    } else if let Some(connection) = sessions.remove(&inbound.session_key) {
-        let _ = tokio::time::timeout(Duration::from_secs(2), connection.session.close()).await;
     }
-    if let Err(error) = &result {
+    let _ = touch_activity(&root.join(&chat.key));
+    let succeeded = outcome.result.is_ok() && !outcome.stopped;
+    if !outcome.stopped {
+        let reply = outcome.result.unwrap_or_else(|_| "(turn failed)".into());
+        if !ctx.shutdown.is_cancelled() && !reply.trim().is_empty() {
+            let id = tokio::time::timeout(
+                Duration::from_secs(20),
+                transport.send(adapt_markdown(&reply)),
+            )
+            .await
+            .context("whatsapp send timed out")??;
+            chat.notes.remember(&id, &reply);
+        }
+    }
+    let percent = chat
+        .connection
+        .as_ref()
+        .and_then(Connection::compact_percent)
+        .filter(|_| succeeded);
+    if let Some(percent) = percent {
+        if let Some(connection) = chat.connection.as_mut() {
+            connection.armed = false;
+        }
         dar_extension_sdk::log::event(
             "-",
             "whatsapp-web",
-            &format!("turn failed for {}: {error:#}", inbound.session_key),
+            &format!("Auto-compacting {} ({percent}% of context)", chat.key),
         );
-    }
-    let reply = result.unwrap_or_else(|_| "(turn failed)".into());
-    if !ctx.shutdown.is_cancelled() && !reply.trim().is_empty() {
-        let id = tokio::time::timeout(
-            Duration::from_secs(20),
-            transport.send(adapt_markdown(&reply)),
-        )
-        .await
-        .context("whatsapp send timed out")??;
-        notes.remember(&id, &reply);
+        chat.compact(cfg, root, &transport, false).await;
     }
     Ok(())
 }
-async fn turn(connection: &mut Connection, text: String) -> Result<String> {
-    connection.session.send_turn(text).await?;
-    let mut reply = String::new();
-    let mut silent = false;
-    while let Some(event) = connection.events.recv().await {
-        match event {
-            ChatEvent::Delta {
-                role: ChatRole::Assistant,
-                text,
-            } if !silent => reply.push_str(&text),
-            ChatEvent::Silent { .. } => {
-                silent = true;
-                reply.clear();
+async fn run_command<T: Transport>(
+    chat: &mut Chat<T>,
+    ctx: &StartCtx,
+    cfg: &Config,
+    root: &Path,
+    command: Command,
+    transport: &T,
+) -> Result<()> {
+    match command {
+        Command::New => {
+            chat.close_connection().await;
+            let chat_dir = root.join(&chat.key);
+            std::fs::create_dir_all(&chat_dir)?;
+            rotate_generation(&chat_dir)?;
+            touch_activity(&chat_dir)?;
+            let key = chat.key.clone();
+            chat.notes.pending.remove(&key);
+            say(transport, &cfg.messages.new_session).await;
+        }
+        // Nothing is in flight when a stop is handled here; in-flight turns are stopped by `run_turn`.
+        Command::Stop => {
+            say(transport, &cfg.messages.stopped).await;
+        }
+        Command::Compact => {
+            let dir = chat.begin(root, cfg).await?;
+            if let Err(error) = chat.ensure_open(ctx, cfg, &dir).await {
+                dar_extension_sdk::log::event(
+                    "-",
+                    "whatsapp-web",
+                    &format!("Compaction failed for {}: {error:#}", chat.key),
+                );
+                return Ok(());
             }
-            ChatEvent::TurnFinished { ok: true, .. } => return Ok(reply),
-            ChatEvent::TurnFinished { error, .. } | ChatEvent::SessionClosed { error } => {
-                bail!("{}", error.unwrap_or_else(|| "backend failed".into()))
+            if chat.compact(cfg, root, transport, true).await {
+                say(transport, &cfg.messages.compacted).await;
             }
-            _ => {}
         }
     }
-    bail!("backend event stream closed")
+    Ok(())
 }
 fn connected_message(phone: Option<&str>) -> String {
     match phone {
@@ -1045,26 +1511,90 @@ mod tests {
     }
     use dar_extension_sdk::chat::{BoxFuture, ChatSession, ChatSessionParams};
     use std::sync::Arc;
-    use tokio::sync::watch;
-    struct EchoBackend;
-    struct EchoSession(mpsc::Sender<ChatEvent>);
+    use tokio::sync::{watch, Notify};
+    /// What the fake backend saw: resume ids per open, and every prompt sent.
+    #[derive(Clone, Default)]
+    struct Probe {
+        opens: Arc<Mutex<Vec<Option<String>>>>,
+        prompts: Arc<Mutex<Vec<String>>>,
+        closes: Arc<Mutex<usize>>,
+    }
+    impl Probe {
+        fn opens(&self) -> Vec<Option<String>> {
+            self.opens.lock().unwrap().clone()
+        }
+        fn compactions(&self) -> usize {
+            self.prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| *p == "/compact")
+                .count()
+        }
+    }
+    struct EchoBackend(Probe);
+    struct EchoSession {
+        events: mpsc::Sender<ChatEvent>,
+        probe: Probe,
+        abort: Arc<Notify>,
+    }
     impl ChatBackend for EchoBackend {
         fn open<'a>(
             &'a self,
-            _: ChatSessionParams,
+            params: ChatSessionParams,
             events: mpsc::Sender<ChatEvent>,
         ) -> BoxFuture<'a, Result<Box<dyn ChatSession>>> {
-            Box::pin(async move { Ok(Box::new(EchoSession(events)) as Box<dyn ChatSession>) })
+            self.0
+                .opens
+                .lock()
+                .unwrap()
+                .push(params.resume_session_id.clone());
+            let probe = self.0.clone();
+            Box::pin(async move {
+                Ok(Box::new(EchoSession {
+                    events,
+                    probe,
+                    abort: Arc::new(Notify::new()),
+                }) as Box<dyn ChatSession>)
+            })
         }
     }
     impl ChatSession for EchoSession {
         fn send_turn(&mut self, prompt: String) -> BoxFuture<'_, Result<()>> {
             Box::pin(async move {
+                self.probe.prompts.lock().unwrap().push(prompt.clone());
                 if prompt.ends_with("hang") {
                     return std::future::pending().await;
                 }
+                if prompt.ends_with("slow") {
+                    let (events, abort) = (self.events.clone(), self.abort.clone());
+                    tokio::spawn(async move {
+                        let _ = events
+                            .send(ChatEvent::Delta {
+                                role: ChatRole::Assistant,
+                                text: "partial".into(),
+                            })
+                            .await;
+                        abort.notified().await;
+                        let _ = events
+                            .send(ChatEvent::TurnFinished {
+                                ok: false,
+                                error: Some("aborted".into()),
+                            })
+                            .await;
+                    });
+                    return Ok(());
+                }
+                if prompt.ends_with("close") {
+                    self.events
+                        .send(ChatEvent::SessionClosed {
+                            error: Some("died".into()),
+                        })
+                        .await?;
+                    return Ok(());
+                }
                 if prompt.ends_with("fail") {
-                    self.0
+                    self.events
                         .send(ChatEvent::TurnFinished {
                             ok: false,
                             error: Some("failed".into()),
@@ -1072,13 +1602,50 @@ mod tests {
                         .await?;
                     return Ok(());
                 }
-                self.0
+                if prompt.ends_with("stale") {
+                    self.events
+                        .send(ChatEvent::ContextUsage {
+                            tokens_used: 85,
+                            context_window: Some(100),
+                        })
+                        .await?;
+                }
+                let usage = [
+                    ("big", Some(100)),
+                    ("edge", Some(100)),
+                    ("under", Some(100)),
+                    ("small", Some(100)),
+                    ("nowin", None),
+                    ("stale", None),
+                ]
+                .into_iter()
+                .find(|(word, _)| prompt.ends_with(word));
+                if let Some((word, window)) = usage {
+                    let tokens_used = match word {
+                        "big" => 85,
+                        "edge" => 80,
+                        "under" => 79,
+                        "stale" => 90,
+                        _ => 10,
+                    };
+                    self.events
+                        .send(ChatEvent::ContextUsage {
+                            tokens_used,
+                            context_window: window,
+                        })
+                        .await?;
+                }
+                self.events
                     .send(ChatEvent::Delta {
                         role: ChatRole::Assistant,
-                        text: prompt,
+                        text: if prompt == "/compact" {
+                            "compact text".into()
+                        } else {
+                            prompt
+                        },
                     })
                     .await?;
-                self.0
+                self.events
                     .send(ChatEvent::TurnFinished {
                         ok: true,
                         error: None,
@@ -1088,9 +1655,11 @@ mod tests {
             })
         }
         fn abort(&mut self) -> BoxFuture<'_, Result<()>> {
+            self.abort.notify_one();
             Box::pin(async { Ok(()) })
         }
         fn close(self: Box<Self>) -> BoxFuture<'static, Result<()>> {
+            *self.probe.closes.lock().unwrap() += 1;
             Box::pin(async { Ok(()) })
         }
     }
@@ -1161,6 +1730,9 @@ mod tests {
         }
     }
     fn context(root: &Path) -> (StartCtx, watch::Sender<bool>) {
+        context_with(root, Probe::default())
+    }
+    fn context_with(root: &Path, probe: Probe) -> (StartCtx, watch::Sender<bool>) {
         let (tx, rx) = watch::channel(false);
         let paths = host_api::HostPaths::new(root).unwrap();
         let mut register = RegisterCtx {
@@ -1174,7 +1746,7 @@ mod tests {
         };
         register
             .services
-            .service::<dyn ChatBackend>("pi", Arc::new(EchoBackend))
+            .service::<dyn ChatBackend>("pi", Arc::new(EchoBackend(probe)))
             .unwrap();
         let config = register.config.clone();
         let host = register.into_start_services().unwrap();
@@ -1201,8 +1773,37 @@ mod tests {
             group: None,
             message_id: "m1".into(),
             kind: Kind::Turn,
+            command: None,
             text,
         }
+    }
+    fn command(key: &str, phone: &str, command: Command) -> Inbound {
+        Inbound {
+            command: Some(command),
+            ..inbound(key.into(), Some(phone.into()), String::new())
+        }
+    }
+    fn new_chat<T: Transport>(key: &str) -> Chat<T> {
+        Chat::new(key.into(), mpsc::unbounded_channel().1)
+    }
+    async fn wait_for(what: &str, condition: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+    fn sends(transport: &FakeTransport) -> Vec<String> {
+        transport
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| a.starts_with("send:"))
+            .cloned()
+            .collect()
     }
     fn sent_hello(actions: &[String]) -> bool {
         actions
@@ -1214,8 +1815,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (ctx, _shutdown) = context(temp.path());
         let transport = FakeTransport::default();
-        let mut notes = Notes::default();
-        let mut sessions = HashMap::new();
+        let mut chat = new_chat("group-1203");
         let group = |kind: Kind, text: &str| {
             let mut i = inbound("group-1203".into(), Some("3361".into()), text.into());
             i.group = Some("1203".into());
@@ -1241,13 +1841,12 @@ mod tests {
             group(Kind::Turn, "@bot hi"),
         ] {
             process(
+                &mut chat,
                 &ctx,
                 &cfg,
                 temp.path(),
                 inbound,
                 transport.clone(),
-                &mut sessions,
-                &mut notes,
             )
             .await
             .unwrap();
@@ -1260,21 +1859,20 @@ mod tests {
         assert!(reply.contains("Thinh reacted 👍 to \"lunch?\""));
         assert!(reply.contains("[WhatsApp group \"Family\" (1203) · from Thinh · +3361"));
         assert!(reply.contains("uploads/m-photo.jpg"));
-        assert!(sessions.contains_key("group-1203"));
-        assert!(notes.text_of("out-1").is_some());
+        assert!(chat.connection.is_some());
+        assert!(chat.notes.text_of("out-1").is_some());
         let other = Config {
             allowed_groups: vec!["999".into()],
             ..Default::default()
         };
         let transport = FakeTransport::default();
         process(
+            &mut chat,
             &ctx,
             &other,
             temp.path(),
             group(Kind::Turn, "hi"),
             transport.clone(),
-            &mut sessions,
-            &mut notes,
         )
         .await
         .unwrap();
@@ -1288,13 +1886,12 @@ mod tests {
         let mut i = inbound("group-5599".into(), Some("3377".into()), "hi".into());
         i.group = Some("5599".into());
         process(
+            &mut new_chat("group-5599"),
             &ctx,
             &Config::default(),
             temp.path(),
             i,
             FakeTransport::default(),
-            &mut HashMap::new(),
-            &mut Notes::default(),
         )
         .await
         .unwrap();
@@ -1420,31 +2017,29 @@ mod tests {
         let (ctx, _shutdown) = context(temp.path());
         let transport = FakeTransport::default();
         let inbound = inbound("pn-3361".into(), Some("3361".into()), "hello".into());
-        let mut sessions = HashMap::new();
+        let mut chat = new_chat("pn-3361");
         let cfg = Config {
             allowed_users: vec!["999".into()],
             ..Default::default()
         };
         process(
+            &mut chat,
             &ctx,
             &cfg,
             temp.path(),
             inbound.clone(),
             transport.clone(),
-            &mut sessions,
-            &mut Notes::default(),
         )
         .await
         .unwrap();
         assert!(transport.0.lock().unwrap().is_empty());
         process(
+            &mut chat,
             &ctx,
             &Config::default(),
             temp.path(),
             inbound,
             transport.clone(),
-            &mut sessions,
-            &mut Notes::default(),
         )
         .await
         .unwrap();
@@ -1462,13 +2057,12 @@ mod tests {
         for (session_key, phone) in [("pn-3377", Some("3377")), ("lid-4488", None)] {
             let inbound = inbound(session_key.into(), phone.map(Into::into), "hello".into());
             process(
+                &mut new_chat("pn-3361"),
                 &ctx,
                 &Config::default(),
                 temp.path(),
                 inbound,
                 FakeTransport::default(),
-                &mut HashMap::new(),
-                &mut Notes::default(),
             )
             .await
             .unwrap();
@@ -1487,13 +2081,12 @@ mod tests {
             ..Default::default()
         };
         process(
+            &mut new_chat("pn-3361"),
             &ctx,
             &cfg,
             temp.path(),
             inbound,
             transport.clone(),
-            &mut HashMap::new(),
-            &mut Notes::default(),
         )
         .await
         .unwrap();
@@ -1506,84 +2099,36 @@ mod tests {
         let transport = HungReadTransport::default();
         let inbound = inbound("pn-3361".into(), Some("3361".into()), "hello".into());
         process(
+            &mut new_chat("pn-3361"),
             &ctx,
             &Config::default(),
             temp.path(),
             inbound,
             transport.clone(),
-            &mut HashMap::new(),
-            &mut Notes::default(),
         )
         .await
         .unwrap();
         assert!(sent_hello(&transport.0 .0.lock().unwrap()));
-    }
-    #[tokio::test]
-    async fn failed_turn_cleans_session_and_replies() {
-        dar_extension_sdk::log::set_event_hook(capture);
-        let temp = tempfile::tempdir().unwrap();
-        let (ctx, _shutdown) = context(temp.path());
-        let transport = FakeTransport::default();
-        let inbound = inbound("pn-3361".into(), Some("3361".into()), "fail".into());
-        let mut sessions = HashMap::new();
-        let mut notes = Notes::default();
-        notes.push("pn-3361", "Ana reacted 👍".into());
-        process(
-            &ctx,
-            &Config::default(),
-            temp.path(),
-            inbound.clone(),
-            transport.clone(),
-            &mut sessions,
-            &mut notes,
-        )
-        .await
-        .unwrap();
-        assert!(sessions.is_empty());
-        assert!(notes.render("pn-3361").is_some(), "kept for retry");
-        assert!(logged("turn failed for pn-3361: failed"));
-        let ok = Inbound {
-            text: "hello".into(),
-            ..inbound
-        };
-        process(
-            &ctx,
-            &Config::default(),
-            temp.path(),
-            ok,
-            transport.clone(),
-            &mut sessions,
-            &mut notes,
-        )
-        .await
-        .unwrap();
-        assert!(notes.render("pn-3361").is_none(), "cleared after success");
-        assert!(transport
-            .0
-            .lock()
-            .unwrap()
-            .contains(&"send:(turn failed)".into()));
     }
     #[tokio::test(start_paused = true)]
     async fn hung_turn_times_out_and_cleans_session() {
         let temp = tempfile::tempdir().unwrap();
         let (ctx, _shutdown) = context(temp.path());
         let transport = FakeTransport::default();
-        let mut sessions = HashMap::new();
+        let mut chat = new_chat("pn-3361");
         let started = tokio::time::Instant::now();
         process(
+            &mut chat,
             &ctx,
             &Config::default(),
             temp.path(),
             inbound("pn-3361".into(), Some("3361".into()), "hang".into()),
             transport.clone(),
-            &mut sessions,
-            &mut Notes::default(),
         )
         .await
         .unwrap();
         assert_eq!(started.elapsed(), Duration::from_secs(300));
-        assert!(sessions.is_empty());
+        assert!(chat.connection.is_none());
         let actions = transport.0.lock().unwrap();
         assert!(actions.contains(&"typing:false".into()));
         assert!(actions.contains(&"send:(turn failed)".into()));
@@ -1595,13 +2140,12 @@ mod tests {
         let transport = HungSendTransport::default();
         let started = tokio::time::Instant::now();
         let error = process(
+            &mut new_chat("pn-3361"),
             &ctx,
             &Config::default(),
             temp.path(),
             inbound("pn-3361".into(), Some("3361".into()), "hello".into()),
             transport.clone(),
-            &mut HashMap::new(),
-            &mut Notes::default(),
         )
         .await
         .unwrap_err();
@@ -1613,6 +2157,555 @@ mod tests {
             .lock()
             .unwrap()
             .contains(&"typing:false".into()));
+    }
+    fn turn_in(key: &str, text: &str) -> Inbound {
+        inbound(key.into(), Some("3361".into()), text.into())
+    }
+    async fn run<T: Transport>(
+        chat: &mut Chat<T>,
+        ctx: &StartCtx,
+        cfg: &Config,
+        root: &Path,
+        inbound: Inbound,
+        transport: &T,
+    ) {
+        process(chat, ctx, cfg, root, inbound, transport.clone())
+            .await
+            .unwrap();
+    }
+    fn backdate_activity(root: &Path, key: &str, minutes: u64) {
+        let last = now_secs() - minutes * 60;
+        std::fs::write(root.join(key).join(ACTIVITY_FILE), last.to_string()).unwrap();
+    }
+    #[tokio::test]
+    async fn reopen_resumes_newest_archived_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+        let generation = temp.path().join("pn-3361").join("1");
+        std::fs::create_dir_all(&generation).unwrap();
+        std::fs::write(
+            generation.join("2026-01-01_a.jsonl"),
+            "{\"type\":\"session\",\"id\":\"sess-7\",\"backend\":\"pi\"}\n",
+        )
+        .unwrap();
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-3361");
+        run(
+            &mut chat,
+            &ctx,
+            &Config::default(),
+            temp.path(),
+            turn_in("pn-3361", "hello"),
+            &transport,
+        )
+        .await;
+        assert_eq!(probe.opens(), vec![Some("sess-7".to_owned())]);
+        let mut other = new_chat("pn-9");
+        run(
+            &mut other,
+            &ctx,
+            &Config::default(),
+            temp.path(),
+            turn_in("pn-9", "hello"),
+            &transport,
+        )
+        .await;
+        assert_eq!(probe.opens()[1], None);
+    }
+    #[tokio::test]
+    async fn legacy_chat_dir_without_generations_is_generation_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let chat_dir = temp.path().join("pn-1");
+        std::fs::create_dir_all(chat_dir.join("uploads")).unwrap();
+        assert_eq!(current_generation(&chat_dir), 1);
+        assert_eq!(generation_dir(&chat_dir).unwrap(), chat_dir.join("1"));
+        rotate_generation(&chat_dir).unwrap();
+        assert_eq!(current_generation(&chat_dir), 2);
+        assert!(chat_dir.join("1").is_dir() && chat_dir.join("2").is_dir());
+    }
+    #[tokio::test]
+    async fn idle_ttl_rotates_generation_and_reopens() {
+        dar_extension_sdk::log::set_event_hook(capture);
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+        let cfg = Config {
+            sessions: Sessions {
+                idle_minutes: Some(60),
+            },
+            ..Default::default()
+        };
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-ttl");
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-ttl", "hello"),
+            &transport,
+        )
+        .await;
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-ttl", "hello"),
+            &transport,
+        )
+        .await;
+        assert_eq!(probe.opens().len(), 1, "fresh activity keeps the session");
+        backdate_activity(temp.path(), "pn-ttl", 61);
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-ttl", "hello"),
+            &transport,
+        )
+        .await;
+        assert_eq!(probe.opens().len(), 2);
+        assert_eq!(current_generation(&temp.path().join("pn-ttl")), 2);
+        assert!(temp.path().join("pn-ttl/1").is_dir());
+        assert!(logged(
+            "Session pn-ttl expired after 60 min idle; starting fresh"
+        ));
+    }
+    #[tokio::test]
+    async fn absent_or_zero_ttl_never_expires() {
+        for idle_minutes in [None, Some(0)] {
+            let temp = tempfile::tempdir().unwrap();
+            let probe = Probe::default();
+            let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+            let cfg = Config {
+                sessions: Sessions { idle_minutes },
+                ..Default::default()
+            };
+            let transport = FakeTransport::default();
+            let mut chat = new_chat("pn-1");
+            run(
+                &mut chat,
+                &ctx,
+                &cfg,
+                temp.path(),
+                turn_in("pn-1", "hello"),
+                &transport,
+            )
+            .await;
+            backdate_activity(temp.path(), "pn-1", 100_000);
+            run(
+                &mut chat,
+                &ctx,
+                &cfg,
+                temp.path(),
+                turn_in("pn-1", "hello"),
+                &transport,
+            )
+            .await;
+            assert_eq!(probe.opens().len(), 1);
+            assert_eq!(current_generation(&temp.path().join("pn-1")), 1);
+        }
+    }
+    #[tokio::test]
+    async fn failed_turn_keeps_session_and_replies() {
+        dar_extension_sdk::log::set_event_hook(capture);
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-fail");
+        chat.notes.push("pn-fail", "Ana reacted 👍".into());
+        let cfg = Config::default();
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-fail", "fail"),
+            &transport,
+        )
+        .await;
+        assert!(chat.connection.is_some());
+        assert!(chat.notes.render("pn-fail").is_some(), "kept for retry");
+        assert!(logged("turn failed for pn-fail: failed"));
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-fail", "hello"),
+            &transport,
+        )
+        .await;
+        assert_eq!(probe.opens().len(), 1);
+        assert!(
+            chat.notes.render("pn-fail").is_none(),
+            "cleared after success"
+        );
+        assert!(transport
+            .0
+            .lock()
+            .unwrap()
+            .contains(&"send:(turn failed)".into()));
+    }
+    #[tokio::test]
+    async fn session_closed_drops_and_reopens_with_resume() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-close");
+        let cfg = Config::default();
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-close", "close"),
+            &transport,
+        )
+        .await;
+        assert!(chat.connection.is_none());
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-close", "hello"),
+            &transport,
+        )
+        .await;
+        assert_eq!(probe.opens().len(), 2);
+        assert!(chat.connection.is_some());
+    }
+    #[tokio::test]
+    async fn new_command_rotates_clears_notes_and_replies() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-new");
+        let cfg = Config::default();
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-new", "hello"),
+            &transport,
+        )
+        .await;
+        chat.notes.push("pn-new", "later".into());
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            command("pn-new", "3361", Command::New),
+            &transport,
+        )
+        .await;
+        assert!(chat.connection.is_none());
+        assert!(chat.notes.render("pn-new").is_none());
+        assert_eq!(current_generation(&temp.path().join("pn-new")), 2);
+        assert_eq!(
+            sends(&transport).last().unwrap(),
+            "send:New session started."
+        );
+        assert_eq!(probe.prompts.lock().unwrap().len(), 1, "no agent turn");
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-new", "hello"),
+            &transport,
+        )
+        .await;
+        assert_eq!(probe.opens().len(), 2);
+    }
+    #[tokio::test]
+    async fn compact_command_replies_without_relaying_backend_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-c");
+        run(
+            &mut chat,
+            &ctx,
+            &Config::default(),
+            temp.path(),
+            command("pn-c", "3361", Command::Compact),
+            &transport,
+        )
+        .await;
+        assert_eq!(probe.prompts.lock().unwrap().as_slice(), ["/compact"]);
+        assert_eq!(sends(&transport), vec!["send:Compacted."]);
+    }
+    #[tokio::test]
+    async fn custom_messages_are_used() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "messages": { "new_session": "Nouvelle session.", "stopped": "Arrêté." },
+            "sessions": { "idle_minutes": 30 }
+        }))
+        .unwrap();
+        assert_eq!(cfg.sessions.idle_minutes, Some(30));
+        assert_eq!(cfg.messages.compacted, "Compacted.");
+        let defaults = Config::default();
+        assert_eq!(defaults.sessions.idle_minutes, None);
+        assert_eq!(defaults.messages.stopped, "Stopped.");
+        assert_eq!(defaults.messages.new_session, "New session started.");
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-m");
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            command("pn-m", "3361", Command::New),
+            &transport,
+        )
+        .await;
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            command("pn-m", "3361", Command::Stop),
+            &transport,
+        )
+        .await;
+        assert_eq!(
+            sends(&transport),
+            vec!["send:Nouvelle session.", "send:Arrêté."]
+        );
+    }
+    #[test]
+    fn commands_need_exact_text_and_group_mention() {
+        let bot = vec!["111".to_owned()];
+        assert_eq!(parse_command(" /new ", false, &bot), Some(Command::New));
+        assert_eq!(parse_command("/stop", false, &bot), Some(Command::Stop));
+        assert_eq!(
+            parse_command("/compact", false, &bot),
+            Some(Command::Compact)
+        );
+        assert_eq!(parse_command("/new now", false, &bot), None);
+        assert_eq!(parse_command("/New", false, &bot), None);
+        assert_eq!(parse_command("@111 /new", true, &bot), Some(Command::New));
+        assert_eq!(parse_command("/stop @111", true, &bot), Some(Command::Stop));
+        assert_eq!(parse_command("/new", true, &bot), None);
+        assert_eq!(parse_command("@222 /new", true, &bot), None);
+        assert_eq!(parse_command("@111 /new please", true, &bot), None);
+    }
+    #[tokio::test]
+    async fn stop_aborts_in_flight_turn_and_drops_partial_reply() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+        let transport = FakeTransport::default();
+        let mut workers = Workers::new(ctx, Config::default(), temp.path().to_owned());
+        workers.submit(turn_in("pn-s", "slow"), transport.clone());
+        wait_for("turn start", || probe.prompts.lock().unwrap().len() == 1).await;
+        workers.submit(command("pn-s", "3361", Command::Stop), transport.clone());
+        wait_for("stop reply", || sends(&transport) == ["send:Stopped."]).await;
+        wait_for("turn end", || {
+            transport
+                .0
+                .lock()
+                .unwrap()
+                .contains(&"typing:false".to_owned())
+        })
+        .await;
+        assert_eq!(sends(&transport), vec!["send:Stopped."]);
+        workers.submit(turn_in("pn-s", "hello"), transport.clone());
+        wait_for("next turn", || sent_hello(&transport.0.lock().unwrap())).await;
+        assert_eq!(probe.opens().len(), 1, "stop keeps the session");
+    }
+    #[tokio::test]
+    async fn stop_when_idle_only_replies() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-i");
+        run(
+            &mut chat,
+            &ctx,
+            &Config::default(),
+            temp.path(),
+            command("pn-i", "3361", Command::Stop),
+            &transport,
+        )
+        .await;
+        assert_eq!(sends(&transport), vec!["send:Stopped."]);
+    }
+    #[tokio::test]
+    async fn auto_compaction_fires_once_at_eighty_percent() {
+        dar_extension_sdk::log::set_event_hook(capture);
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-auto");
+        let cfg = Config::default();
+        let turn = |text: &'static str| turn_in("pn-auto", text);
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn("small"),
+            &transport,
+        )
+        .await;
+        assert_eq!(probe.compactions(), 0);
+        run(&mut chat, &ctx, &cfg, temp.path(), turn("big"), &transport).await;
+        assert_eq!(probe.compactions(), 1);
+        assert!(logged("Auto-compacting pn-auto (85% of context)"));
+        assert!(logged("Compacted pn-auto"));
+        assert_eq!(sends(&transport).len(), 2, "compaction sends nothing");
+        run(&mut chat, &ctx, &cfg, temp.path(), turn("big"), &transport).await;
+        assert_eq!(probe.compactions(), 1, "no re-trigger while still over");
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn("small"),
+            &transport,
+        )
+        .await;
+        run(&mut chat, &ctx, &cfg, temp.path(), turn("big"), &transport).await;
+        assert_eq!(probe.compactions(), 2);
+    }
+    #[test]
+    fn compact_threshold_handles_huge_windows() {
+        assert!(!over_compact_threshold(u64::MAX / 2, u64::MAX));
+        assert!(over_compact_threshold(u64::MAX, u64::MAX));
+    }
+    #[tokio::test]
+    async fn auto_compaction_threshold_is_inclusive_at_eighty_percent() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-edge");
+        let cfg = Config::default();
+        let turn = |text: &'static str| turn_in("pn-edge", text);
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn("under"),
+            &transport,
+        )
+        .await;
+        assert_eq!(probe.compactions(), 0, "79% stays below the threshold");
+        run(&mut chat, &ctx, &cfg, temp.path(), turn("edge"), &transport).await;
+        assert_eq!(probe.compactions(), 1, "80% triggers compaction");
+    }
+    #[tokio::test]
+    async fn usage_without_window_clears_stale_usage() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-stale");
+        let cfg = Config::default();
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-stale", "stale"),
+            &transport,
+        )
+        .await;
+        assert_eq!(probe.compactions(), 0, "a windowless report replaces 85%");
+    }
+    #[tokio::test]
+    async fn finish_without_shutdown_closes_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+        let transport = FakeTransport::default();
+        let mut workers = Workers::new(ctx, Config::default(), temp.path().to_owned());
+        workers.submit(turn_in("pn-f", "hang"), transport.clone());
+        wait_for("turn start", || probe.prompts.lock().unwrap().len() == 1).await;
+        workers.finish(Duration::from_secs(1)).await;
+        assert_eq!(*probe.closes.lock().unwrap(), 1);
+    }
+    #[tokio::test]
+    async fn compaction_records_activity_after_finishing() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-ca");
+        let cfg = Config::default();
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-ca", "hello"),
+            &transport,
+        )
+        .await;
+        backdate_activity(temp.path(), "pn-ca", 100);
+        assert!(chat.compact(&cfg, temp.path(), &transport, false).await);
+        let last = read_number(&temp.path().join("pn-ca").join(ACTIVITY_FILE)).unwrap();
+        assert!(now_secs() - last < 5);
+    }
+    #[tokio::test]
+    async fn compact_open_failure_is_logged() {
+        dar_extension_sdk::log::set_event_hook(capture);
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = FakeTransport::default();
+        let cfg = Config {
+            backend: Some("missing".into()),
+            ..Default::default()
+        };
+        let mut chat = new_chat("pn-of");
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            command("pn-of", "3361", Command::Compact),
+            &transport,
+        )
+        .await;
+        assert!(EVENTS.lock().unwrap().iter().any(|e| e.starts_with(
+            "whatsapp-web: Compaction failed for pn-of: chat backend 'missing' not registered"
+        )));
+        assert!(sends(&transport).is_empty());
+    }
+    #[tokio::test]
+    async fn chats_run_concurrently() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, shutdown) = context(temp.path());
+        let transport = FakeTransport::default();
+        let mut workers = Workers::new(ctx, Config::default(), temp.path().to_owned());
+        workers.submit(turn_in("pn-a", "hang"), transport.clone());
+        workers.submit(turn_in("pn-b", "hello"), transport.clone());
+        wait_for("second chat reply", || {
+            sent_hello(&transport.0.lock().unwrap())
+        })
+        .await;
+        shutdown.send(true).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            workers.finish(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
     }
     #[test]
     fn phone_validation() {
