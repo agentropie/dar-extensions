@@ -5,11 +5,19 @@ use dar_extension_sdk::{
     ConfigStore, Extension, RegisterCtx, StartCtx,
 };
 use serde::Deserialize;
-use std::{collections::HashMap, path::Path, sync::Mutex, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
 use tokio::sync::mpsc;
 use whatsapp_rust::{
     pair_code::PairCodeOptions,
-    prelude::{Bot, MessageContext, MessageExt, SqliteStore},
+    prelude::{Bot, Event, EventKind, MessageContext, MessageExt, SqliteStore},
 };
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -66,13 +74,49 @@ impl Extension for WhatsAppWebExtension {
             let store =
                 SqliteStore::open(db.to_str().context("session store path is not UTF-8")?).await?;
             let (tx, rx) = mpsc::channel(256);
-            let mut builder = Bot::builder().with_backend(store)
-                .on_message(move |message| { let tx = tx.clone(); async move { let _ = tx.send(message).await; } })
-                .on_pair_code(|code, timeout| async move {
-                    tracing::info!(%code, seconds = timeout.as_secs(), "whatsapp-web pairing code: enter in Linked devices");
+            let qr_shown = Arc::new(AtomicBool::new(false));
+            let mut builder = Bot::builder()
+                .with_backend(store)
+                .on_message(move |message| {
+                    let tx = tx.clone();
+                    async move {
+                        let _ = tx.send(message).await;
+                    }
                 })
-                .on_pair_code_error(|error, _| async move { tracing::warn!(?error, "whatsapp-web pairing code request failed"); })
-                .on_qr_code(|code, _| async move { tracing::info!(%code, "whatsapp-web pairing QR fallback"); });
+                .on_pair_code(|code, timeout| async move {
+                    dar_extension_sdk::log::event(
+                        "-",
+                        "whatsapp-web",
+                        &format!(
+                            "pairing code {code} (valid {}s): enter in Linked devices",
+                            timeout.as_secs()
+                        ),
+                    );
+                })
+                .on_pair_code_error(|error, _| async move {
+                    dar_extension_sdk::log::event(
+                        "-",
+                        "whatsapp-web",
+                        &format!("pairing code request failed: {error:?}"),
+                    );
+                })
+                .on_event_for(
+                    &[EventKind::PairSuccess, EventKind::PairError],
+                    |event, _| async move {
+                        if let Some(message) = pairing_message(&event) {
+                            dar_extension_sdk::log::event("-", "whatsapp-web", &message);
+                        }
+                    },
+                )
+                .on_qr_code(move |code, _| {
+                    let first = !qr_shown.swap(true, Ordering::Relaxed);
+                    async move {
+                        tracing::info!(%code, "whatsapp-web pairing QR fallback");
+                        if first {
+                            log_qr(&code);
+                        }
+                    }
+                });
             if let Some(phone_number) = cfg.phone_number.clone() {
                 builder = builder.with_pair_code(PairCodeOptions {
                     phone_number,
@@ -324,6 +368,39 @@ async fn turn(connection: &mut Connection, text: String) -> Result<String> {
     }
     bail!("backend event stream closed")
 }
+fn pairing_message(event: &Event) -> Option<String> {
+    match event {
+        Event::PairSuccess(pair) => Some(format!(
+            "paired as {} ({}, {})",
+            pair.id, pair.business_name, pair.platform
+        )),
+        Event::PairError(pair) => Some(format!("pairing failed: {}", pair.error)),
+        _ => None,
+    }
+}
+/// QR rows for dark terminals; one log event per row keeps them aligned.
+fn qr_rows(code: &str) -> Vec<String> {
+    let Ok(qr) = qrcode::QrCode::new(code) else {
+        return Vec::new();
+    };
+    qr.render::<qrcode::render::unicode::Dense1x2>()
+        .dark_color(qrcode::render::unicode::Dense1x2::Light)
+        .light_color(qrcode::render::unicode::Dense1x2::Dark)
+        .build()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+fn log_qr(code: &str) {
+    dar_extension_sdk::log::event(
+        "-",
+        "whatsapp-web",
+        "pairing QR fallback (scan in Linked devices):",
+    );
+    for row in qr_rows(code) {
+        dar_extension_sdk::log::event("-", "whatsapp-web", &row);
+    }
+}
 fn adapt_markdown(text: &str) -> String {
     text.lines()
         .map(|line| {
@@ -344,6 +421,42 @@ fn adapt_markdown(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn qr_rows_are_aligned_single_lines() {
+        let rows = qr_rows("2@abc,def,ghi,jkl");
+        let width = rows[0].chars().count();
+        assert!(rows.len() > 10 && width > 20);
+        assert!(rows
+            .iter()
+            .all(|row| row.chars().count() == width && !row.contains('\n')));
+    }
+    #[test]
+    fn pairing_events_are_described() {
+        let jid: whatsapp_rust::prelude::Jid = "33612345678@s.whatsapp.net".parse().unwrap();
+        let lid: whatsapp_rust::prelude::Jid = "123@lid".parse().unwrap();
+        let success = Event::PairSuccess(
+            whatsapp_rust::types::events::PairSuccess::builder()
+                .id(jid.clone())
+                .lid(lid.clone())
+                .business_name("Sindi".into())
+                .platform("smba".into())
+                .build(),
+        );
+        assert_eq!(
+            pairing_message(&success).unwrap(),
+            "paired as 33612345678@s.whatsapp.net (Sindi, smba)"
+        );
+        let error = Event::PairError(
+            whatsapp_rust::types::events::PairError::builder()
+                .id(jid)
+                .lid(lid)
+                .business_name(String::new())
+                .platform(String::new())
+                .error("bad".into())
+                .build(),
+        );
+        assert_eq!(pairing_message(&error).unwrap(), "pairing failed: bad");
+    }
     use dar_extension_sdk::chat::{BoxFuture, ChatSession, ChatSessionParams};
     use std::sync::Arc;
     use tokio::sync::watch;
