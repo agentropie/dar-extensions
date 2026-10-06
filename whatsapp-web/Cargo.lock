@@ -2897,6 +2897,7 @@ name = "whatsapp-web"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dar-extension-sdk",
  "dar-host-api",
  "qrcode",
