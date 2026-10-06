@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **whatsapp-web:** linked-device text DMs using in-process whatsapp-rust, phone-number pairing, allowlisting, and persistent agent-local authentication. (ALG-466)
+
 ## [0.6.3] - 2026-09-30
 
 ### Fixed
