@@ -289,6 +289,11 @@ async fn process<T: Transport>(
     {
         return Ok(());
     }
+    let sender = match &inbound.phone {
+        Some(phone) => format!("phone {phone}"),
+        None => inbound.session_key.replacen('-', " ", 1),
+    };
+    dar_extension_sdk::log::event("-", "whatsapp-web", &format!("message from {sender}"));
     let _ = tokio::time::timeout(Duration::from_secs(5), transport.read()).await;
     if !sessions.contains_key(&inbound.session_key) {
         let backend_id =
@@ -421,6 +426,16 @@ fn adapt_markdown(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    fn capture(_: &str, event: &str, message: &str) {
+        EVENTS.lock().unwrap().push(format!("{event}: {message}"));
+    }
+    fn logged(message: &str) -> bool {
+        EVENTS
+            .lock()
+            .unwrap()
+            .contains(&format!("whatsapp-web: {message}"))
+    }
     #[test]
     fn qr_rows_are_aligned_single_lines() {
         let rows = qr_rows("2@abc,def,ghi,jkl");
@@ -619,6 +634,31 @@ mod tests {
         assert!(actions.contains(&"typing:true".into()));
         assert!(actions.contains(&"typing:false".into()));
         assert!(actions.contains(&"send:hello".into()));
+    }
+    #[tokio::test]
+    async fn inbound_message_is_logged_with_sender() {
+        dar_extension_sdk::log::set_event_hook(capture);
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        for (session_key, phone) in [("pn-3377", Some("3377")), ("lid-4488", None)] {
+            let inbound = Inbound {
+                session_key: session_key.into(),
+                phone: phone.map(Into::into),
+                text: "hello".into(),
+            };
+            process(
+                &ctx,
+                &Config::default(),
+                temp.path(),
+                inbound,
+                FakeTransport::default(),
+                &mut HashMap::new(),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(logged("message from phone 3377"));
+        assert!(logged("message from lid 4488"));
     }
     #[tokio::test]
     async fn unresolved_lid_is_rejected_by_allowlist() {
