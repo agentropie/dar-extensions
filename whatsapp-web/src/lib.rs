@@ -876,6 +876,13 @@ async fn process<T: Transport>(
     } else if let Some(connection) = sessions.remove(&inbound.session_key) {
         let _ = tokio::time::timeout(Duration::from_secs(2), connection.session.close()).await;
     }
+    if let Err(error) = &result {
+        dar_extension_sdk::log::event(
+            "-",
+            "whatsapp-web",
+            &format!("turn failed for {}: {error:#}", inbound.session_key),
+        );
+    }
     let reply = result.unwrap_or_else(|_| "(turn failed)".into());
     if !ctx.shutdown.is_cancelled() && !reply.trim().is_empty() {
         let id = tokio::time::timeout(
@@ -1487,6 +1494,7 @@ mod tests {
     }
     #[tokio::test]
     async fn failed_turn_cleans_session_and_replies() {
+        dar_extension_sdk::log::set_event_hook(capture);
         let temp = tempfile::tempdir().unwrap();
         let (ctx, _shutdown) = context(temp.path());
         let transport = FakeTransport::default();
@@ -1507,6 +1515,7 @@ mod tests {
         .unwrap();
         assert!(sessions.is_empty());
         assert!(notes.render("pn-3361").is_some(), "kept for retry");
+        assert!(logged("turn failed for pn-3361: failed"));
         let ok = Inbound {
             text: "hello".into(),
             ..inbound
