@@ -82,6 +82,14 @@ impl Extension for WhatsAppWebExtension {
             let db = root.join("session.db");
             let store =
                 SqliteStore::open(db.to_str().context("session store path is not UTF-8")?).await?;
+            // The library's own already-paired check runs before a stored session
+            // finishes logging in, so it would request a code on every restart.
+            let paired = store
+                .database()
+                .list_devices()
+                .await?
+                .iter()
+                .any(|device| device.linked);
             let (tx, rx) = mpsc::channel(256);
             let qr_shown = Arc::new(AtomicBool::new(false));
             let mut builder = Bot::builder()
@@ -126,7 +134,7 @@ impl Extension for WhatsAppWebExtension {
                         }
                     }
                 });
-            if let Some(phone_number) = cfg.phone_number.clone() {
+            if let Some(phone_number) = cfg.phone_number.clone().filter(|_| !paired) {
                 builder = builder.with_pair_code(PairCodeOptions {
                     phone_number,
                     ..Default::default()
