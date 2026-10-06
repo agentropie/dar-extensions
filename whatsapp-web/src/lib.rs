@@ -117,8 +117,19 @@ impl Extension for WhatsAppWebExtension {
                         &format!("pairing code request failed: {error:?}"),
                     );
                 })
+                .on_event_for(&[EventKind::Connected], |_, client| async move {
+                    dar_extension_sdk::log::event(
+                        "-",
+                        "whatsapp-web",
+                        &connected_message(client.pn().as_ref().map(|jid| jid.user_base())),
+                    );
+                })
                 .on_event_for(
-                    &[EventKind::PairSuccess, EventKind::PairError],
+                    &[
+                        EventKind::PairSuccess,
+                        EventKind::PairError,
+                        EventKind::LoggedOut,
+                    ],
                     |event, _| async move {
                         if let Some(message) = pairing_message(&event) {
                             dar_extension_sdk::log::event("-", "whatsapp-web", &message);
@@ -918,6 +929,12 @@ async fn turn(connection: &mut Connection, text: String) -> Result<String> {
     }
     bail!("backend event stream closed")
 }
+fn connected_message(phone: Option<&str>) -> String {
+    match phone {
+        Some(phone) => format!("Connected as +{phone}"),
+        None => "Connected".into(),
+    }
+}
 fn pairing_message(event: &Event) -> Option<String> {
     match event {
         Event::PairSuccess(pair) => Some(format!(
@@ -925,6 +942,10 @@ fn pairing_message(event: &Event) -> Option<String> {
             pair.id, pair.business_name, pair.platform
         )),
         Event::PairError(pair) => Some(format!("pairing failed: {}", pair.error)),
+        Event::LoggedOut(out) => Some(format!(
+            "Logged out by WhatsApp ({:?}); delete .whatsapp-web/session.db and restart to pair again",
+            out.reason
+        )),
         _ => None,
     }
 }
@@ -989,6 +1010,11 @@ mod tests {
         assert!(rows
             .iter()
             .all(|row| row.chars().count() == width && !row.contains('\n')));
+    }
+    #[test]
+    fn connected_names_own_phone() {
+        assert_eq!(connected_message(Some("3361")), "Connected as +3361");
+        assert_eq!(connected_message(None), "Connected");
     }
     #[test]
     fn pairing_events_are_described() {
