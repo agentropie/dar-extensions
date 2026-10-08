@@ -15,6 +15,7 @@ extensions:
     # backend: pi
     # sessions:
     #   idle_minutes: 1440 # optional; omitted or 0 = sessions never expire
+    #   on_message_during_turn: interrupt # or queue
     # messages: # optional replies to commands (defaults shown)
     #   stopped: "Stopped."
     #   new_session: "New session started."
@@ -36,6 +37,8 @@ Reactions never start a turn. Reactions and unaddressed group messages from allo
 Each chat (`pn-<phone>`, `lid-<id>`, `group-<id>`) has generations under `<agent>/.whatsapp-web/<chat>/<generation>/` with a `current` pointer; uploads live in the current generation. Older chat directories without generations keep working and simply start at generation 1. When a session opens, the newest archived backend session in the current generation is resumed, so a dar restart continues the conversation (backends that cannot resume start fresh). A failed turn keeps the session; it is dropped and reopened (with resume) only if the backend reports the session closed, the turn times out or `send_turn` fails.
 
 `sessions.idle_minutes` is optional and has no default. When set, a message arriving after that many idle minutes (last activity is stored on disk, so it survives restarts) starts a new generation and logs `Session <chat> expired after <n> min idle; starting fresh`; the old transcript stays on disk.
+
+`sessions.on_message_during_turn` (default `interrupt`) decides what a new message does while the chat's agent turn runs. With `interrupt`, a message that would start a turn aborts the running one (its partial reply is dropped, nothing is sent, the Logs tab says `Turn for <chat> interrupted by a new message`) and the next turn starts with `[Your previous reply was interrupted by this message]`; the backend keeps the interrupted exchange in its history. Commands, reactions and unaddressed group messages never interrupt, and `/compact` (manual or automatic) is never interrupted. With `queue`, messages wait until the running turn finishes.
 
 Chats are processed concurrently, one worker per chat, in message order. Commands must be the whole message, sent by an allowed user; in groups the agent must be @-mentioned and the rest of the text (mention removed) must be exactly the command. They never start a normal agent turn:
 

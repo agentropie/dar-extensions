@@ -36,7 +36,17 @@ struct Config {
 #[serde(default)]
 struct Sessions {
     idle_minutes: Option<u64>,
+    on_message_during_turn: DuringTurn,
 }
+/// What a new message does while the chat's agent turn is running.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum DuringTurn {
+    Queue,
+    #[default]
+    Interrupt,
+}
+const INTERRUPTED_NOTE: &str = "[Your previous reply was interrupted by this message]";
 /// Replies to the `/stop`, `/new` and `/compact` commands.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
@@ -877,6 +887,8 @@ struct Chat<T> {
     rx: mpsc::UnboundedReceiver<(Inbound, T)>,
     /// Messages that arrived during a turn and are processed after it, in order.
     deferred: VecDeque<(Inbound, T)>,
+    /// The last agent turn was aborted by a new message; the next prompt says so.
+    interrupted: bool,
 }
 /// Sends a command or turn reply; failures are logged, never fatal.
 async fn say<T: Transport>(transport: &T, text: &str) -> Option<String> {
@@ -905,6 +917,7 @@ impl<T: Transport> Chat<T> {
             notes: Notes::default(),
             rx,
             deferred: VecDeque::new(),
+            interrupted: false,
         }
     }
     async fn close_connection(&mut self) {
@@ -963,13 +976,15 @@ impl<T: Transport> Chat<T> {
         generation_dir(&chat_dir)
     }
     /// Runs one backend turn. A `/stop` arriving meanwhile aborts it; any other
-    /// message waits in `deferred`.
+    /// message waits in `deferred`, and in interrupt mode a new agent turn
+    /// aborts this one when `interruptible`.
     async fn run_turn(
         &mut self,
         cfg: &Config,
         prompt: String,
         transport: &T,
         typing: bool,
+        interruptible: bool,
     ) -> TurnOutcome {
         let Some(connection) = self.connection.as_mut() else {
             return TurnOutcome {
@@ -979,6 +994,10 @@ impl<T: Transport> Chat<T> {
         };
         let rx = &mut self.rx;
         let deferred = &mut self.deferred;
+        let key = &self.key;
+        let interrupt =
+            interruptible && cfg.sessions.on_message_during_turn == DuringTurn::Interrupt;
+        let mut interrupted = false;
         let mut rx_open = true;
         let mut stopped = false;
         if typing {
@@ -1036,7 +1055,24 @@ impl<T: Transport> Chat<T> {
                             }
                             say(&reply_to, &cfg.messages.stopped).await;
                         }
-                        Some(item) => deferred.push_back(item),
+                        Some(item) => {
+                            let starts_turn = matches!(item.0.kind, Kind::Turn)
+                                && item.0.command.is_none()
+                                && allowed(cfg, item.0.phone.as_deref(), item.0.group.as_deref());
+                            if interrupt && starts_turn && !stopped {
+                                stopped = true;
+                                interrupted = true;
+                                dar_extension_sdk::log::event(
+                                    "-",
+                                    "whatsapp-web",
+                                    &format!("Turn for {key} interrupted by a new message"),
+                                );
+                                if let Err(error) = connection.session.abort().await {
+                                    tracing::warn!(%error, "whatsapp-web abort failed");
+                                }
+                            }
+                            deferred.push_back(item);
+                        }
                     },
                     _ = tick.tick(), if typing => {
                         let _ = tokio::time::timeout(Duration::from_secs(5), transport.typing(true)).await;
@@ -1055,12 +1091,13 @@ impl<T: Transport> Chat<T> {
         if connection.closed {
             self.close_connection().await;
         }
+        self.interrupted |= interrupted;
         TurnOutcome { result, stopped }
     }
     /// Sends `/compact` as a turn and discards the backend's text.
     async fn compact(&mut self, cfg: &Config, root: &Path, transport: &T, typing: bool) -> bool {
         let outcome = self
-            .run_turn(cfg, "/compact".into(), transport, typing)
+            .run_turn(cfg, "/compact".into(), transport, typing, false)
             .await;
         let _ = touch_activity(&root.join(&self.key));
         match outcome.result {
@@ -1302,7 +1339,12 @@ async fn process<T: Transport>(
     let attachments = transport
         .attachments(&session_dir.join("uploads"), &inbound.message_id)
         .await;
-    let mut prompt = chat.notes.render(&inbound.session_key).unwrap_or_default();
+    let mut prompt = String::new();
+    if std::mem::take(&mut chat.interrupted) {
+        prompt.push_str(INTERRUPTED_NOTE);
+        prompt.push('\n');
+    }
+    prompt.push_str(&chat.notes.render(&inbound.session_key).unwrap_or_default());
     prompt.push_str(&header_text(&inbound.header, subject.as_deref()));
     if !inbound.text.is_empty() {
         prompt.push('\n');
@@ -1310,7 +1352,7 @@ async fn process<T: Transport>(
     }
     prompt.push_str(&attachment_suffix(&attachments));
     chat.ensure_open(ctx, cfg, &session_dir).await?;
-    let outcome = chat.run_turn(cfg, prompt, &transport, true).await;
+    let outcome = chat.run_turn(cfg, prompt, &transport, true, true).await;
     if outcome.result.is_ok() {
         chat.notes.pending.remove(&inbound.session_key);
     }
@@ -1372,6 +1414,7 @@ async fn run_command<T: Transport>(
             touch_activity(&chat_dir)?;
             let key = chat.key.clone();
             chat.notes.pending.remove(&key);
+            chat.interrupted = false;
             say(transport, &cfg.messages.new_session).await;
         }
         // Nothing is in flight when a stop is handled here; in-flight turns are stopped by `run_turn`.
@@ -2233,6 +2276,7 @@ mod tests {
         let cfg = Config {
             sessions: Sessions {
                 idle_minutes: Some(60),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -2281,7 +2325,10 @@ mod tests {
             let probe = Probe::default();
             let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
             let cfg = Config {
-                sessions: Sessions { idle_minutes },
+                sessions: Sessions {
+                    idle_minutes,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let transport = FakeTransport::default();
@@ -2450,13 +2497,18 @@ mod tests {
     async fn custom_messages_are_used() {
         let cfg: Config = serde_json::from_value(serde_json::json!({
             "messages": { "new_session": "Nouvelle session.", "stopped": "Arrêté." },
-            "sessions": { "idle_minutes": 30 }
+            "sessions": { "idle_minutes": 30, "on_message_during_turn": "queue" }
         }))
         .unwrap();
         assert_eq!(cfg.sessions.idle_minutes, Some(30));
+        assert_eq!(cfg.sessions.on_message_during_turn, DuringTurn::Queue);
         assert_eq!(cfg.messages.compacted, "Compacted.");
         let defaults = Config::default();
         assert_eq!(defaults.sessions.idle_minutes, None);
+        assert_eq!(
+            defaults.sessions.on_message_during_turn,
+            DuringTurn::Interrupt
+        );
         assert_eq!(defaults.messages.stopped, "Stopped.");
         assert_eq!(defaults.messages.new_session, "New session started.");
         let temp = tempfile::tempdir().unwrap();
@@ -2526,6 +2578,47 @@ mod tests {
         workers.submit(turn_in("pn-s", "hello"), transport.clone());
         wait_for("next turn", || sent_hello(&transport.0.lock().unwrap())).await;
         assert_eq!(probe.opens().len(), 1, "stop keeps the session");
+    }
+    #[tokio::test]
+    async fn new_message_interrupts_running_turn_by_default() {
+        dar_extension_sdk::log::set_event_hook(capture);
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+        let transport = FakeTransport::default();
+        let mut workers = Workers::new(ctx, Config::default(), temp.path().to_owned());
+        workers.submit(turn_in("pn-int", "slow"), transport.clone());
+        wait_for("turn start", || probe.prompts.lock().unwrap().len() == 1).await;
+        workers.submit(turn_in("pn-int", "hello"), transport.clone());
+        wait_for("next turn", || sent_hello(&transport.0.lock().unwrap())).await;
+        let prompts = probe.prompts.lock().unwrap().clone();
+        assert!(prompts[1].starts_with(INTERRUPTED_NOTE), "{prompts:?}");
+        assert_eq!(
+            sends(&transport).len(),
+            1,
+            "no partial reply, no stop reply"
+        );
+        assert!(logged("Turn for pn-int interrupted by a new message"));
+        assert_eq!(probe.opens().len(), 1, "interrupt keeps the session");
+    }
+    #[tokio::test]
+    async fn queue_mode_waits_for_running_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+        let transport = FakeTransport::default();
+        let mut cfg = Config::default();
+        cfg.sessions.on_message_during_turn = DuringTurn::Queue;
+        let mut workers = Workers::new(ctx, cfg, temp.path().to_owned());
+        workers.submit(turn_in("pn-q", "slow"), transport.clone());
+        wait_for("turn start", || probe.prompts.lock().unwrap().len() == 1).await;
+        workers.submit(turn_in("pn-q", "hello"), transport.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(probe.prompts.lock().unwrap().len(), 1, "hello waits");
+        workers.submit(command("pn-q", "3361", Command::Stop), transport.clone());
+        wait_for("queued turn", || sent_hello(&transport.0.lock().unwrap())).await;
+        let prompts = probe.prompts.lock().unwrap().clone();
+        assert!(!prompts[1].contains(INTERRUPTED_NOTE), "{prompts:?}");
     }
     #[tokio::test]
     async fn stop_when_idle_only_replies() {
