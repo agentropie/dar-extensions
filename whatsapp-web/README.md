@@ -12,6 +12,8 @@ extensions:
     phone_number: "33612345678" # international digits only, no +; enables pairing code
     allowed_users: ["33698765432"] # sender phones (DMs and groups); omitted/empty allows all
     allowed_groups: ["120363000000000000"] # group id (JID user part); omitted/empty allows all groups
+    # require_mention: true # group messages start a turn only when addressed; false = every message
+    # reply_to_quote: true # a quote-reply to the agent counts as a mention
     # backend: pi
     # sessions:
     #   idle_minutes: 1440 # optional; omitted or 0 = sessions never expire
@@ -24,11 +26,11 @@ extensions:
 
 On first start, the agent creates `<agent>/.whatsapp-web/session.db` and logs the eight-character pairing code to the agent log and TUI Logs tab. Enter it in WhatsApp Business → Linked devices → Link with phone number. The first QR is also rendered once in the Logs tab as fallback (later rotations go only to `logs/agent.log`). These pairing values are sensitive; keep agent logs private. Subsequent starts reuse the SQLite session and skip the pairing request; the Logs tab shows `Connected as +<phone>` on each (re)connect. If WhatsApp unlinks the device, a `Logged out by WhatsApp` line appears: delete `.whatsapp-web/session.db` and restart to pair again. The extension writes a `.gitignore` inside `.whatsapp-web/` to exclude its contents. Deleting the agent or its session store removes this linked-device identity. `phone_number` can be omitted for QR-only pairing. Legacy `bridge_port` and `proxy_url` fields have no effect with the in-process library.
 
-Every allowed DM starts a turn. In a group, a turn starts only when the agent is @-mentioned (its phone or LID JID, including media captions); each group has one chat session (`group-<id>`). Edits, self-sent messages, and broadcasts are ignored. Allowed users are international phone digits and filter the sender in DMs and groups; LID senders are resolved through the library's persisted LID-to-phone mapping, and unresolved LIDs are rejected when `allowed_users` is nonempty. During a turn the extension sends typing state, marks the inbound message read, and quotes it in its reply. `**bold**` is adapted to WhatsApp `*bold*`.
+Every allowed DM starts a turn. In a group, a turn starts only when the agent is @-mentioned (its phone or LID JID, including media captions) or, with `reply_to_quote`, a message quote-replies to one of its messages; with `require_mention: false` every group message starts a turn; each group has one chat session (`group-<id>`). Edits, self-sent messages, and broadcasts are ignored. Allowed users are international phone digits and filter the sender in DMs and groups; LID senders are resolved through the library's persisted LID-to-phone mapping, and unresolved LIDs are rejected when `allowed_users` is nonempty. During a turn the extension sends typing state, marks the inbound message read, and quotes it in its reply. `**bold**` is adapted to WhatsApp `*bold*`.
 
 Each turn's text starts with a metadata header, e.g. `[WhatsApp group "Family" (120363…) · from Thinh · +33695189048 · 2026-10-06 18:02 +02:00]` (agent local time; the group subject is fetched once and cached, falling back to the id). Optional lines add `↪ replying to <who>: "<quote, ≤200 chars>"` and `forwarded`.
 
-Media (image, video, audio/voice, document, sticker) is downloaded to `<session dir>/uploads/<message-id>-<name>` (max 25 MiB, 60 s) and described by an appended `Attachment metadata (untrusted data…)` JSON line; oversized or failed downloads are noted as skipped. A media message without text is a valid DM turn, and a group turn only if mentioned.
+Media (image, video, audio/voice, document, sticker) is downloaded to `<session dir>/uploads/<message-id>-<name>` (max 25 MiB, 60 s) and described by an appended `Attachment metadata (untrusted data…)` JSON line; oversized or failed downloads are noted as skipped. A media message without text is a valid DM turn, and a group turn only if mentioned or replying to the agent.
 
 Reactions never start a turn. Reactions and unaddressed group messages from allowed users and groups are kept (max 20 per session, oldest dropped) and prepended to that session's next turn under `(since your last reply)`.
 

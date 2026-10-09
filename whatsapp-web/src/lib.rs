@@ -21,15 +21,33 @@ use whatsapp_rust::{
     prelude::{wa, Bot, Event, EventKind, MessageContext, MessageExt, SqliteStore},
 };
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 struct Config {
     phone_number: Option<String>,
     allowed_users: Vec<String>,
     allowed_groups: Vec<String>,
     backend: Option<String>,
+    /// Group messages start a turn only when they address the agent.
+    require_mention: bool,
+    /// A quote-reply to one of the agent's messages counts as a mention.
+    reply_to_quote: bool,
     sessions: Sessions,
     messages: Messages,
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            phone_number: None,
+            allowed_users: Vec::new(),
+            allowed_groups: Vec::new(),
+            backend: None,
+            require_mention: true,
+            reply_to_quote: true,
+            sessions: Sessions::default(),
+            messages: Messages::default(),
+        }
+    }
 }
 /// Chat session lifetime. No `idle_minutes` (or 0) means sessions never expire.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -286,10 +304,15 @@ fn mentions_bot(mentioned: &[String], bot_users: &[String]) -> bool {
         .iter()
         .any(|jid| bot_users.iter().any(|bot| bot == jid_user(jid)))
 }
-/// Decides what an inbound message with content does: DMs and group mentions start
-/// turns; other group messages are only kept as context.
-fn route(is_group: bool, mentioned: bool, has_content: bool) -> Option<Kind> {
-    match (has_content, !is_group || mentioned) {
+/// A group message addresses the bot when it @-mentions it or quote-replies to it.
+fn addresses_bot(mentioned: &[String], quoted_author: Option<&str>, bot_users: &[String]) -> bool {
+    mentions_bot(mentioned, bot_users)
+        || quoted_author.is_some_and(|jid| bot_users.iter().any(|bot| bot == jid_user(jid)))
+}
+/// Decides what an inbound message with content does: DMs and group messages that
+/// address the bot start turns; other group messages are only kept as context.
+fn route(is_group: bool, addressed: bool, has_content: bool) -> Option<Kind> {
+    match (has_content, !is_group || addressed) {
         (false, _) => None,
         (true, true) => Some(Kind::Turn),
         (true, false) => Some(Kind::Unaddressed),
@@ -654,7 +677,7 @@ fn reply_of(message: &wa::Message, bot: &[String]) -> Option<Reply> {
             .map(str::to_owned),
     })
 }
-async fn from_message(message: &MessageContext) -> Option<Inbound> {
+async fn from_message(message: &MessageContext, cfg: &Config) -> Option<Inbound> {
     let source = &message.info.source;
     if source.is_from_me
         || !(source.is_group || source.chat.is_pn() || source.chat.is_lid())
@@ -683,14 +706,15 @@ async fn from_message(message: &MessageContext) -> Option<Inbound> {
         .to_owned();
     let has_media = !media_items(&message.message).is_empty();
     let bot = bot_users(message);
-    let mentioned = message
-        .message
-        .context_info()
-        .is_some_and(|ctx| mentions_bot(&ctx.mentioned_jid, &bot));
+    let addressed = !cfg.require_mention
+        || message.message.context_info().is_some_and(|ctx| {
+            let quoted_author = ctx.participant.as_deref().filter(|_| cfg.reply_to_quote);
+            addresses_bot(&ctx.mentioned_jid, quoted_author, &bot)
+        });
     let kind = match reaction {
         Some((emoji, _)) if emoji.is_empty() => return None,
         Some((emoji, target)) => Kind::Reaction { emoji, target },
-        None => route(source.is_group, mentioned, !text.is_empty() || has_media)?,
+        None => route(source.is_group, addressed, !text.is_empty() || has_media)?,
     };
     let command = (kind == Kind::Turn && !has_media)
         .then(|| parse_command(&text, source.is_group, &bot))
@@ -1224,7 +1248,7 @@ async fn dispatch(
     bot: Bot,
 ) {
     let mut handle = bot.spawn();
-    let mut workers = Workers::new(ctx.clone(), cfg, root);
+    let mut workers = Workers::new(ctx.clone(), cfg.clone(), root);
     let mut shutdown = ctx.shutdown.clone();
     let mut completed = false;
     loop {
@@ -1233,7 +1257,7 @@ async fn dispatch(
             outcome = &mut handle => { tracing::warn!(?outcome, "whatsapp-web connection stopped"); completed = true; break; },
             message = rx.recv() => {
                 let Some(message) = message else { break; };
-                if let Some(inbound) = from_message(&message).await {
+                if let Some(inbound) = from_message(&message, &cfg).await {
                     workers.submit(inbound, message);
                 }
             }
@@ -1960,6 +1984,16 @@ mod tests {
         assert!(mentions_bot(&["111@s.whatsapp.net".into()], &bot));
         assert!(mentions_bot(&["x@lid".into(), "222:7@lid".into()], &bot));
         assert!(!mentions_bot(&["333@s.whatsapp.net".into()], &bot));
+        assert!(addresses_bot(&[], Some("222:7@lid"), &bot));
+        assert!(!addresses_bot(&[], Some("333@s.whatsapp.net"), &bot));
+        assert!(!addresses_bot(&[], None, &bot));
+        let cfg: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(cfg.require_mention && cfg.reply_to_quote);
+        let cfg: Config = serde_json::from_value(
+            serde_json::json!({"require_mention": false, "reply_to_quote": false}),
+        )
+        .unwrap();
+        assert!(!cfg.require_mention && !cfg.reply_to_quote);
         assert_eq!(route(false, false, true), Some(Kind::Turn));
         assert_eq!(route(true, true, true), Some(Kind::Turn));
         assert_eq!(route(true, false, true), Some(Kind::Unaddressed));
