@@ -37,7 +37,7 @@ struct Config {
     /// A quote-reply to one of the agent's messages counts as a mention.
     reply_to_quote: bool,
     /// Send the assistant's text before each tool call as its own message
-    /// instead of one reply when the turn ends.
+    /// instead of one reply when the turn ends. Off by default.
     stream_replies: bool,
     sessions: Sessions,
     messages: Messages,
@@ -51,7 +51,7 @@ impl Default for Config {
             backend: None,
             require_mention: true,
             reply_to_quote: true,
-            stream_replies: true,
+            stream_replies: false,
             sessions: Sessions::default(),
             messages: Messages::default(),
         }
@@ -991,7 +991,7 @@ struct TurnOutcome {
     timed_out: bool,
     /// The turn ended `NO_REPLY` (or loop-guard blocked): deliver nothing more.
     silent: bool,
-    /// Text of a failed turn that was never sent.
+    /// Text never sent when the turn timed out (earlier failed sends included).
     partial: String,
     /// Replies already sent mid-turn (message id, text).
     flushed: Vec<(String, String)>,
@@ -1148,7 +1148,13 @@ impl<T: Transport> Chat<T> {
         let mut interrupted = false;
         let mut rx_open = true;
         let mut stopped = false;
+        // Reply text lives here, outside the cancellable turn future, so a turn
+        // deadline or a failed send never loses it. `reply` is the text since the
+        // last tool call, `unsent` holds cut segments awaiting an acknowledged
+        // send (the front one is in flight), `failed` segments whose send failed.
         let mut reply = String::new();
+        let mut unsent: VecDeque<String> = VecDeque::new();
+        let mut failed: Vec<String> = Vec::new();
         let mut silent = false;
         let mut flushed: Vec<(String, String)> = Vec::new();
         let mut artifacts: Vec<ArtifactReady> = Vec::new();
@@ -1166,15 +1172,48 @@ impl<T: Transport> Chat<T> {
                 connection.closed = true;
                 return Err(error);
             }
+            // A mid-turn send runs here beside the event/control branches, so a slow
+            // send never delays `/stop` or an interrupt.
+            let mut in_flight: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + '_>>> = None;
+            let mut done: Option<Result<()>> = None;
             loop {
+                if in_flight.is_none() {
+                    if let Some(text) = unsent.front().cloned() {
+                        in_flight = Some(Box::pin(async move {
+                            let id = say(transport, &text).await;
+                            if id.is_some() && typing {
+                                let _ = tokio::time::timeout(Duration::from_secs(5), transport.typing(true)).await;
+                            }
+                            id
+                        }));
+                    }
+                }
+                // The backend finished: leave only once every mid-turn message is
+                // acknowledged or failed, so the final reply cannot overtake them.
+                if in_flight.is_none() && unsent.is_empty() {
+                    if let Some(result) = done.take() {
+                        return result;
+                    }
+                }
                 tokio::select! {
-                    event = connection.events.recv() => {
+                    sent = async { in_flight.as_mut().expect("guarded").await }, if in_flight.is_some() => {
+                        in_flight = None;
+                        if let Some(text) = unsent.pop_front() {
+                            match sent {
+                                Some(id) => flushed.push((id, text)),
+                                None => failed.push(text),
+                            }
+                        }
+                    }
+                    event = connection.events.recv(), if done.is_none() => {
                         let Some(event) = event else {
                             connection.closed = true;
                             bail!("backend event stream closed")
                         };
                         match event {
-                            ChatEvent::Delta { role: ChatRole::Assistant, text } if !silent => {
+                            // Once stopped or interrupted nothing more is buffered: the
+                            // backend may still deliver events it queued before the abort.
+                            ChatEvent::Delta { role: ChatRole::Assistant, text } if !silent && !stopped => {
                                 reply.push_str(&text)
                             }
                             ChatEvent::Silent { .. } => {
@@ -1183,20 +1222,15 @@ impl<T: Transport> Chat<T> {
                             }
                             // Text before a tool call is sent now, so the chat is not silent
                             // through a long tool run. Whatever follows is the final reply.
-                            ChatEvent::ToolCall { .. } if stream && !silent => {
+                            ChatEvent::ToolCall { .. } if stream && !silent && !stopped => {
                                 if let Some(text) = take_flushable(&mut reply) {
-                                    if let Some(id) = say(transport, &text).await {
-                                        flushed.push((id, text));
-                                    }
-                                    if typing {
-                                        let _ = tokio::time::timeout(Duration::from_secs(5), transport.typing(true)).await;
-                                    }
+                                    unsent.push_back(text);
                                 }
                             }
                             ChatEvent::ContextUsage { tokens_used, context_window } => {
                                 connection.record_usage(tokens_used, context_window)
                             }
-                            ChatEvent::TurnFinished { ok: true, .. } => return Ok(()),
+                            ChatEvent::TurnFinished { ok: true, .. } => done = Some(Ok(())),
                             ChatEvent::TurnFinished { error, .. } => {
                                 bail!("{}", error.unwrap_or_else(|| "backend failed".into()))
                             }
@@ -1218,6 +1252,10 @@ impl<T: Transport> Chat<T> {
                                 && allowed(cfg, inbound.phone.as_deref(), inbound.group.as_deref()) =>
                         {
                             stopped = true;
+                            reply.clear();
+                            unsent.clear();
+                            failed.clear();
+                            in_flight = None;
                             if let Err(error) = connection.session.abort().await {
                                 tracing::warn!(%error, "whatsapp-web abort failed");
                             }
@@ -1230,6 +1268,10 @@ impl<T: Transport> Chat<T> {
                             if interrupt && starts_turn && !stopped {
                                 stopped = true;
                                 interrupted = true;
+                                reply.clear();
+                                unsent.clear();
+                                failed.clear();
+                                in_flight = None;
                                 dar_extension_sdk::log::event(
                                     "-",
                                     "whatsapp-web",
@@ -1265,12 +1307,23 @@ impl<T: Transport> Chat<T> {
             self.close_connection().await;
         }
         self.interrupted |= interrupted;
+        // Whatever never got an acknowledged send, in order. A silent turn
+        // delivers nothing more, so failed earlier segments are not retried.
+        let leftover = if silent {
+            String::new()
+        } else {
+            failed
+                .into_iter()
+                .chain(unsent)
+                .chain(std::iter::once(std::mem::take(&mut reply)))
+                .collect::<String>()
+        };
         TurnOutcome {
-            result: result.map(|()| std::mem::take(&mut reply)),
+            result: result.map(|()| leftover.clone()),
             stopped,
             timed_out,
             silent,
-            partial: reply,
+            partial: leftover,
             flushed,
             artifacts,
         }
@@ -1564,10 +1617,11 @@ async fn process<T: Transport>(
         if !reply.trim().is_empty() {
             send_text(chat, &transport, &reply).await?;
         }
-        if outcome.timed_out && !cfg.messages.timeout.trim().is_empty() {
-            say(&transport, &cfg.messages.timeout).await;
-        }
-        if deliverable {
+        // A failed timeout notice counts as a failed reply, like a failed final send.
+        let notice_ok = !outcome.timed_out
+            || cfg.messages.timeout.trim().is_empty()
+            || say(&transport, &cfg.messages.timeout).await.is_some();
+        if deliverable && notice_ok {
             deliver_artifacts(ctx, cfg, &transport, &outcome.artifacts).await;
         }
     }
@@ -1657,8 +1711,19 @@ async fn deliver_artifacts<T: Transport>(
         }
         let claim = match store.claim_delivery(artifact.id, target.clone()) {
             Ok(DeliveryClaimResult::Claimed(claim)) => claim,
-            Ok(DeliveryClaimResult::Delivered(_) | DeliveryClaimResult::InProgress) | Err(_) => {
-                continue
+            // Already sent to this chat, or being sent: stay quiet.
+            Ok(DeliveryClaimResult::Delivered(_) | DeliveryClaimResult::InProgress) => continue,
+            Err(error) => {
+                dar_extension_sdk::log::event(
+                    "-",
+                    "whatsapp-web",
+                    &format!(
+                        "Artifact delivery failed for {}: could not claim delivery: {error}",
+                        transport.chat_id()
+                    ),
+                );
+                say(transport, &cfg.messages.artifact_failed).await;
+                continue;
             }
         };
         let sent = match verified_artifact(&store, artifact.id) {
@@ -1857,6 +1922,7 @@ mod tests {
         opens: Arc<Mutex<Vec<Option<String>>>>,
         prompts: Arc<Mutex<Vec<String>>>,
         closes: Arc<Mutex<usize>>,
+        aborts: Arc<Mutex<usize>>,
         /// Artifacts the backend publishes on a prompt ending in `publish`.
         publish: Arc<Mutex<Vec<ArtifactReady>>>,
     }
@@ -1967,7 +2033,44 @@ mod tests {
                         },
                         finished(),
                     ]),
-                    "partialstall" => Some(vec![scripted("partial")]),
+                    "partialstall" | "stallpublish" => Some(vec![scripted("partial")]),
+                    "toolstall" => Some(vec![scripted("Checking."), tool()]),
+                    "toolsfinal" => Some(vec![scripted("Checking."), tool(), finished()]),
+                    "toolspublish" => Some(vec![
+                        scripted("Checking. "),
+                        tool(),
+                        scripted("Done."),
+                        finished(),
+                    ]),
+                    // Events the backend queues after it was told to abort.
+                    "stopqueued" | "toolhold" => {
+                        let word = prompt
+                            .rsplit(char::is_whitespace)
+                            .next()
+                            .unwrap_or_default();
+                        let (events, abort) = (self.events.clone(), self.abort.clone());
+                        let slow = word == "toolhold";
+                        tokio::spawn(async move {
+                            let first = if slow { "Checking." } else { "before " };
+                            let _ = events.send(scripted(first)).await;
+                            if slow {
+                                let _ = events.send(tool()).await;
+                            }
+                            abort.notified().await;
+                            for event in [scripted("late"), tool(), scripted("later")] {
+                                let _ = events.send(event).await;
+                            }
+                            // Room for any (wrong) mid-turn send to complete first.
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                            let _ = events
+                                .send(ChatEvent::TurnFinished {
+                                    ok: false,
+                                    error: Some("aborted".into()),
+                                })
+                                .await;
+                        });
+                        return Ok(());
+                    }
                     "publishsilent" => Some(vec![
                         ChatEvent::Silent {
                             reason: None,
@@ -1977,7 +2080,10 @@ mod tests {
                     ]),
                     _ => None,
                 };
-                if prompt.ends_with("publish") || prompt.ends_with("publishsilent") {
+                if ["publish", "publishsilent", "stallpublish", "toolspublish"]
+                    .iter()
+                    .any(|word| prompt.ends_with(word))
+                {
                     let ready = self.probe.publish.lock().unwrap().clone();
                     for artifact in ready {
                         if let Some(sink) = &self.artifacts {
@@ -2062,6 +2168,7 @@ mod tests {
             })
         }
         fn abort(&mut self) -> BoxFuture<'_, Result<()>> {
+            *self.probe.aborts.lock().unwrap() += 1;
             self.abort.notify_one();
             Box::pin(async { Ok(()) })
         }
@@ -2156,6 +2263,54 @@ mod tests {
         }
         async fn send(&self, _: String) -> Result<String> {
             std::future::pending().await
+        }
+        async fn group_subject(&self) -> Option<String> {
+            None
+        }
+        async fn attachments(&self, _: &Path, _: &str) -> Vec<Attachment> {
+            Vec::new()
+        }
+    }
+    #[derive(Clone, Copy)]
+    enum Send {
+        Ok,
+        Fail,
+        Hang,
+    }
+    /// Text sends follow `plan` in order (then succeed); everything else is `FakeTransport`.
+    #[derive(Clone)]
+    struct PlanTransport {
+        inner: FakeTransport,
+        plan: Arc<Mutex<VecDeque<Send>>>,
+    }
+    impl PlanTransport {
+        fn new(plan: &[Send]) -> Self {
+            Self {
+                inner: FakeTransport::default(),
+                plan: Arc::new(Mutex::new(plan.iter().copied().collect())),
+            }
+        }
+    }
+    impl Transport for PlanTransport {
+        fn chat_id(&self) -> String {
+            self.inner.chat_id()
+        }
+        async fn send_file(&self, file: OutFile) -> Result<String> {
+            self.inner.send_file(file).await
+        }
+        async fn read(&self) -> Result<()> {
+            self.inner.read().await
+        }
+        async fn typing(&self, active: bool) -> Result<()> {
+            self.inner.typing(active).await
+        }
+        async fn send(&self, text: String) -> Result<String> {
+            let step = self.plan.lock().unwrap().pop_front().unwrap_or(Send::Ok);
+            match step {
+                Send::Ok => self.inner.send(text).await,
+                Send::Fail => bail!("network down"),
+                Send::Hang => std::future::pending().await,
+            }
         }
         async fn group_subject(&self) -> Option<String> {
             None
@@ -3245,6 +3400,13 @@ mod tests {
         };
         (store, ready)
     }
+    /// Streaming is off by default; these tests opt in.
+    fn streaming() -> Config {
+        Config {
+            stream_replies: true,
+            ..Default::default()
+        }
+    }
     fn actions(transport: &FakeTransport) -> Vec<String> {
         transport.0.lock().unwrap().clone()
     }
@@ -3257,7 +3419,7 @@ mod tests {
         run(
             &mut chat,
             &ctx,
-            &Config::default(),
+            &streaming(),
             temp.path(),
             turn_in("pn-3361", "tools"),
             &transport,
@@ -3269,7 +3431,7 @@ mod tests {
     async fn stream_replies_off_sends_one_reply_at_turn_end() {
         let cfg: Config =
             serde_json::from_value(serde_json::json!({ "stream_replies": false })).unwrap();
-        assert!(Config::default().stream_replies);
+        assert!(!Config::default().stream_replies);
         let temp = tempfile::tempdir().unwrap();
         let (ctx, _shutdown) = context(temp.path());
         let transport = FakeTransport::default();
@@ -3294,7 +3456,7 @@ mod tests {
         run(
             &mut chat,
             &ctx,
-            &Config::default(),
+            &streaming(),
             temp.path(),
             turn_in("pn-3361", "toolnoreply"),
             &transport,
@@ -3311,27 +3473,51 @@ mod tests {
         run(
             &mut chat,
             &ctx,
-            &Config::default(),
+            &streaming(),
             temp.path(),
             turn_in("pn-3361", "toolsilent"),
             &transport,
         )
         .await;
         assert_eq!(sends(&transport), vec!["send:Checking."]);
+    }
+    #[tokio::test]
+    async fn old_config_keeps_one_reply_and_full_silence() {
+        // A config written before streaming existed: none of the new keys.
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "phone_number": "33612345678",
+            "allowed_users": ["3361"],
+            "sessions": { "idle_minutes": 60, "on_message_during_turn": "queue" },
+            "messages": { "stopped": "Arrêté." }
+        }))
+        .unwrap();
+        assert!(!cfg.stream_replies);
+        assert!(!Config::default().stream_replies);
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let mut chat = new_chat("pn-3361");
+        let one = FakeTransport::default();
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-3361", "tools"),
+            &one,
+        )
+        .await;
+        assert_eq!(sends(&one), vec!["send:Checking. Done."]);
         let quiet = FakeTransport::default();
         run(
             &mut chat,
             &ctx,
-            &Config {
-                stream_replies: false,
-                ..Default::default()
-            },
+            &cfg,
             temp.path(),
             turn_in("pn-3361", "toolsilent"),
             &quiet,
         )
         .await;
-        assert!(sends(&quiet).is_empty(), "nothing leaks when not streaming");
+        assert!(sends(&quiet).is_empty(), "silent turn leaks nothing");
     }
     #[tokio::test(start_paused = true)]
     async fn timeout_sends_partial_text_then_configured_message() {
@@ -3507,6 +3693,235 @@ mod tests {
         )
         .await;
         assert!(actions(&transport).iter().all(|a| !a.starts_with("file:")));
+    }
+
+    #[tokio::test]
+    async fn stop_discards_text_and_tool_calls_the_backend_queued_before_the_abort() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+        let transport = FakeTransport::default();
+        let mut workers = Workers::new(ctx, streaming(), temp.path().to_owned());
+        workers.submit(turn_in("pn-s", "stopqueued"), transport.clone());
+        wait_for("turn start", || probe.prompts.lock().unwrap().len() == 1).await;
+        workers.submit(command("pn-s", "3361", Command::Stop), transport.clone());
+        wait_for("stop reply", || sends(&transport) == ["send:Stopped."]).await;
+        wait_for("turn end", || {
+            actions(&transport).contains(&"typing:false".to_owned())
+        })
+        .await;
+        assert_eq!(sends(&transport), vec!["send:Stopped."]);
+    }
+    #[tokio::test]
+    async fn interrupt_discards_text_and_tool_calls_the_backend_queued_before_the_abort() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+        let transport = FakeTransport::default();
+        let mut workers = Workers::new(ctx, streaming(), temp.path().to_owned());
+        workers.submit(turn_in("pn-i", "stopqueued"), transport.clone());
+        wait_for("turn start", || probe.prompts.lock().unwrap().len() == 1).await;
+        workers.submit(turn_in("pn-i", "hello"), transport.clone());
+        wait_for("next turn", || sent_hello(&actions(&transport))).await;
+        let sent = sends(&transport);
+        assert_eq!(sent.len(), 1, "only the new turn replies: {sent:?}");
+    }
+    #[tokio::test]
+    async fn failed_flush_is_resent_with_the_final_reply() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = PlanTransport::new(&[Send::Fail]);
+        let mut chat = new_chat("pn-3361");
+        run(
+            &mut chat,
+            &ctx,
+            &streaming(),
+            temp.path(),
+            turn_in("pn-3361", "tools"),
+            &transport,
+        )
+        .await;
+        assert_eq!(sends(&transport.inner), vec!["send:Checking. Done."]);
+    }
+    #[tokio::test]
+    async fn failed_flush_with_no_later_text_still_delivers_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = PlanTransport::new(&[Send::Fail]);
+        let mut chat = new_chat("pn-3361");
+        run(
+            &mut chat,
+            &ctx,
+            &streaming(),
+            temp.path(),
+            turn_in("pn-3361", "toolsfinal"),
+            &transport,
+        )
+        .await;
+        assert_eq!(sends(&transport.inner), vec!["send:Checking."]);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn deadline_during_a_flush_keeps_the_text_for_the_timeout_reply() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "stream_replies": true,
+            "sessions": { "turn_timeout_secs": 7 },
+            "messages": { "timeout": "Trop long." }
+        }))
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = PlanTransport::new(&[Send::Hang]);
+        let mut chat = new_chat("pn-3361");
+        let started = tokio::time::Instant::now();
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-3361", "toolstall"),
+            &transport,
+        )
+        .await;
+        assert_eq!(started.elapsed(), Duration::from_secs(7));
+        assert_eq!(
+            sends(&transport.inner),
+            vec!["send:Checking.", "send:Trop long."]
+        );
+    }
+    #[tokio::test]
+    async fn failed_flush_and_final_send_withhold_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, ready) = published_artifact(temp.path(), "report.txt");
+        let probe = Probe::default();
+        probe.publish.lock().unwrap().push(ready);
+        let (ctx, _shutdown) = context_with_store(temp.path(), probe, Some(store));
+        let transport = PlanTransport::new(&[Send::Fail, Send::Fail]);
+        let mut chat = new_chat("pn-3361");
+        let result = process(
+            &mut chat,
+            &ctx,
+            &streaming(),
+            temp.path(),
+            turn_in("pn-3361", "toolspublish"),
+            transport.clone(),
+        )
+        .await;
+        assert!(result.is_err(), "the failed reply is reported");
+        let all = actions(&transport.inner);
+        assert!(all.iter().all(|a| !a.starts_with("file:")), "{all:?}");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn failed_timeout_notice_withholds_artifacts() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "sessions": { "turn_timeout_secs": 7 }
+        }))
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (store, ready) = published_artifact(temp.path(), "report.txt");
+        let probe = Probe::default();
+        probe.publish.lock().unwrap().push(ready);
+        let (ctx, _shutdown) = context_with_store(temp.path(), probe, Some(store));
+        // The partial text goes out; the timeout notice fails.
+        let transport = PlanTransport::new(&[Send::Ok, Send::Fail]);
+        let mut chat = new_chat("pn-3361");
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-3361", "stallpublish"),
+            &transport,
+        )
+        .await;
+        let all = actions(&transport.inner);
+        assert_eq!(sends(&transport.inner), vec!["send:partial"]);
+        assert!(all.iter().all(|a| !a.starts_with("file:")), "{all:?}");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn hanging_flush_does_not_delay_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+        let turn_transport = PlanTransport::new(&[Send::Hang]);
+        let stop_transport = PlanTransport::new(&[]);
+        let mut workers = Workers::new(ctx, streaming(), temp.path().to_owned());
+        workers.submit(turn_in("pn-s", "toolhold"), turn_transport.clone());
+        wait_for("turn start", || probe.prompts.lock().unwrap().len() == 1).await;
+        // Let the flush start and hang.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            turn_transport.plan.lock().unwrap().is_empty(),
+            "flush in flight"
+        );
+        let stopped_at = tokio::time::Instant::now();
+        workers.submit(
+            command("pn-s", "3361", Command::Stop),
+            stop_transport.clone(),
+        );
+        wait_for("backend abort", || *probe.aborts.lock().unwrap() == 1).await;
+        assert!(
+            stopped_at.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            stopped_at.elapsed()
+        );
+        wait_for("stop reply", || {
+            sends(&stop_transport.inner) == ["send:Stopped."]
+        })
+        .await;
+        assert!(sends(&turn_transport.inner).is_empty());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn hanging_flush_does_not_delay_interrupt() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let (ctx, _shutdown) = context_with(temp.path(), probe.clone());
+        let turn_transport = PlanTransport::new(&[Send::Hang]);
+        let next_transport = PlanTransport::new(&[]);
+        let mut workers = Workers::new(ctx, streaming(), temp.path().to_owned());
+        workers.submit(turn_in("pn-i", "toolhold"), turn_transport.clone());
+        wait_for("turn start", || probe.prompts.lock().unwrap().len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let at = tokio::time::Instant::now();
+        workers.submit(turn_in("pn-i", "hello"), next_transport.clone());
+        wait_for("backend abort", || *probe.aborts.lock().unwrap() == 1).await;
+        assert!(at.elapsed() < Duration::from_secs(5), "{:?}", at.elapsed());
+        wait_for("next turn", || sent_hello(&actions(&next_transport.inner))).await;
+    }
+    #[tokio::test]
+    async fn broken_delivery_state_notifies_chat_and_logs() {
+        dar_extension_sdk::log::set_event_hook(capture);
+        let temp = tempfile::tempdir().unwrap();
+        let (store, ready) = published_artifact(temp.path(), "report.txt");
+        std::fs::write(
+            temp.path()
+                .join("vault")
+                .join(ready.id.to_string())
+                .join("deliveries.json"),
+            "not json",
+        )
+        .unwrap();
+        let probe = Probe::default();
+        probe.publish.lock().unwrap().push(ready);
+        let (ctx, _shutdown) = context_with_store(temp.path(), probe, Some(store));
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-3361");
+        run(
+            &mut chat,
+            &ctx,
+            &Config::default(),
+            temp.path(),
+            turn_in("pn-3361", "x publish"),
+            &transport,
+        )
+        .await;
+        let all = actions(&transport);
+        assert!(all.iter().all(|a| !a.starts_with("file:")), "{all:?}");
+        assert_eq!(
+            sends(&transport).last().map(String::as_str),
+            Some("send:I couldn't send the generated file.")
+        );
+        assert!(EVENTS.lock().unwrap().iter().any(|e| e
+            .starts_with("whatsapp-web: Artifact delivery failed for chat@g.us: could not claim")));
     }
     #[test]
     fn only_common_image_types_go_inline() {

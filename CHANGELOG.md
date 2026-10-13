@@ -4,7 +4,7 @@
 
 ### Added
 
-- **whatsapp-web:** assistant text before each tool call is sent as its own message instead of waiting for the turn to end (`stream_replies`, default true). (ALG-476)
+- **whatsapp-web:** assistant text before each tool call is sent as its own message instead of waiting for the turn to end, when `stream_replies: true` (opt-in; default false keeps one reply per turn). (ALG-476)
 - **whatsapp-web:** configurable turn limit `sessions.turn_timeout_secs` (default 300); on timeout unsent partial text and `messages.timeout` are sent instead of a bare `(turn failed)`. (ALG-476)
 - **whatsapp-web:** files published with `artifact_publish` are delivered to the chat as WhatsApp documents (images for JPEG/PNG/WebP), with `messages.artifact_failed` on upload failure. (ALG-476)
 
