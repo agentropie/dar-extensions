@@ -1,12 +1,14 @@
 //! Inbound-only WhatsApp linked-device channel.
 use anyhow::{bail, Context, Result};
 use dar_extension_sdk::{
-    chat::{ChatBackend, ChatEvent, ChatRole},
+    artifacts::{ArtifactDeliveryTarget, ArtifactStore, DeliveryClaimResult},
+    chat::{is_no_reply, ArtifactReady, ChatBackend, ChatEvent, ChatRole},
     ConfigStore, Extension, RegisterCtx, StartCtx,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
+    io::Read,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -16,9 +18,11 @@ use std::{
 };
 use tokio::{sync::mpsc, task::JoinSet};
 use whatsapp_rust::{
-    download::Downloadable,
+    download::{Downloadable, MediaType},
+    media::{self, DocumentOptions, ImageOptions},
     pair_code::PairCodeOptions,
     prelude::{wa, Bot, Event, EventKind, MessageContext, MessageExt, SqliteStore},
+    UploadOptions,
 };
 
 #[derive(Clone, Debug, Deserialize)]
@@ -32,6 +36,9 @@ struct Config {
     require_mention: bool,
     /// A quote-reply to one of the agent's messages counts as a mention.
     reply_to_quote: bool,
+    /// Send the assistant's text before each tool call as its own message
+    /// instead of one reply when the turn ends.
+    stream_replies: bool,
     sessions: Sessions,
     messages: Messages,
 }
@@ -44,18 +51,31 @@ impl Default for Config {
             backend: None,
             require_mention: true,
             reply_to_quote: true,
+            stream_replies: true,
             sessions: Sessions::default(),
             messages: Messages::default(),
         }
     }
 }
 /// Chat session lifetime. No `idle_minutes` (or 0) means sessions never expire.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 struct Sessions {
     idle_minutes: Option<u64>,
     on_message_during_turn: DuringTurn,
+    /// Longest an agent turn may run before it is aborted.
+    turn_timeout_secs: u64,
 }
+impl Default for Sessions {
+    fn default() -> Self {
+        Self {
+            idle_minutes: None,
+            on_message_during_turn: DuringTurn::default(),
+            turn_timeout_secs: DEFAULT_TURN_TIMEOUT_SECS,
+        }
+    }
+}
+const DEFAULT_TURN_TIMEOUT_SECS: u64 = 300;
 /// What a new message does while the chat's agent turn is running.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -65,13 +85,16 @@ enum DuringTurn {
     Interrupt,
 }
 const INTERRUPTED_NOTE: &str = "[Your previous reply was interrupted by this message]";
-/// Replies to the `/stop`, `/new` and `/compact` commands.
+/// Replies to the `/stop`, `/new` and `/compact` commands, a timed-out turn and
+/// a file that could not be delivered.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 struct Messages {
     stopped: String,
     new_session: String,
     compacted: String,
+    timeout: String,
+    artifact_failed: String,
 }
 impl Default for Messages {
     fn default() -> Self {
@@ -79,6 +102,10 @@ impl Default for Messages {
             stopped: "Stopped.".into(),
             new_session: "New session started.".into(),
             compacted: "Compacted.".into(),
+            timeout:
+                "This took too long and was stopped. Please try again or ask for something simpler."
+                    .into(),
+            artifact_failed: "I couldn't send the generated file.".into(),
         }
     }
 }
@@ -102,6 +129,9 @@ fn parse(config: &ConfigStore) -> Result<Config> {
         .any(|group| group.is_empty() || !group.bytes().all(|c| c.is_ascii_digit() || c == b'-'))
     {
         bail!("whatsapp-web allowed_groups must contain group id digits only");
+    }
+    if cfg.sessions.turn_timeout_secs == 0 {
+        bail!("whatsapp-web sessions.turn_timeout_secs must be greater than 0");
     }
     Ok(cfg)
 }
@@ -759,11 +789,26 @@ async fn from_message(message: &MessageContext, cfg: &Config) -> Option<Inbound>
         text,
     })
 }
+/// A file to send to a chat.
+struct OutFile {
+    name: String,
+    mime: Option<String>,
+    caption: Option<String>,
+    bytes: Vec<u8>,
+}
+/// Image types WhatsApp shows inline; everything else goes as a document.
+fn sends_as_image(mime: Option<&str>) -> bool {
+    matches!(mime, Some("image/jpeg" | "image/png" | "image/webp"))
+}
 trait Transport: Clone + Send + Sync + 'static {
     fn read(&self) -> impl std::future::Future<Output = Result<()>> + Send;
     fn typing(&self, active: bool) -> impl std::future::Future<Output = Result<()>> + Send;
     /// Sends a reply quoting the inbound message and returns the sent message id.
     fn send(&self, text: String) -> impl std::future::Future<Output = Result<String>> + Send;
+    /// The chat replies go to; identifies the artifact delivery destination.
+    fn chat_id(&self) -> String;
+    /// Sends a file to the chat, quoting the inbound message, and returns the sent message id.
+    fn send_file(&self, file: OutFile) -> impl std::future::Future<Output = Result<String>> + Send;
     fn group_subject(&self) -> impl std::future::Future<Output = Option<String>> + Send;
     /// Downloads inbound media into `uploads`; failures become skipped entries.
     fn attachments(
@@ -788,6 +833,44 @@ impl Transport for MessageContext {
     }
     async fn send(&self, text: String) -> Result<String> {
         Ok(self.reply_quoting(text).await?.message_id.to_string())
+    }
+    fn chat_id(&self) -> String {
+        self.info.source.chat.to_string()
+    }
+    async fn send_file(&self, file: OutFile) -> Result<String> {
+        let context = Box::new(self.build_quote_context());
+        let image = sends_as_image(file.mime.as_deref());
+        let media_type = if image {
+            MediaType::Image
+        } else {
+            MediaType::Document
+        };
+        let upload = self
+            .client
+            .upload(file.bytes, media_type, UploadOptions::new())
+            .await?;
+        let message = if image {
+            let mut options = ImageOptions::default().with_context_info(context);
+            if let Some(mime) = file.mime {
+                options = options.with_mimetype(mime);
+            }
+            if let Some(caption) = file.caption {
+                options = options.with_caption(caption);
+            }
+            media::image_message(upload, options)
+        } else {
+            let mut options = DocumentOptions::default()
+                .with_file_name(file.name)
+                .with_context_info(context);
+            if let Some(mime) = file.mime {
+                options = options.with_mimetype(mime);
+            }
+            if let Some(caption) = file.caption {
+                options = options.with_caption(caption);
+            }
+            media::document_message(upload, options)
+        };
+        Ok(self.send_message(message).await?.message_id.to_string())
     }
     async fn group_subject(&self) -> Option<String> {
         let metadata = self
@@ -867,6 +950,8 @@ fn over_compact_threshold(tokens_used: u64, context_window: u64) -> bool {
 struct Connection {
     session: Box<dyn dar_extension_sdk::chat::ChatSession>,
     events: mpsc::Receiver<ChatEvent>,
+    /// Published `artifact_publish` files, delivered after the turn's reply.
+    artifacts: mpsc::Receiver<ArtifactReady>,
     usage: Option<(u64, u64)>,
     /// Auto-compaction may fire; cleared when it fires, set by a later usage below the threshold.
     armed: bool,
@@ -900,8 +985,44 @@ impl Connection {
     }
 }
 struct TurnOutcome {
+    /// The reply text not yet sent, or why the turn failed.
     result: Result<String>,
     stopped: bool,
+    timed_out: bool,
+    /// The turn ended `NO_REPLY` (or loop-guard blocked): deliver nothing more.
+    silent: bool,
+    /// Text of a failed turn that was never sent.
+    partial: String,
+    /// Replies already sent mid-turn (message id, text).
+    flushed: Vec<(String, String)>,
+    artifacts: Vec<ArtifactReady>,
+}
+impl TurnOutcome {
+    fn failed(error: anyhow::Error) -> Self {
+        Self {
+            result: Err(error),
+            stopped: false,
+            timed_out: false,
+            silent: false,
+            partial: String::new(),
+            flushed: Vec::new(),
+            artifacts: Vec::new(),
+        }
+    }
+}
+/// Takes the buffered reply for a mid-turn message; whitespace and a lone
+/// `NO_REPLY` are not worth sending.
+fn take_flushable(reply: &mut String) -> Option<String> {
+    if reply.trim().is_empty() {
+        return None;
+    }
+    let text = std::mem::take(reply);
+    (!is_no_reply(&text)).then_some(text)
+}
+fn push_artifact(artifacts: &mut Vec<ArtifactReady>, artifact: ArtifactReady) {
+    if !artifacts.iter().any(|existing| existing.id == artifact.id) {
+        artifacts.push(artifact);
+    }
 }
 /// State of one chat, owned by that chat's worker task.
 struct Chat<T> {
@@ -962,7 +1083,9 @@ impl<T: Transport> Chat<T> {
             .get::<dyn ChatBackend>(&backend_id)
             .with_context(|| format!("chat backend '{backend_id}' not registered"))?;
         let (tx, events) = mpsc::channel(256);
+        let (artifact_tx, artifacts) = mpsc::channel(32);
         let params = dar_extension_sdk::chat::agent_session_params(ctx, dir)
+            .artifact_ready(Some(artifact_tx))
             .resume_session_id(dar_extension_sdk::chat::archive::newest_session_id(
                 dir,
                 &backend_id,
@@ -974,6 +1097,7 @@ impl<T: Transport> Chat<T> {
         self.connection = Some(Connection {
             session,
             events,
+            artifacts,
             usage: None,
             armed: true,
             closed: false,
@@ -1009,13 +1133,13 @@ impl<T: Transport> Chat<T> {
         transport: &T,
         typing: bool,
         interruptible: bool,
+        stream: bool,
     ) -> TurnOutcome {
         let Some(connection) = self.connection.as_mut() else {
-            return TurnOutcome {
-                result: Err(anyhow::anyhow!("session missing")),
-                stopped: false,
-            };
+            return TurnOutcome::failed(anyhow::anyhow!("session missing"));
         };
+        // Files published by an earlier, discarded turn are not this turn's.
+        while connection.artifacts.try_recv().is_ok() {}
         let rx = &mut self.rx;
         let deferred = &mut self.deferred;
         let key = &self.key;
@@ -1024,6 +1148,11 @@ impl<T: Transport> Chat<T> {
         let mut interrupted = false;
         let mut rx_open = true;
         let mut stopped = false;
+        let mut reply = String::new();
+        let mut silent = false;
+        let mut flushed: Vec<(String, String)> = Vec::new();
+        let mut artifacts: Vec<ArtifactReady> = Vec::new();
+        let mut artifacts_open = true;
         if typing {
             let _ = tokio::time::timeout(Duration::from_secs(5), transport.typing(true)).await;
         }
@@ -1031,13 +1160,11 @@ impl<T: Transport> Chat<T> {
             tokio::time::Instant::now() + Duration::from_secs(10),
             Duration::from_secs(10),
         );
-        let result = tokio::time::timeout(Duration::from_secs(300), async {
+        let result = tokio::time::timeout(Duration::from_secs(cfg.sessions.turn_timeout_secs), async {
             if let Err(error) = connection.session.send_turn(prompt).await {
                 connection.closed = true;
                 return Err(error);
             }
-            let mut reply = String::new();
-            let mut silent = false;
             loop {
                 tokio::select! {
                     event = connection.events.recv() => {
@@ -1053,10 +1180,22 @@ impl<T: Transport> Chat<T> {
                                 silent = true;
                                 reply.clear();
                             }
+                            // Text before a tool call is sent now, so the chat is not silent
+                            // through a long tool run. Whatever follows is the final reply.
+                            ChatEvent::ToolCall { .. } if stream && !silent => {
+                                if let Some(text) = take_flushable(&mut reply) {
+                                    if let Some(id) = say(transport, &text).await {
+                                        flushed.push((id, text));
+                                    }
+                                    if typing {
+                                        let _ = tokio::time::timeout(Duration::from_secs(5), transport.typing(true)).await;
+                                    }
+                                }
+                            }
                             ChatEvent::ContextUsage { tokens_used, context_window } => {
                                 connection.record_usage(tokens_used, context_window)
                             }
-                            ChatEvent::TurnFinished { ok: true, .. } => return Ok(reply),
+                            ChatEvent::TurnFinished { ok: true, .. } => return Ok(()),
                             ChatEvent::TurnFinished { error, .. } => {
                                 bail!("{}", error.unwrap_or_else(|| "backend failed".into()))
                             }
@@ -1067,6 +1206,10 @@ impl<T: Transport> Chat<T> {
                             _ => {}
                         }
                     }
+                    artifact = connection.artifacts.recv(), if artifacts_open => match artifact {
+                        Some(artifact) => push_artifact(&mut artifacts, artifact),
+                        None => artifacts_open = false,
+                    },
                     message = rx.recv(), if rx_open => match message {
                         None => rx_open = false,
                         Some((inbound, reply_to))
@@ -1105,10 +1248,15 @@ impl<T: Transport> Chat<T> {
             }
         })
         .await;
+        let mut timed_out = false;
         let result = result.unwrap_or_else(|_| {
+            timed_out = true;
             connection.closed = true;
             Err(anyhow::anyhow!("chat turn timed out"))
         });
+        while let Ok(artifact) = connection.artifacts.try_recv() {
+            push_artifact(&mut artifacts, artifact);
+        }
         if typing {
             let _ = tokio::time::timeout(Duration::from_secs(5), transport.typing(false)).await;
         }
@@ -1116,12 +1264,20 @@ impl<T: Transport> Chat<T> {
             self.close_connection().await;
         }
         self.interrupted |= interrupted;
-        TurnOutcome { result, stopped }
+        TurnOutcome {
+            result: result.map(|()| std::mem::take(&mut reply)),
+            stopped,
+            timed_out,
+            silent,
+            partial: reply,
+            flushed,
+            artifacts,
+        }
     }
     /// Sends `/compact` as a turn and discards the backend's text.
     async fn compact(&mut self, cfg: &Config, root: &Path, transport: &T, typing: bool) -> bool {
         let outcome = self
-            .run_turn(cfg, "/compact".into(), transport, typing, false)
+            .run_turn(cfg, "/compact".into(), transport, typing, false, false)
             .await;
         let _ = touch_activity(&root.join(&self.key));
         match outcome.result {
@@ -1376,7 +1532,12 @@ async fn process<T: Transport>(
     }
     prompt.push_str(&attachment_suffix(&attachments));
     chat.ensure_open(ctx, cfg, &session_dir).await?;
-    let outcome = chat.run_turn(cfg, prompt, &transport, true, true).await;
+    let outcome = chat
+        .run_turn(cfg, prompt, &transport, true, true, cfg.stream_replies)
+        .await;
+    for (id, text) in &outcome.flushed {
+        chat.notes.remember(id, text);
+    }
     if outcome.result.is_ok() {
         chat.notes.pending.remove(&inbound.session_key);
     }
@@ -1391,16 +1552,22 @@ async fn process<T: Transport>(
     }
     let _ = touch_activity(&root.join(&chat.key));
     let succeeded = outcome.result.is_ok() && !outcome.stopped;
-    if !outcome.stopped {
-        let reply = outcome.result.unwrap_or_else(|_| "(turn failed)".into());
-        if !ctx.shutdown.is_cancelled() && !reply.trim().is_empty() {
-            let id = tokio::time::timeout(
-                Duration::from_secs(20),
-                transport.send(adapt_markdown(&reply)),
-            )
-            .await
-            .context("whatsapp send timed out")??;
-            chat.notes.remember(&id, &reply);
+    let deliverable = (succeeded || outcome.timed_out) && !outcome.silent;
+    if !outcome.stopped && !ctx.shutdown.is_cancelled() {
+        let reply = match outcome.result {
+            Ok(reply) => reply,
+            // Unsent partial text first, then the timeout notice.
+            Err(_) if outcome.timed_out => outcome.partial,
+            Err(_) => "(turn failed)".into(),
+        };
+        if !reply.trim().is_empty() {
+            send_text(chat, &transport, &reply).await?;
+        }
+        if outcome.timed_out && !cfg.messages.timeout.trim().is_empty() {
+            say(&transport, &cfg.messages.timeout).await;
+        }
+        if deliverable {
+            deliver_artifacts(ctx, cfg, &transport, &outcome.artifacts).await;
         }
     }
     let percent = chat
@@ -1420,6 +1587,110 @@ async fn process<T: Transport>(
         chat.compact(cfg, root, &transport, false).await;
     }
     Ok(())
+}
+/// Sends one text reply and remembers it so later quotes and reactions resolve.
+async fn send_text<T: Transport>(chat: &mut Chat<T>, transport: &T, text: &str) -> Result<()> {
+    let id = tokio::time::timeout(
+        Duration::from_secs(20),
+        transport.send(adapt_markdown(text)),
+    )
+    .await
+    .context("whatsapp send timed out")??;
+    chat.notes.remember(&id, text);
+    Ok(())
+}
+fn delivery_target(chat_id: &str) -> ArtifactDeliveryTarget {
+    ArtifactDeliveryTarget {
+        surface_id: "whatsapp-web".into(),
+        origin_destination: serde_json::json!({ "chat": chat_id }).to_string(),
+    }
+}
+/// Vault-verified file name, media type, caption and bytes of a published artifact.
+fn verified_artifact(
+    store: &ArtifactStore,
+    id: dar_extension_sdk::artifacts::ArtifactId,
+) -> Result<OutFile> {
+    let mut verified = store.open_verified(id)?;
+    let metadata = verified.metadata();
+    let (name, mime, caption) = (
+        metadata.filename.clone(),
+        metadata.media_type.clone(),
+        metadata.caption.clone(),
+    );
+    let mut bytes = Vec::with_capacity(metadata.bytes as usize);
+    verified.read_to_end(&mut bytes)?;
+    Ok(OutFile {
+        name,
+        mime,
+        caption,
+        bytes,
+    })
+}
+/// Sends validated, published artifacts to the chat, once per chat. A failed
+/// upload releases its claim, is logged, and tells the user in the chat.
+async fn deliver_artifacts<T: Transport>(
+    ctx: &StartCtx,
+    cfg: &Config,
+    transport: &T,
+    artifacts: &[ArtifactReady],
+) {
+    if artifacts.is_empty() {
+        return;
+    }
+    let Ok(store) = ctx
+        .host
+        .services
+        .get_named::<ArtifactStore>("artifact-store")
+    else {
+        dar_extension_sdk::log::event(
+            "-",
+            "whatsapp-web",
+            "Artifact delivery skipped: no artifact store (enable tool-registry-host)",
+        );
+        return;
+    };
+    let target = delivery_target(&transport.chat_id());
+    for artifact in artifacts {
+        if artifact.validate(&store).is_none() {
+            continue;
+        }
+        let claim = match store.claim_delivery(artifact.id, target.clone()) {
+            Ok(DeliveryClaimResult::Claimed(claim)) => claim,
+            Ok(DeliveryClaimResult::Delivered(_) | DeliveryClaimResult::InProgress) | Err(_) => {
+                continue
+            }
+        };
+        let sent = match verified_artifact(&store, artifact.id) {
+            Ok(file) => {
+                let name = file.name.clone();
+                tokio::time::timeout(Duration::from_secs(120), transport.send_file(file))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("upload timed out"))
+                    .and_then(|sent| sent)
+                    .map_err(|error| error.context(name))
+            }
+            Err(error) => Err(error),
+        };
+        match sent {
+            Ok(remote_id) => {
+                // Keep the claim if the receipt write fails: the file was sent, so
+                // releasing it would allow a duplicate on retry.
+                let _ = store.complete_delivery(claim, remote_id);
+            }
+            Err(error) => {
+                let _ = store.release_delivery(claim);
+                dar_extension_sdk::log::event(
+                    "-",
+                    "whatsapp-web",
+                    &format!(
+                        "Artifact delivery failed for {}: {error:#}",
+                        transport.chat_id()
+                    ),
+                );
+                say(transport, &cfg.messages.artifact_failed).await;
+            }
+        }
+    }
 }
 async fn run_command<T: Transport>(
     chat: &mut Chat<T>,
@@ -1585,6 +1856,8 @@ mod tests {
         opens: Arc<Mutex<Vec<Option<String>>>>,
         prompts: Arc<Mutex<Vec<String>>>,
         closes: Arc<Mutex<usize>>,
+        /// Artifacts the backend publishes on a prompt ending in `publish`.
+        publish: Arc<Mutex<Vec<ArtifactReady>>>,
     }
     impl Probe {
         fn opens(&self) -> Vec<Option<String>> {
@@ -1604,6 +1877,7 @@ mod tests {
         events: mpsc::Sender<ChatEvent>,
         probe: Probe,
         abort: Arc<Notify>,
+        artifacts: Option<mpsc::Sender<ArtifactReady>>,
     }
     impl ChatBackend for EchoBackend {
         fn open<'a>(
@@ -1622,6 +1896,7 @@ mod tests {
                     events,
                     probe,
                     abort: Arc::new(Notify::new()),
+                    artifacts: params.artifact_ready.clone(),
                 }) as Box<dyn ChatSession>)
             })
         }
@@ -1650,6 +1925,70 @@ mod tests {
                             })
                             .await;
                     });
+                    return Ok(());
+                }
+                let scripted = |text: &str| ChatEvent::Delta {
+                    role: ChatRole::Assistant,
+                    text: text.into(),
+                };
+                let tool = || ChatEvent::ToolCall {
+                    id: "t1".into(),
+                    name: "bash".into(),
+                    args: "{}".into(),
+                };
+                let finished = || ChatEvent::TurnFinished {
+                    ok: true,
+                    error: None,
+                };
+                let script = match prompt
+                    .rsplit(char::is_whitespace)
+                    .next()
+                    .unwrap_or_default()
+                {
+                    "tools" => Some(vec![
+                        scripted("Checking. "),
+                        tool(),
+                        scripted("Done."),
+                        finished(),
+                    ]),
+                    "toolnoreply" => Some(vec![
+                        scripted("NO_REPLY"),
+                        tool(),
+                        scripted("real"),
+                        finished(),
+                    ]),
+                    "toolsilent" => Some(vec![
+                        scripted("Checking."),
+                        tool(),
+                        ChatEvent::Silent {
+                            reason: None,
+                            text: "NO_REPLY".into(),
+                        },
+                        finished(),
+                    ]),
+                    "partialstall" => Some(vec![scripted("partial")]),
+                    "publishsilent" => Some(vec![
+                        ChatEvent::Silent {
+                            reason: None,
+                            text: "NO_REPLY".into(),
+                        },
+                        finished(),
+                    ]),
+                    _ => None,
+                };
+                if prompt.ends_with("publish") || prompt.ends_with("publishsilent") {
+                    let ready = self.probe.publish.lock().unwrap().clone();
+                    for artifact in ready {
+                        if let Some(sink) = &self.artifacts {
+                            sink.send(artifact).await?;
+                        }
+                    }
+                }
+                if let Some(script) = script {
+                    for event in script {
+                        self.events.send(event).await?;
+                    }
+                    // `partialstall` streams text and never finishes the turn.
                     return Ok(());
                 }
                 if prompt.ends_with("close") {
@@ -1733,6 +2072,22 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeTransport(Arc<Mutex<Vec<String>>>);
     impl Transport for FakeTransport {
+        fn chat_id(&self) -> String {
+            "chat@g.us".into()
+        }
+        async fn send_file(&self, file: OutFile) -> Result<String> {
+            if file.name.starts_with("fail") {
+                bail!("upload rejected");
+            }
+            self.0.lock().unwrap().push(format!(
+                "file:{}:{}:{}:{}",
+                file.name,
+                file.mime.unwrap_or_default(),
+                file.caption.unwrap_or_default(),
+                file.bytes.len()
+            ));
+            Ok("file-1".into())
+        }
         async fn read(&self) -> Result<()> {
             self.0.lock().unwrap().push("read".into());
             Ok(())
@@ -1761,6 +2116,12 @@ mod tests {
     #[derive(Clone, Default)]
     struct HungReadTransport(FakeTransport);
     impl Transport for HungReadTransport {
+        fn chat_id(&self) -> String {
+            self.0.chat_id()
+        }
+        async fn send_file(&self, file: OutFile) -> Result<String> {
+            self.0.send_file(file).await
+        }
         async fn read(&self) -> Result<()> {
             std::future::pending().await
         }
@@ -1780,6 +2141,12 @@ mod tests {
     #[derive(Clone, Default)]
     struct HungSendTransport(FakeTransport);
     impl Transport for HungSendTransport {
+        fn chat_id(&self) -> String {
+            self.0.chat_id()
+        }
+        async fn send_file(&self, file: OutFile) -> Result<String> {
+            self.0.send_file(file).await
+        }
         async fn read(&self) -> Result<()> {
             self.0.read().await
         }
@@ -1800,6 +2167,13 @@ mod tests {
         context_with(root, Probe::default())
     }
     fn context_with(root: &Path, probe: Probe) -> (StartCtx, watch::Sender<bool>) {
+        context_with_store(root, probe, None)
+    }
+    fn context_with_store(
+        root: &Path,
+        probe: Probe,
+        store: Option<ArtifactStore>,
+    ) -> (StartCtx, watch::Sender<bool>) {
         let (tx, rx) = watch::channel(false);
         let paths = host_api::HostPaths::new(root).unwrap();
         let mut register = RegisterCtx {
@@ -1815,6 +2189,12 @@ mod tests {
             .services
             .service::<dyn ChatBackend>("pi", Arc::new(EchoBackend(probe)))
             .unwrap();
+        if let Some(store) = store {
+            register
+                .services
+                .service::<ArtifactStore>("artifact-store", Arc::new(store))
+                .unwrap();
+        }
         let config = register.config.clone();
         let host = register.into_start_services().unwrap();
         (
@@ -2208,7 +2588,8 @@ mod tests {
         assert!(chat.connection.is_none());
         let actions = transport.0.lock().unwrap();
         assert!(actions.contains(&"typing:false".into()));
-        assert!(actions.contains(&"send:(turn failed)".into()));
+        assert!(actions.contains(&format!("send:{}", Config::default().messages.timeout)));
+        assert!(!actions.contains(&"send:(turn failed)".into()));
     }
     #[tokio::test(start_paused = true)]
     async fn hung_send_times_out() {
@@ -2833,6 +3214,306 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    fn published_artifact(root: &Path, name: &str) -> (ArtifactStore, ArtifactReady) {
+        use dar_extension_sdk::artifacts::{ArtifactMetadataInput, ExportRoot};
+        let exports = root.join("exports");
+        std::fs::create_dir_all(&exports).unwrap();
+        std::fs::write(exports.join(name), "artifact bytes").unwrap();
+        let store = ArtifactStore::open(root.join("vault"), 1024).unwrap();
+        let metadata = store
+            .stage_from_export_root(
+                &ExportRoot::open(&exports).unwrap(),
+                name,
+                ArtifactMetadataInput {
+                    filename: name.into(),
+                    media_type: Some("text/plain".into()),
+                    caption: Some("the report".into()),
+                },
+            )
+            .unwrap();
+        let ready = ArtifactReady {
+            id: metadata.id,
+            uri: format!("dar-artifact://{}", metadata.id),
+            name: name.into(),
+            mime_type: Some("text/plain".into()),
+            bytes: metadata.bytes,
+            sha256: metadata.sha256_hex(),
+            caption: Some("the report".into()),
+        };
+        (store, ready)
+    }
+    fn actions(transport: &FakeTransport) -> Vec<String> {
+        transport.0.lock().unwrap().clone()
+    }
+    #[tokio::test]
+    async fn text_before_a_tool_call_is_sent_as_its_own_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-3361");
+        run(
+            &mut chat,
+            &ctx,
+            &Config::default(),
+            temp.path(),
+            turn_in("pn-3361", "tools"),
+            &transport,
+        )
+        .await;
+        assert_eq!(sends(&transport), vec!["send:Checking. ", "send:Done."]);
+    }
+    #[tokio::test]
+    async fn stream_replies_off_sends_one_reply_at_turn_end() {
+        let cfg: Config =
+            serde_json::from_value(serde_json::json!({ "stream_replies": false })).unwrap();
+        assert!(Config::default().stream_replies);
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-3361");
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-3361", "tools"),
+            &transport,
+        )
+        .await;
+        assert_eq!(sends(&transport), vec!["send:Checking. Done."]);
+    }
+    #[tokio::test]
+    async fn lone_no_reply_before_a_tool_call_is_not_sent() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-3361");
+        run(
+            &mut chat,
+            &ctx,
+            &Config::default(),
+            temp.path(),
+            turn_in("pn-3361", "toolnoreply"),
+            &transport,
+        )
+        .await;
+        assert_eq!(sends(&transport), vec!["send:real"]);
+    }
+    #[tokio::test]
+    async fn silent_turn_keeps_text_already_flushed_but_sends_nothing_more() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-3361");
+        run(
+            &mut chat,
+            &ctx,
+            &Config::default(),
+            temp.path(),
+            turn_in("pn-3361", "toolsilent"),
+            &transport,
+        )
+        .await;
+        assert_eq!(sends(&transport), vec!["send:Checking."]);
+        let quiet = FakeTransport::default();
+        run(
+            &mut chat,
+            &ctx,
+            &Config {
+                stream_replies: false,
+                ..Default::default()
+            },
+            temp.path(),
+            turn_in("pn-3361", "toolsilent"),
+            &quiet,
+        )
+        .await;
+        assert!(sends(&quiet).is_empty(), "nothing leaks when not streaming");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn timeout_sends_partial_text_then_configured_message() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "sessions": { "turn_timeout_secs": 7 },
+            "messages": { "timeout": "Trop long." }
+        }))
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-3361");
+        let started = tokio::time::Instant::now();
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-3361", "partialstall"),
+            &transport,
+        )
+        .await;
+        assert_eq!(started.elapsed(), Duration::from_secs(7));
+        assert_eq!(sends(&transport), vec!["send:partial", "send:Trop long."]);
+        assert!(chat.connection.is_none());
+    }
+    #[test]
+    fn turn_timeout_config_defaults_and_validation() {
+        assert_eq!(Config::default().sessions.turn_timeout_secs, 300);
+        assert!(Config::default().messages.timeout.contains("too long"));
+        let store = |value: serde_json::Value| {
+            parse(&ConfigStore::from_values(HashMap::from([(
+                "whatsapp-web".to_string(),
+                value,
+            )])))
+        };
+        assert!(store(serde_json::json!({ "sessions": { "turn_timeout_secs": 0 } })).is_err());
+        assert_eq!(
+            store(serde_json::json!({ "sessions": { "turn_timeout_secs": 900 } }))
+                .unwrap()
+                .sessions
+                .turn_timeout_secs,
+            900
+        );
+    }
+    #[tokio::test]
+    async fn published_artifact_is_sent_as_document_once_after_reply() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, ready) = published_artifact(temp.path(), "report.txt");
+        let probe = Probe::default();
+        probe.publish.lock().unwrap().push(ready);
+        let (ctx, _shutdown) = context_with_store(temp.path(), probe, Some(store));
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-3361");
+        let cfg = Config::default();
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-3361", "send it publish"),
+            &transport,
+        )
+        .await;
+        let sent: Vec<String> = actions(&transport)
+            .into_iter()
+            .filter(|a| a.starts_with("send:") || a.starts_with("file:"))
+            .collect();
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].starts_with("send:") && sent[0].ends_with("send it publish"));
+        assert_eq!(sent[1], "file:report.txt:text/plain:the report:14");
+        // The same artifact is not delivered again to the same chat.
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-3361", "again publish"),
+            &transport,
+        )
+        .await;
+        assert_eq!(
+            actions(&transport)
+                .iter()
+                .filter(|a| a.starts_with("file:"))
+                .count(),
+            1
+        );
+    }
+    #[tokio::test]
+    async fn failed_artifact_upload_notifies_chat_and_releases_claim() {
+        let temp = tempfile::tempdir().unwrap();
+        dar_extension_sdk::log::set_event_hook(capture);
+        let (store, ready) = published_artifact(temp.path(), "fail.txt");
+        let id = ready.id;
+        let probe = Probe::default();
+        probe.publish.lock().unwrap().push(ready);
+        let (ctx, _shutdown) = context_with_store(temp.path(), probe, Some(store));
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-3361");
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "messages": { "artifact_failed": "Fichier non envoyé." }
+        }))
+        .unwrap();
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-3361", "go publish"),
+            &transport,
+        )
+        .await;
+        let sent = sends(&transport);
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].ends_with("go publish"));
+        assert_eq!(sent[1], "send:Fichier non envoyé.");
+        assert!(actions(&transport).iter().all(|a| !a.starts_with("file:")));
+        assert!(logged(
+            "Artifact delivery failed for chat@g.us: fail.txt: upload rejected"
+        ));
+        let store = ctx
+            .host
+            .services
+            .get_named::<ArtifactStore>("artifact-store")
+            .unwrap();
+        assert!(matches!(
+            store
+                .claim_delivery(id, delivery_target("chat@g.us"))
+                .unwrap(),
+            DeliveryClaimResult::Claimed(_)
+        ));
+    }
+    #[tokio::test]
+    async fn silent_turn_delivers_no_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, ready) = published_artifact(temp.path(), "report.txt");
+        let probe = Probe::default();
+        probe.publish.lock().unwrap().push(ready);
+        let (ctx, _shutdown) = context_with_store(temp.path(), probe, Some(store));
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-3361");
+        run(
+            &mut chat,
+            &ctx,
+            &Config::default(),
+            temp.path(),
+            turn_in("pn-3361", "publishsilent"),
+            &transport,
+        )
+        .await;
+        assert!(actions(&transport)
+            .iter()
+            .all(|a| !a.starts_with("file:") && !a.starts_with("send:")));
+    }
+    #[tokio::test]
+    async fn forged_artifact_is_not_delivered() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, mut ready) = published_artifact(temp.path(), "report.txt");
+        ready.name = "forged.txt".into();
+        let probe = Probe::default();
+        probe.publish.lock().unwrap().push(ready);
+        let (ctx, _shutdown) = context_with_store(temp.path(), probe, Some(store));
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("pn-3361");
+        run(
+            &mut chat,
+            &ctx,
+            &Config::default(),
+            temp.path(),
+            turn_in("pn-3361", "x publish"),
+            &transport,
+        )
+        .await;
+        assert!(actions(&transport).iter().all(|a| !a.starts_with("file:")));
+    }
+    #[test]
+    fn only_common_image_types_go_inline() {
+        assert!(sends_as_image(Some("image/png")));
+        assert!(sends_as_image(Some("image/jpeg")));
+        assert!(!sends_as_image(Some("image/svg+xml")));
+        assert!(!sends_as_image(Some("application/pdf")));
+        assert!(!sends_as_image(None));
     }
     #[test]
     fn phone_validation() {
