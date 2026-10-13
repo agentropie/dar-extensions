@@ -1200,15 +1200,9 @@ impl<T: Transport> Chat<T> {
                         if let Some(text) = sending.take() {
                             match sent {
                                 Some(id) => {
+                                    // The owned typing tick restores composing; no
+                                    // task may outlive the turn.
                                     flushed.push((id, text));
-                                    if typing {
-                                        // Sending clears the composing state; refresh it
-                                        // without waiting on it.
-                                        let transport = transport.clone();
-                                        tokio::spawn(async move {
-                                            let _ = tokio::time::timeout(Duration::from_secs(5), transport.typing(true)).await;
-                                        });
-                                    }
                                 }
                                 None => {
                                     degraded = true;
@@ -4079,6 +4073,39 @@ mod tests {
         )
         .await;
         assert_eq!(sends(&transport.inner), vec!["send:A.B.C."]);
+    }
+
+    #[tokio::test]
+    async fn no_typing_is_enabled_after_the_final_pause() {
+        for (prompt, cfg) in [("tools", streaming()), ("toolsfinal", streaming())] {
+            let temp = tempfile::tempdir().unwrap();
+            let (ctx, _shutdown) = context(temp.path());
+            let transport = FakeTransport::default();
+            let mut chat = new_chat("pn-3361");
+            run(
+                &mut chat,
+                &ctx,
+                &cfg,
+                temp.path(),
+                turn_in("pn-3361", prompt),
+                &transport,
+            )
+            .await;
+            // Let anything the turn left behind run.
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let typing: Vec<String> = actions(&transport)
+                .into_iter()
+                .filter(|a| a.starts_with("typing:"))
+                .collect();
+            assert_eq!(
+                typing.last().map(String::as_str),
+                Some("typing:false"),
+                "{prompt}: {typing:?}"
+            );
+        }
     }
     #[test]
     fn only_common_image_types_go_inline() {
