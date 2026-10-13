@@ -1160,7 +1160,8 @@ impl<T: Transport> Chat<T> {
             tokio::time::Instant::now() + Duration::from_secs(10),
             Duration::from_secs(10),
         );
-        let result = tokio::time::timeout(Duration::from_secs(cfg.sessions.turn_timeout_secs), async {
+        let turn_limit = Duration::from_secs(cfg.sessions.turn_timeout_secs);
+        let result = tokio::time::timeout(turn_limit, async {
             if let Err(error) = connection.session.send_turn(prompt).await {
                 connection.closed = true;
                 return Err(error);
