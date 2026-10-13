@@ -672,6 +672,22 @@ async fn save_media(
     }
     attachment
 }
+/// Rewrites session-relative `uploads/…` paths to paths relative to the agent
+/// root, so the agent's `read` tool can open them. `sessions` is
+/// `<agent root>/.whatsapp-web/sessions`.
+fn agent_relative_paths(attachments: &mut [Attachment], sessions: &Path, session_dir: &Path) {
+    let Some(base) = sessions.parent().and_then(Path::parent) else {
+        return;
+    };
+    let Ok(rel) = session_dir.strip_prefix(base) else {
+        return;
+    };
+    for attachment in attachments.iter_mut() {
+        if let Some(path) = attachment.path.as_mut() {
+            *path = rel.join(path.as_str()).to_string_lossy().into_owned();
+        }
+    }
+}
 async fn sender_phone(message: &MessageContext) -> Option<String> {
     let source = &message.info.source;
     if source.sender.is_pn() {
@@ -1588,9 +1604,12 @@ async fn process<T: Transport>(
         }
         None => None,
     };
-    let attachments = transport
+    let mut attachments = transport
         .attachments(&session_dir.join("uploads"), &inbound.message_id)
         .await;
+    // The agent's file tools resolve paths from the agent root
+    // (`<root>/.whatsapp-web/sessions`); report paths relative to it.
+    agent_relative_paths(&mut attachments, root, &session_dir);
     let mut prompt = String::new();
     if std::mem::take(&mut chat.interrupted) {
         prompt.push_str(INTERRUPTED_NOTE);
@@ -4073,6 +4092,25 @@ mod tests {
         )
         .await;
         assert_eq!(sends(&transport.inner), vec!["send:A.B.C."]);
+    }
+
+    #[test]
+    fn attachment_paths_are_relative_to_the_agent_root() {
+        let sessions = Path::new("/agent/.whatsapp-web/sessions");
+        let session_dir = sessions.join("pn-3361").join("2");
+        let mut attachments = vec![
+            Attachment {
+                path: Some("uploads/a.png".into()),
+                ..Default::default()
+            },
+            Attachment::default(),
+        ];
+        agent_relative_paths(&mut attachments, sessions, &session_dir);
+        assert_eq!(
+            attachments[0].path.as_deref(),
+            Some(".whatsapp-web/sessions/pn-3361/2/uploads/a.png")
+        );
+        assert_eq!(attachments[1].path, None);
     }
 
     #[tokio::test]
