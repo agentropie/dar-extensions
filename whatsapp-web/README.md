@@ -15,13 +15,17 @@ extensions:
     # require_mention: true # group messages start a turn only when addressed; false = every message
     # reply_to_quote: true # a quote-reply to the agent counts as a mention
     # backend: pi
+    # stream_replies: true # send text before each tool call as its own message; false = one reply at turn end
     # sessions:
     #   idle_minutes: 1440 # optional; omitted or 0 = sessions never expire
     #   on_message_during_turn: interrupt # or queue
-    # messages: # optional replies to commands (defaults shown)
+    #   turn_timeout_secs: 300 # longest an agent turn may run; must be > 0
+    # messages: # optional replies (defaults shown)
     #   stopped: "Stopped."
     #   new_session: "New session started."
     #   compacted: "Compacted."
+    #   timeout: "This took too long and was stopped. Please try again or ask for something simpler."
+    #   artifact_failed: "I couldn't send the generated file."
 ```
 
 On first start, the agent creates `<agent>/.whatsapp-web/session.db` and logs the eight-character pairing code to the agent log and TUI Logs tab. Enter it in WhatsApp Business → Linked devices → Link with phone number. The first QR is also rendered once in the Logs tab as fallback (later rotations go only to `logs/agent.log`). These pairing values are sensitive; keep agent logs private. Subsequent starts reuse the SQLite session and skip the pairing request; the Logs tab shows `Connected as +<phone>` on each (re)connect. If WhatsApp unlinks the device, a `Logged out by WhatsApp` line appears: delete `.whatsapp-web/session.db` and restart to pair again. The extension writes a `.gitignore` inside `.whatsapp-web/` to exclude its contents. Deleting the agent or its session store removes this linked-device identity. `phone_number` can be omitted for QR-only pairing. Legacy `bridge_port` and `proxy_url` fields have no effect with the in-process library.
@@ -34,9 +38,17 @@ Media (image, video, audio/voice, document, sticker) is downloaded to `<session 
 
 Reactions never start a turn. Reactions and unaddressed group messages from allowed users and groups are kept (max 20 per session, oldest dropped) and prepended to that session's next turn under `(since your last reply)`.
 
+## Streaming replies, timeouts and files
+
+**Streaming (`stream_replies`, default `true`).** When the agent calls a tool, any assistant text written so far is sent immediately as its own WhatsApp message (quoting the inbound one), so a long tool run is not silent. The text after the last tool call is sent when the turn ends, as before. Whitespace and a lone `NO_REPLY` before a tool call are not sent. If a turn later ends `NO_REPLY` (silent), text already sent stays sent and only the remainder is suppressed; with `stream_replies: false` a silent turn sends nothing at all. A `/stop` or interrupting message drops only the unsent text.
+
+**Timeout.** A turn is aborted after `sessions.turn_timeout_secs` (default 300). The extension then sends any unsent partial text, followed by `messages.timeout`, and drops the backend session (it reopens with resume on the next message). The log line stays `turn failed for <chat>: chat turn timed out`. Other failures still reply `(turn failed)`. An empty `messages.timeout` sends only the partial text.
+
+**Files.** When the agent calls `artifact_publish` (needs `tool-registry-host`, and a chat backend that reports published artifacts: `chat-pi`, `chat-codex`, `chat-opencode`, or the built-in backend as of dar 0.7), the file is sent to the same chat after the reply as a WhatsApp document, with the vault's file name, media type and caption. JPEG, PNG and WebP files are sent as images instead. Delivery uses the same vault claim/receipt as the Slack extension, so one artifact goes to one chat once, and only artifacts that validate against the vault are sent. Files are sent after a successful or timed-out turn, not after `/stop`, an interruption or a silent turn. If the upload fails, the claim is released, `Artifact delivery failed for <chat>: <error>` is logged and the chat gets `messages.artifact_failed`. The SDK has no channel for telling the agent about the failure.
+
 ## Sessions, commands and compaction
 
-Each chat (`pn-<phone>`, `lid-<id>`, `group-<id>`) has generations under `<agent>/.whatsapp-web/<chat>/<generation>/` with a `current` pointer; uploads live in the current generation. Older chat directories without generations keep working and simply start at generation 1. When a session opens, the newest archived backend session in the current generation is resumed, so a dar restart continues the conversation (backends that cannot resume start fresh). A failed turn keeps the session; it is dropped and reopened (with resume) only if the backend reports the session closed, the turn times out or `send_turn` fails.
+Each chat (`pn-<phone>`, `lid-<id>`, `group-<id>`) has generations under `<agent>/.whatsapp-web/<chat>/<generation>/` with a `current` pointer; uploads live in the current generation. Older chat directories without generations keep working and simply start at generation 1. When a session opens, the newest archived backend session in the current generation is resumed, so a dar restart continues the conversation (backends that cannot resume start fresh). A failed turn keeps the session; it is dropped and reopened (with resume) only if the backend reports the session closed, the turn times out (`sessions.turn_timeout_secs`) or `send_turn` fails.
 
 `sessions.idle_minutes` is optional and has no default. When set, a message arriving after that many idle minutes (last activity is stored on disk, so it survives restarts) starts a new generation and logs `Session <chat> expired after <n> min idle; starting fresh`; the old transcript stays on disk.
 
