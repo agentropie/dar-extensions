@@ -1150,11 +1150,15 @@ impl<T: Transport> Chat<T> {
         let mut stopped = false;
         // Reply text lives here, outside the cancellable turn future, so a turn
         // deadline or a failed send never loses it. `reply` is the text since the
-        // last tool call, `unsent` holds cut segments awaiting an acknowledged
-        // send (the front one is in flight), `failed` segments whose send failed.
+        // last tool call, `unsent` cut segments queued for a mid-turn send,
+        // `sending` the one segment in flight. After the first failed send
+        // streaming stops for the turn: that text and everything later is kept in
+        // `held` and goes out, in order, with the final reply.
         let mut reply = String::new();
         let mut unsent: VecDeque<String> = VecDeque::new();
-        let mut failed: Vec<String> = Vec::new();
+        let mut sending: Option<String> = None;
+        let mut held: Vec<String> = Vec::new();
+        let mut degraded = false;
         let mut silent = false;
         let mut flushed: Vec<(String, String)> = Vec::new();
         let mut artifacts: Vec<ArtifactReady> = Vec::new();
@@ -1178,14 +1182,9 @@ impl<T: Transport> Chat<T> {
             let mut done: Option<Result<()>> = None;
             loop {
                 if in_flight.is_none() {
-                    if let Some(text) = unsent.front().cloned() {
-                        in_flight = Some(Box::pin(async move {
-                            let id = say(transport, &text).await;
-                            if id.is_some() && typing {
-                                let _ = tokio::time::timeout(Duration::from_secs(5), transport.typing(true)).await;
-                            }
-                            id
-                        }));
+                    if let Some(text) = unsent.pop_front() {
+                        sending = Some(text.clone());
+                        in_flight = Some(Box::pin(async move { say(transport, &text).await }));
                     }
                 }
                 // The backend finished: leave only once every mid-turn message is
@@ -1198,10 +1197,24 @@ impl<T: Transport> Chat<T> {
                 tokio::select! {
                     sent = async { in_flight.as_mut().expect("guarded").await }, if in_flight.is_some() => {
                         in_flight = None;
-                        if let Some(text) = unsent.pop_front() {
+                        if let Some(text) = sending.take() {
                             match sent {
-                                Some(id) => flushed.push((id, text)),
-                                None => failed.push(text),
+                                Some(id) => {
+                                    flushed.push((id, text));
+                                    if typing {
+                                        // Sending clears the composing state; refresh it
+                                        // without waiting on it.
+                                        let transport = transport.clone();
+                                        tokio::spawn(async move {
+                                            let _ = tokio::time::timeout(Duration::from_secs(5), transport.typing(true)).await;
+                                        });
+                                    }
+                                }
+                                None => {
+                                    degraded = true;
+                                    held.push(text);
+                                    held.extend(unsent.drain(..));
+                                }
                             }
                         }
                     }
@@ -1217,14 +1230,23 @@ impl<T: Transport> Chat<T> {
                                 reply.push_str(&text)
                             }
                             ChatEvent::Silent { .. } => {
+                                // Nothing more is delivered; sends already acknowledged stay.
                                 silent = true;
                                 reply.clear();
+                                unsent.clear();
+                                held.clear();
+                                sending = None;
+                                in_flight = None;
                             }
                             // Text before a tool call is sent now, so the chat is not silent
                             // through a long tool run. Whatever follows is the final reply.
                             ChatEvent::ToolCall { .. } if stream && !silent && !stopped => {
                                 if let Some(text) = take_flushable(&mut reply) {
-                                    unsent.push_back(text);
+                                    if degraded {
+                                        held.push(text);
+                                    } else {
+                                        unsent.push_back(text);
+                                    }
                                 }
                             }
                             ChatEvent::ContextUsage { tokens_used, context_window } => {
@@ -1254,7 +1276,8 @@ impl<T: Transport> Chat<T> {
                             stopped = true;
                             reply.clear();
                             unsent.clear();
-                            failed.clear();
+                            held.clear();
+                            sending = None;
                             in_flight = None;
                             if let Err(error) = connection.session.abort().await {
                                 tracing::warn!(%error, "whatsapp-web abort failed");
@@ -1270,7 +1293,8 @@ impl<T: Transport> Chat<T> {
                                 interrupted = true;
                                 reply.clear();
                                 unsent.clear();
-                                failed.clear();
+                                held.clear();
+                                sending = None;
                                 in_flight = None;
                                 dar_extension_sdk::log::event(
                                     "-",
@@ -1307,13 +1331,13 @@ impl<T: Transport> Chat<T> {
             self.close_connection().await;
         }
         self.interrupted |= interrupted;
-        // Whatever never got an acknowledged send, in order. A silent turn
-        // delivers nothing more, so failed earlier segments are not retried.
+        // Whatever never got an acknowledged send, in order (a send cut short by
+        // the deadline counts as unsent). A silent turn delivers nothing more.
         let leftover = if silent {
             String::new()
         } else {
-            failed
-                .into_iter()
+            held.into_iter()
+                .chain(sending)
                 .chain(unsent)
                 .chain(std::iter::once(std::mem::take(&mut reply)))
                 .collect::<String>()
@@ -2024,8 +2048,38 @@ mod tests {
                         scripted("real"),
                         finished(),
                     ]),
-                    "toolsilent" => Some(vec![
-                        scripted("Checking."),
+                    "toolsilent" => {
+                        // A real turn runs the tool before it ends silent; leave
+                        // time for the mid-turn send to be acknowledged.
+                        let events = self.events.clone();
+                        tokio::spawn(async move {
+                            let _ = events.send(scripted("Checking.")).await;
+                            let _ = events.send(tool()).await;
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                            let _ = events
+                                .send(ChatEvent::Silent {
+                                    reason: None,
+                                    text: "NO_REPLY".into(),
+                                })
+                                .await;
+                            let _ = events.send(finished()).await;
+                        });
+                        return Ok(());
+                    }
+                    "partialstall" | "stallpublish" => Some(vec![scripted("partial")]),
+                    "toolstall" => Some(vec![scripted("Checking."), tool()]),
+                    "threetools" => Some(vec![
+                        scripted("A."),
+                        tool(),
+                        scripted("B."),
+                        tool(),
+                        scripted("C."),
+                        finished(),
+                    ]),
+                    "twotoolsilent" => Some(vec![
+                        scripted("A."),
+                        tool(),
+                        scripted("B."),
                         tool(),
                         ChatEvent::Silent {
                             reason: None,
@@ -2033,8 +2087,6 @@ mod tests {
                         },
                         finished(),
                     ]),
-                    "partialstall" | "stallpublish" => Some(vec![scripted("partial")]),
-                    "toolstall" => Some(vec![scripted("Checking."), tool()]),
                     "toolsfinal" => Some(vec![scripted("Checking."), tool(), finished()]),
                     "toolspublish" => Some(vec![
                         scripted("Checking. "),
@@ -2276,18 +2328,24 @@ mod tests {
         Ok,
         Fail,
         Hang,
+        /// Succeeds after 100 ms, then makes typing hang (a stalled post-send refresh).
+        SlowOk,
+        /// Fails after 100 ms.
+        SlowFail,
     }
     /// Text sends follow `plan` in order (then succeed); everything else is `FakeTransport`.
     #[derive(Clone)]
     struct PlanTransport {
         inner: FakeTransport,
         plan: Arc<Mutex<VecDeque<Send>>>,
+        typing_hangs: Arc<AtomicBool>,
     }
     impl PlanTransport {
         fn new(plan: &[Send]) -> Self {
             Self {
                 inner: FakeTransport::default(),
                 plan: Arc::new(Mutex::new(plan.iter().copied().collect())),
+                typing_hangs: Arc::default(),
             }
         }
     }
@@ -2302,6 +2360,9 @@ mod tests {
             self.inner.read().await
         }
         async fn typing(&self, active: bool) -> Result<()> {
+            if active && self.typing_hangs.load(Ordering::Relaxed) {
+                return std::future::pending().await;
+            }
             self.inner.typing(active).await
         }
         async fn send(&self, text: String) -> Result<String> {
@@ -2310,6 +2371,15 @@ mod tests {
                 Send::Ok => self.inner.send(text).await,
                 Send::Fail => bail!("network down"),
                 Send::Hang => std::future::pending().await,
+                Send::SlowOk => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    self.typing_hangs.store(true, Ordering::Relaxed);
+                    self.inner.send(text).await
+                }
+                Send::SlowFail => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    bail!("network down")
+                }
             }
         }
         async fn group_subject(&self) -> Option<String> {
@@ -3922,6 +3992,93 @@ mod tests {
         );
         assert!(EVENTS.lock().unwrap().iter().any(|e| e
             .starts_with("whatsapp-web: Artifact delivery failed for chat@g.us: could not claim")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acknowledged_flush_is_not_resent_when_typing_stalls_at_the_deadline() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "stream_replies": true,
+            "sessions": { "turn_timeout_secs": 3 },
+            "messages": { "timeout": "Trop long." }
+        }))
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = PlanTransport::new(&[Send::SlowOk]);
+        let mut chat = new_chat("pn-3361");
+        run(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            turn_in("pn-3361", "toolstall"),
+            &transport,
+        )
+        .await;
+        assert_eq!(
+            sends(&transport.inner),
+            vec!["send:Checking.", "send:Trop long."]
+        );
+        assert_eq!(chat.notes.text_of("out-1"), Some("Checking."));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn silent_cancels_pending_flushes_without_starting_the_queued_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        // A is slow to send, B is queued behind it when Silent arrives.
+        let transport = PlanTransport::new(&[Send::SlowOk, Send::SlowOk]);
+        let mut chat = new_chat("pn-3361");
+        run(
+            &mut chat,
+            &ctx,
+            &streaming(),
+            temp.path(),
+            turn_in("pn-3361", "twotoolsilent"),
+            &transport,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            sends(&transport.inner).is_empty(),
+            "{:?}",
+            actions(&transport.inner)
+        );
+        assert_eq!(transport.plan.lock().unwrap().len(), 1, "B never started");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn after_a_failed_flush_later_text_follows_in_order_with_the_final_reply() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        // A fails slowly, so B is already queued behind it when it does.
+        let transport = PlanTransport::new(&[Send::SlowFail]);
+        let mut chat = new_chat("pn-3361");
+        run(
+            &mut chat,
+            &ctx,
+            &streaming(),
+            temp.path(),
+            turn_in("pn-3361", "threetools"),
+            &transport,
+        )
+        .await;
+        assert_eq!(sends(&transport.inner), vec!["send:A.B.C."]);
+    }
+    #[tokio::test]
+    async fn after_a_failed_flush_streaming_stops_for_the_rest_of_the_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = PlanTransport::new(&[Send::Fail]);
+        let mut chat = new_chat("pn-3361");
+        run(
+            &mut chat,
+            &ctx,
+            &streaming(),
+            temp.path(),
+            turn_in("pn-3361", "threetools"),
+            &transport,
+        )
+        .await;
+        assert_eq!(sends(&transport.inner), vec!["send:A.B.C."]);
     }
     #[test]
     fn only_common_image_types_go_inline() {
