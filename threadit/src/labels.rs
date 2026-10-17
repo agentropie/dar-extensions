@@ -11,6 +11,9 @@ pub fn tool_label(name: &str) -> Option<String> {
     if lower.starts_with("task.") || lower.starts_with("task_") {
         return None;
     }
+    if !is_plain_name(name) {
+        return Some(RUNNING.to_string());
+    }
     let normalized = lower.replace(['.', '-'], "_");
     let exact = match normalized.as_str() {
         "read" => Some("Reading files"),
@@ -35,6 +38,18 @@ pub fn tool_label(name: &str) -> Option<String> {
         }
     }
     Some(humanize(name))
+}
+
+const RUNNING: &str = "Running commands";
+
+/// A tool identifier, not free text. Codex names shell calls by their raw
+/// command, which must never be humanized into a label.
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._:/-".contains(c))
 }
 
 fn humanize(name: &str) -> String {
@@ -140,6 +155,19 @@ fn short_url(raw: &str) -> String {
 /// `None` for task bookkeeping tools.
 pub fn detailed_tool_label(name: &str, args: &str) -> Option<String> {
     let label = tool_label(name)?;
+    if !is_plain_name(name) {
+        // Codex: the name is the command; a plain-text args is the same command.
+        let command = match serde_json::from_str::<Value>(args) {
+            Err(_) if !args.trim().is_empty() => args,
+            _ => name,
+        };
+        let shown = bash_label(command);
+        return Some(if shown.is_empty() {
+            label
+        } else {
+            trim_text(&format!("Running: {}", redact(&shown)), 80)
+        });
+    }
     let Ok(Value::Object(args)) = serde_json::from_str::<Value>(args) else {
         return Some(label);
     };
@@ -271,7 +299,7 @@ mod tests {
     #[test]
     fn odd_names_stay_plain() {
         assert_eq!(tool_label("/etc/passwd").unwrap(), "Using etc passwd");
-        assert_eq!(tool_label("!!!").unwrap(), "Using a tool");
+        assert_eq!(tool_label("!!!").unwrap(), "Running commands");
     }
 
     fn detailed(name: &str, args: Value) -> Option<String> {
@@ -324,10 +352,6 @@ mod tests {
         assert_eq!(
             detailed_tool_label("slack.send", "\"nope\"").unwrap(),
             "Using send"
-        );
-        assert_eq!(
-            detailed_tool_label("curl -u alice:hunter2 x", "curl -u alice:hunter2 x").unwrap(),
-            tool_label("curl -u alice:hunter2 x").unwrap()
         );
     }
 
@@ -529,5 +553,41 @@ mod tests {
                 assert!(!shown.contains(secret), "{command}");
             }
         }
+    }
+
+    #[test]
+    fn codex_command_names_never_humanized() {
+        let cmd = "curl -u alice:hunter2 x";
+        assert_eq!(tool_label(cmd).unwrap(), "Running commands");
+        assert_eq!(detailed_tool_label(cmd, cmd).unwrap(), "Running: curl …");
+        assert_eq!(detailed_tool_label(cmd, "").unwrap(), "Running: curl …");
+        assert_eq!(
+            detailed_tool_label("git status", "git status").unwrap(),
+            "Running: git status"
+        );
+        assert_eq!(
+            detailed_tool_label("PASSWORD='a b' cmd", "PASSWORD='a b' cmd").unwrap(),
+            "Running commands"
+        );
+        let long = "x".repeat(65);
+        assert_eq!(tool_label(&long).unwrap(), "Running commands");
+        for label in [
+            tool_label(cmd).unwrap(),
+            detailed_tool_label(cmd, cmd).unwrap(),
+        ] {
+            assert!(!label.contains("alice") && !label.contains("hunter2"));
+        }
+    }
+
+    #[test]
+    fn codex_non_shell_tools_keep_labels() {
+        // mcpToolCall is named `server.tool`; others use their tool name.
+        assert_eq!(tool_label("linear.get_issue").unwrap(), "Using get issue");
+        assert_eq!(
+            detailed_tool_label("linear.get_issue", r#"{"id":"ALG-1"}"#).unwrap(),
+            "Using get issue: ALG-1"
+        );
+        assert_eq!(tool_label("apply_patch").unwrap(), "Using apply patch");
+        assert_eq!(tool_label("src/main.rs").unwrap(), "Using rs");
     }
 }
