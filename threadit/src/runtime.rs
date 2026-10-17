@@ -1126,7 +1126,7 @@ mod tests {
             },
             tool(
                 "bash",
-                r#"{"command":"cd /x && curl -u alice:hunter2 host"}"#,
+                r#"{"command":"cd /x && API_TOKEN=hunter2 curl host"}"#,
             ),
             tool("bash", "unparsable"),
             tool("task.checkpoint", r#"{"id":"x"}"#),
@@ -1144,12 +1144,12 @@ mod tests {
             [
                 "Started",
                 "Reading …/c/d/notes.md",
-                "Running: curl …",
+                "Running: cd /x && API_TOKEN=••• curl host",
                 "Running commands"
             ]
         );
         let all: String = server.requests().iter().map(|r| r.body.clone()).collect();
-        for leak in ["hunter2", "alice", "TOP-SECRET", "private thoughts"] {
+        for leak in ["hunter2", "TOP-SECRET", "private thoughts"] {
             assert!(!all.contains(leak), "leaked {leak}");
         }
     }

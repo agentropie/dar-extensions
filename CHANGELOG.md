@@ -10,6 +10,7 @@
 
 - **whatsapp-web:** linked-device text DMs using in-process whatsapp-rust, phone-number pairing, allowlisting, and persistent agent-local authentication. (ALG-466)
 - **whatsapp-web:** a quote-reply to the agent starts a group turn like an @-mention (`reply_to_quote`, default true); `require_mention: false` makes every group message start a turn.
+- **threadit:** `activity: detailed` is now the default and shows the real target: the full first command line (`Running: …`, 120 chars), file path, or first identifying argument, with light secret masking. `activity: safe` is unchanged.
 - **threadit:** tool names that are not plain identifiers (codex names shell calls by their raw command) are never turned into labels: safe mode shows `Running commands`, detailed mode shows the safe command prefix. Previously a codex command such as `curl -u user:pass` leaked into the label. Odd names such as `!!!` now show `Running commands` instead of `Using a tool`.
 - **threadit:** `activity: detailed` adds a redacted target to tool activity labels (file path, safe command prefix, or one identifying argument); default `safe` is unchanged.
 - **threadit:** Threadit board extension. It polls attention items, runs one chat session per thread, shows safe progress as agent activities, honors stop requests, and posts the answer as a reply.

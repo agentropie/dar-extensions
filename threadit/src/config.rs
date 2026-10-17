@@ -26,9 +26,9 @@ pub struct ThreaditConfig {
 #[serde(rename_all = "lowercase")]
 pub enum ActivityMode {
     /// Tool names only.
-    #[default]
     Safe,
-    /// Tool names plus a redacted target from the arguments.
+    /// Tool names plus the path, command or first argument, lightly masked.
+    #[default]
     Detailed,
 }
 
@@ -137,7 +137,7 @@ mod tests {
         let parse = |v: serde_json::Value| serde_json::from_value::<ThreaditConfig>(v);
         assert_eq!(
             parse(serde_json::json!({})).unwrap().activity,
-            ActivityMode::Safe
+            ActivityMode::Detailed
         );
         assert_eq!(
             parse(serde_json::json!({"activity": "detailed"}))
