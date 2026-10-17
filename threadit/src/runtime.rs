@@ -124,6 +124,15 @@ async fn end_for_posted(
     })
 }
 
+/// Log line for an accepted mention. Usernames are `[A-Za-z0-9_-]`, so they are safe to log.
+fn mention_log(item: &Message, resumed: bool) -> String {
+    let verb = if resumed { "resumed" } else { "received" };
+    format!(
+        "mention {verb} in thread {} (message {}, from @{})",
+        item.thread_id, item.id, item.author.username
+    )
+}
+
 fn question_text(questions: &[dar_extension_sdk::chat::QuestionInfo]) -> String {
     let mut out = String::new();
     for q in questions {
@@ -634,6 +643,7 @@ impl Runtime {
             }
         }
         self.handled.insert(item.id);
+        dar_extension_sdk::log::event("-", "threadit", &mention_log(&item, resumed));
         let first = if resumed {
             "Resumed after restart"
         } else {
@@ -739,6 +749,11 @@ pub async fn run(
     turn_timeout: Duration,
     mut shutdown: ShutdownToken,
 ) {
+    dar_extension_sdk::log::event(
+        "-",
+        "threadit",
+        &format!("extension enabled; connecting to {}", board.base_url()),
+    );
     let me = loop {
         match board.me().await {
             Ok(me) => break me,
@@ -761,7 +776,11 @@ pub async fn run(
         tracing::error!("threadit account {} is not an agent account", me.username);
         return;
     }
-    tracing::info!(agent = %me.username, "threadit connected");
+    dar_extension_sdk::log::event(
+        "-",
+        "threadit",
+        &format!("connected to {} as @{}", board.base_url(), me.username),
+    );
 
     let mut rt = Runtime::new(
         board,
@@ -1889,5 +1908,19 @@ mod tests {
     #[test]
     fn question_text_without_questions_has_fallback() {
         assert_eq!(question_text(&[]), "The agent needs more input.");
+    }
+
+    #[test]
+    fn mention_log_names_thread_message_and_author() {
+        let item: Message = serde_json::from_str(
+            r#"{"id":7,"thread_id":3,"author":{"id":1,"username":"root"},"body":"secret body"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            mention_log(&item, false),
+            "mention received in thread 3 (message 7, from @root)"
+        );
+        assert!(mention_log(&item, true).starts_with("mention resumed"));
+        assert!(!mention_log(&item, false).contains("secret"));
     }
 }
