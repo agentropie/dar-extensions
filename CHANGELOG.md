@@ -10,6 +10,7 @@
 
 - **whatsapp-web:** linked-device text DMs using in-process whatsapp-rust, phone-number pairing, allowlisting, and persistent agent-local authentication. (ALG-466)
 - **whatsapp-web:** a quote-reply to the agent starts a group turn like an @-mention (`reply_to_quote`, default true); `require_mention: false` makes every group message start a turn.
+- **threadit:** Threadit board extension. It polls attention items, runs one chat session per thread, shows safe progress as agent activities, honors stop requests, and posts the answer as a reply.
 
 ## [0.6.3] - 2026-09-30
 
