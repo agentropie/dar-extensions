@@ -174,13 +174,14 @@ pub async fn drive_turn(
         }
     };
     let sent = tokio::select! {
+        biased;
+        sent = send => sent,
         _ = shutdown.cancelled() => {
             return TurnReport { end: TurnEnd::Shutdown, drop_session: true };
         }
         _ = &mut deadline => {
             return TurnReport { end: TurnEnd::Failed("timed out"), drop_session: true };
         }
-        sent = send => sent,
     };
     if sent.is_err() {
         return TurnReport {
@@ -1605,7 +1606,7 @@ mod tests {
         assert_eq!(replies(&server)[0]["body"], STOPPED_REPLY);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn hung_send_hits_the_deadline_and_closes_the_session() {
         let server = MockServer::start(base_handler(SESSION_OK, ITEM)).await;
         let (rt, _probe) = build_runtime(&server.base, vec![], vec![], Duration::ZERO, false, true);
@@ -1619,12 +1620,16 @@ mod tests {
         assert_eq!(replies(&server)[0]["body"], FAILURE_REPLY);
     }
 
-    #[derive(Clone, Default)]
-    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+    thread_local! {
+        static CAPTURED_LOGS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
 
-    impl std::io::Write for LogBuf {
+    /// Writes log output into the buffer of the current test thread.
+    struct ThreadLogWriter;
+
+    impl std::io::Write for ThreadLogWriter {
         fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(data);
+            CAPTURED_LOGS.with(|logs| logs.borrow_mut().extend_from_slice(data));
             Ok(data.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -1632,15 +1637,23 @@ mod tests {
         }
     }
 
+    /// Install one global subscriber for the test binary. A scoped subscriber
+    /// loses events when parallel tests register the same callsites first.
+    fn capture_logs() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| ThreadLogWriter)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+        });
+        CAPTURED_LOGS.with(|logs| logs.borrow_mut().clear());
+    }
+
     #[tokio::test]
     async fn logs_hold_no_raw_backend_open_or_server_text() {
-        let buf = LogBuf::default();
-        let writer = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        capture_logs();
 
         let handler: Handler =
             Arc::new(
@@ -1667,7 +1680,7 @@ mod tests {
         rt.close_all().await;
         rt.handle_item(item(), false).await;
 
-        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let logs = CAPTURED_LOGS.with(|logs| String::from_utf8(logs.borrow().clone()).unwrap());
         assert!(
             logs.contains("threadit backend reported an error"),
             "{logs}"
