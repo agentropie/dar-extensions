@@ -249,4 +249,26 @@ mod tests {
         );
         assert_eq!(detailed("task.update", json!({"id": "x"})), None);
     }
+
+    #[test]
+    fn masking_bugs_fixed() {
+        let label = |args: Value| detailed("web_search", args).unwrap();
+        // (a) ASCII word boundaries after accented letters
+        let out = label(json!({"query": "éghp_abcdefghij"}));
+        assert!(!out.contains("ghp_"), "{out}");
+        let out = label(json!({"query": "épassword=hunter2"}));
+        assert!(!out.contains("hunter2"), "{out}");
+        // (b) escaped quotes inside a JSON value
+        let out = label(json!({"query": r#"{"password":"hello \"hunter2 world\""}"#}));
+        assert!(!out.contains("hunter2"), "{out}");
+        // (c) a value merely containing the mask is still masked
+        let out = label(json!({"query": "password=•••hunter2"}));
+        assert!(!out.contains("hunter2"), "{out}");
+    }
+
+    #[test]
+    fn command_like_names_are_commands() {
+        let out = detailed_tool_label("export GITHUB_TOKEN=abc123 && make", "{}").unwrap();
+        assert_eq!(out, "Running: export GITHUB_TOKEN=••• && make");
+    }
 }

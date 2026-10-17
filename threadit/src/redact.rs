@@ -12,15 +12,15 @@ static RULES: LazyLock<Vec<(Regex, String)>> = LazyLock::new(|| {
     let r = |p: &str, to: &str| (Regex::new(p).unwrap(), to.to_string());
     vec![
         r(
-            r#"(?i)\b(authorization\s*:\s*)(bearer\s+|basic\s+)?[^\s"'`]+"#,
+            r#"(?i)(?-u:\b)(authorization\s*:\s*)(bearer\s+|basic\s+)?[^\s"'`]+"#,
             &format!("${{1}}${{2}}{MASK}"),
         ),
         r(
-            r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]+",
+            r"(?i)(?-u:\b)(bearer)\s+[A-Za-z0-9._~+/=-]+",
             &format!("$1 {MASK}"),
         ),
         r(
-            &format!(r#"("{KEY}"\s*:\s*)"[^"]*""#),
+            &format!(r#"("{KEY}"\s*:\s*)"(?:[^"\\]|\\.)*""#),
             &format!("$1\"{MASK}\""),
         ),
         r(
@@ -29,10 +29,10 @@ static RULES: LazyLock<Vec<(Regex, String)>> = LazyLock::new(|| {
         ),
         r(r"(://)[^\s/@]+@", &format!("$1{MASK}@")),
         r(
-            r"\b(?:ghp_|ghs_|github_pat_|sk-ant-|sk-|xox[a-z]-|lin_api_|AKIA)[A-Za-z0-9_-]{6,}",
+            r"(?-u:\b)(?:ghp_|ghs_|github_pat_|sk-ant-|sk-|xox[a-z]-|lin_api_|AKIA)[A-Za-z0-9_-]{6,}",
             MASK,
         ),
-        r(r"\beyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*", MASK),
+        r(r"(?-u:\b)eyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*", MASK),
     ]
 });
 
