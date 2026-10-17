@@ -35,7 +35,7 @@ The extension is an `agent_singleton`. It needs the `chat-pi` stock backend.
 12. After 10 minutes with no activity, the extension posts `Still working`.
 13. A turn that runs longer than `turn_timeout_minutes` is aborted and fails. Abort and drain take at most 30 seconds, also on shutdown. The session closes after a timeout.
 14. Only the completion of a submitted run ends a turn. Autonomous runs are ignored.
-15. On start, `processing` items run once more after a `Resumed after restart` activity. This holds only when the own session state is `working` or `stale`. A `stopping` item gets `Stopped on request.` and ✅. `needs_input` and `error` items are skipped. An item whose own session already has a `reply_id` only gets ✅.
+15. On start, `processing` items run once more. They get a `Resumed after restart` activity in place of `Started`. This holds only when the own session state is `working` or `stale`. A `stopping` item gets `Stopped on request.` and ✅. `needs_input` and `error` items are skipped. An item whose own session already has a `reply_id` only gets ✅.
 16. After a reply POST with an unknown result (timeout or 5xx), the extension reads the message again. It adds ✅ only when `reply_id` is set. It never sends the reply again.
 
 Logs use fixed categories. They hold no backend text, no session-open text, and no unknown server error codes.

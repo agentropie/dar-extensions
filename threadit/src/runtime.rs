@@ -551,25 +551,12 @@ impl Runtime {
             }
         }
         self.handled.insert(item.id);
-        if resumed {
-            let posted = post_activity(
-                &self.shared.board,
-                item.id,
-                "thought",
-                "Resumed after restart",
-                false,
-            )
-            .await;
-            match posted {
-                Posted::Closed => return,
-                Posted::Ok { stop: true } => {
-                    self.shared.finish_stopped(&item).await;
-                    return;
-                }
-                _ => {}
-            }
-        }
-        let posted = post_activity(&self.shared.board, item.id, "thought", "Started", false).await;
+        let first = if resumed {
+            "Resumed after restart"
+        } else {
+            "Started"
+        };
+        let posted = post_activity(&self.shared.board, item.id, "thought", first, false).await;
         match posted {
             Posted::Closed => return,
             Posted::Ok { stop: true } => {
@@ -1317,7 +1304,8 @@ mod tests {
             make_runtime(&server.base, vec![finished_ok()], vec![], Duration::ZERO);
         rt.handle_item(item(), true).await;
         let bodies: Vec<String> = activities(&server).into_iter().map(|a| a.1).collect();
-        assert_eq!(&bodies[..2], ["Resumed after restart", "Started"]);
+        assert_eq!(bodies[0], "Resumed after restart");
+        assert!(!bodies.iter().any(|b| b == "Started"));
     }
 
     #[tokio::test]
