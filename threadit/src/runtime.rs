@@ -436,6 +436,12 @@ impl Shared {
             .is_some_and(|s| s.reply_id.is_some());
         if replied {
             self.mark_done(item).await;
+        } else if self.has_marker(item.id) {
+            // An earlier stop reply may still commit. Never send it again.
+            tracing::warn!(
+                item = item.id,
+                "threadit reply delivery is unconfirmed, item stays at working"
+            );
         } else {
             self.reply_and_finish(item, STOPPED_REPLY).await;
         }
@@ -1791,6 +1797,14 @@ mod tests {
         assert_eq!(turns, 0);
         assert!(bodies.is_empty());
         assert_eq!(emojis, ["✅"]);
+    }
+
+    #[tokio::test]
+    async fn resume_stopping_with_delivery_marker_never_replies() {
+        let (turns, bodies, emojis) = resume_case_marked("stopping", "null", true).await;
+        assert_eq!(turns, 0);
+        assert!(bodies.is_empty());
+        assert!(emojis.is_empty(), "item stays at working");
     }
 
     #[tokio::test]
