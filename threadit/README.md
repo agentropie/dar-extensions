@@ -33,9 +33,9 @@ The extension is an `agent_singleton`. It needs the `chat-pi` stock backend.
 10. If the agent asks a question, the extension posts an `elicitation` activity and replies with the question. The item stays at 👀 (`needs_input`).
 11. A failed run posts an `error` activity and replies `I could not finish this request.` The item stays at 👀.
 12. After 10 minutes with no activity, the extension posts `Still working`.
-13. A turn that runs longer than `turn_timeout_minutes` is aborted and fails. Abort and drain take at most 30 seconds, also on shutdown. The session closes after a timeout.
+13. A turn that runs longer than `turn_timeout_minutes` is aborted and fails. The limit also covers prompt submission. Abort and drain take at most 30 seconds, also on shutdown. The session closes after a timeout.
 14. Only the completion of a submitted run ends a turn. Autonomous runs are ignored.
-15. On start, `processing` items run once more. They get a `Resumed after restart` activity in place of `Started`. This holds only when the own session state is `working` or `stale`. A `stopping` item gets `Stopped on request.` and ✅. `needs_input` and `error` items are skipped. An item whose own session already has a `reply_id` only gets ✅.
+15. On start, `processing` items run once more. They get a `Resumed after restart` activity in place of `Started`. This holds only when the own session state is `working` or `stale`. A `stopping` item gets `Stopped on request.` and ✅. `needs_input` and `error` items are skipped. An item whose own session already has a `reply_id` only gets ✅. Before the first reply POST, the extension writes a marker file `data/threadit/delivering/<message_id>`. It removes the file after ✅ succeeds. On start, an item with a marker never gets a new turn or reply. It gets ✅ when the own session has a `reply_id`. Otherwise it stays at 👀 and the extension logs a warning.
 16. After a reply POST with an unknown result (timeout or 5xx), the extension reads the message again. It adds ✅ only when `reply_id` is set. It never sends the reply again.
 
 Logs use fixed categories. They hold no backend text, no session-open text, and no unknown server error codes.

@@ -80,12 +80,16 @@ async fn post_activity(
 
 /// Abort the turn and wait for the `TurnFinished` of the submitted run.
 /// The `wait` limit covers the `abort()` call and the drain. True when the session is still usable.
-async fn abort_and_drain(conn: &mut ChatConn, wait: Duration) -> bool {
+/// `origin` is the origin of the run the caller already consumed.
+async fn abort_and_drain(
+    conn: &mut ChatConn,
+    wait: Duration,
+    mut origin: Option<TurnOrigin>,
+) -> bool {
     let work = async {
         if conn.session.abort().await.is_err() {
             return false;
         }
-        let mut origin: Option<TurnOrigin> = None;
         loop {
             match conn.rx.recv().await {
                 Some(ChatEvent::TurnStarted { origin: started }) => origin = Some(started),
@@ -106,13 +110,14 @@ async fn end_for_posted(
     posted: Posted,
     conn: &mut ChatConn,
     stop_wait: Duration,
+    origin: Option<TurnOrigin>,
 ) -> Option<TurnReport> {
     let end = match posted {
         Posted::Closed => TurnEnd::ThreadClosed,
         Posted::Ok { stop: true } => TurnEnd::Stopped,
         _ => return None,
     };
-    let usable = abort_and_drain(conn, stop_wait).await;
+    let usable = abort_and_drain(conn, stop_wait, origin).await;
     Some(TurnReport {
         end,
         drop_session: !usable,
@@ -160,9 +165,22 @@ pub async fn drive_turn(
     sender: Option<AgentSender>,
     shutdown: &mut ShutdownToken,
 ) -> TurnReport {
-    let sent = match sender {
-        Some(_) => conn.session.send_turn_from(prompt, sender).await,
-        None => conn.session.send_turn(prompt).await,
+    let deadline = tokio::time::sleep(params.timeout);
+    tokio::pin!(deadline);
+    let send = async {
+        match sender {
+            Some(_) => conn.session.send_turn_from(prompt, sender).await,
+            None => conn.session.send_turn(prompt).await,
+        }
+    };
+    let sent = tokio::select! {
+        _ = shutdown.cancelled() => {
+            return TurnReport { end: TurnEnd::Shutdown, drop_session: true };
+        }
+        _ = &mut deadline => {
+            return TurnReport { end: TurnEnd::Failed("timed out"), drop_session: true };
+        }
+        sent = send => sent,
     };
     if sent.is_err() {
         return TurnReport {
@@ -175,8 +193,6 @@ pub async fn drive_turn(
     let mut answer = String::new();
     let mut silent = false;
     let mut origin: Option<TurnOrigin> = None;
-    let deadline = tokio::time::sleep(params.timeout);
-    tokio::pin!(deadline);
     let mut last_label: Option<String> = None;
     let mut last_post = Instant::now();
     let mut ticker = tokio::time::interval(params.poll);
@@ -198,14 +214,14 @@ pub async fn drive_turn(
         };
         match step {
             Step::Shutdown => {
-                let _ = abort_and_drain(conn, params.stop_wait).await;
+                let _ = abort_and_drain(conn, params.stop_wait, origin).await;
                 return TurnReport {
                     end: TurnEnd::Shutdown,
                     drop_session: true,
                 };
             }
             Step::Timeout => {
-                let _ = abort_and_drain(conn, params.stop_wait).await;
+                let _ = abort_and_drain(conn, params.stop_wait, origin).await;
                 return TurnReport {
                     end: TurnEnd::Failed("timed out"),
                     drop_session: true,
@@ -215,7 +231,9 @@ pub async fn drive_turn(
                 if let Ok(message) = board.message(item_id).await {
                     if message.stop_requested_for(params.me_id) {
                         let posted = Posted::Ok { stop: true };
-                        if let Some(report) = end_for_posted(posted, conn, params.stop_wait).await {
+                        if let Some(report) =
+                            end_for_posted(posted, conn, params.stop_wait, origin).await
+                        {
                             return report;
                         }
                     }
@@ -224,7 +242,9 @@ pub async fn drive_turn(
                     let posted =
                         post_activity(board, item_id, "thought", "Still working", true).await;
                     last_post = Instant::now();
-                    if let Some(report) = end_for_posted(posted, conn, params.stop_wait).await {
+                    if let Some(report) =
+                        end_for_posted(posted, conn, params.stop_wait, origin).await
+                    {
                         return report;
                     }
                 }
@@ -250,6 +270,8 @@ pub async fn drive_turn(
                         silent = true;
                     }
                 }
+                ChatEvent::ToolCall { .. } | ChatEvent::QuestionAsked { .. }
+                    if origin == Some(TurnOrigin::Autonomous) => {}
                 ChatEvent::ToolCall { name, .. } => {
                     let Some(label) = tool_label(&name) else {
                         continue;
@@ -260,17 +282,21 @@ pub async fn drive_turn(
                     let posted = post_activity(board, item_id, "action", &label, true).await;
                     last_label = Some(label);
                     last_post = Instant::now();
-                    if let Some(report) = end_for_posted(posted, conn, params.stop_wait).await {
+                    if let Some(report) =
+                        end_for_posted(posted, conn, params.stop_wait, origin).await
+                    {
                         return report;
                     }
                 }
                 ChatEvent::QuestionAsked { questions, .. } => {
                     let text = question_text(&questions);
                     let posted = post_activity(board, item_id, "elicitation", &text, false).await;
-                    if let Some(report) = end_for_posted(posted, conn, params.stop_wait).await {
+                    if let Some(report) =
+                        end_for_posted(posted, conn, params.stop_wait, origin).await
+                    {
                         return report;
                     }
-                    let usable = abort_and_drain(conn, params.stop_wait).await;
+                    let usable = abort_and_drain(conn, params.stop_wait, origin).await;
                     return TurnReport {
                         end: TurnEnd::Question(text),
                         drop_session: !usable,
@@ -329,16 +355,48 @@ enum Replied {
 struct Shared {
     board: Board,
     me: Account,
+    marker_dir: PathBuf,
 }
 
 impl Shared {
+    fn marker_path(&self, item_id: i64) -> PathBuf {
+        self.marker_dir.join(item_id.to_string())
+    }
+
+    fn has_marker(&self, item_id: i64) -> bool {
+        self.marker_path(item_id).exists()
+    }
+
+    fn clear_marker(&self, item_id: i64) {
+        let _ = std::fs::remove_file(self.marker_path(item_id));
+    }
+
+    /// Write the delivery marker before the first reply POST.
+    fn write_marker(&self, item_id: i64) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.marker_dir)?;
+        std::fs::write(self.marker_path(item_id), b"")
+    }
+
     async fn reply_all(&self, item: &Message, text: &str) -> Replied {
+        if self.write_marker(item.id).is_err() {
+            tracing::warn!(
+                item = item.id,
+                "threadit could not write the delivery marker"
+            );
+            return Replied::Failed;
+        }
         for part in split_answer(text, MAX_BODY_CHARS) {
             match self.board.reply(item.thread_id, item.id, &part).await {
                 Ok(()) => {}
-                Err(BoardError::ThreadClosed) => return Replied::Closed,
+                Err(BoardError::ThreadClosed) => {
+                    self.clear_marker(item.id);
+                    return Replied::Closed;
+                }
                 Err(err) => {
                     tracing::warn!(item = item.id, error = %err, "threadit reply failed");
+                    if !err.is_uncertain() {
+                        self.clear_marker(item.id);
+                    }
                     return if err.is_uncertain() {
                         Replied::Uncertain
                     } else {
@@ -351,8 +409,11 @@ impl Shared {
     }
 
     async fn mark_done(&self, item: &Message) {
-        if let Err(err) = self.board.react(item.id, DONE).await {
-            tracing::warn!(item = item.id, error = %err, "threadit could not add the done reaction");
+        match self.board.react(item.id, DONE).await {
+            Ok(()) => self.clear_marker(item.id),
+            Err(err) => {
+                tracing::warn!(item = item.id, error = %err, "threadit could not add the done reaction");
+            }
         }
     }
 
@@ -426,7 +487,14 @@ impl Runtime {
         shutdown: ShutdownToken,
     ) -> Self {
         Self {
-            shared: Shared { board, me },
+            shared: Shared {
+                marker_dir: session_root
+                    .parent()
+                    .unwrap_or(&session_root)
+                    .join("delivering"),
+                board,
+                me,
+            },
             opener,
             session_root,
             poll,
@@ -530,13 +598,21 @@ impl Runtime {
             return;
         }
         // A reply exists already: the earlier run finished. Add ✅ and do not run again.
-        if resumed
-            && item
-                .session_of(self.shared.me.id)
-                .is_some_and(|s| s.reply_id.is_some())
-        {
+        let replied = item
+            .session_of(self.shared.me.id)
+            .is_some_and(|s| s.reply_id.is_some());
+        if resumed && replied {
             self.handled.insert(item.id);
             self.shared.mark_done(&item).await;
+            return;
+        }
+        // An earlier run began to deliver a reply. Never run or reply again.
+        if resumed && self.shared.has_marker(item.id) {
+            self.handled.insert(item.id);
+            tracing::warn!(
+                item = item.id,
+                "threadit reply delivery is unconfirmed, item stays at working"
+            );
             return;
         }
         match self.shared.board.react(item.id, WORKING).await {
@@ -724,6 +800,7 @@ mod tests {
         sent: SentLog,
         aborts: Arc<AtomicUsize>,
         abort_hangs: bool,
+        send_hangs: bool,
     }
 
     impl MockSession {
@@ -744,7 +821,13 @@ mod tests {
     impl ChatSession for MockSession {
         fn send_turn(&mut self, prompt: String) -> BoxFuture<'_, Result<()>> {
             self.run(prompt, None);
-            Box::pin(async { Ok(()) })
+            let hangs = self.send_hangs;
+            Box::pin(async move {
+                if hangs {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
         }
         fn send_turn_from(
             &mut self,
@@ -752,7 +835,13 @@ mod tests {
             sender: Option<AgentSender>,
         ) -> BoxFuture<'_, Result<()>> {
             self.run(prompt, sender);
-            Box::pin(async { Ok(()) })
+            let hangs = self.send_hangs;
+            Box::pin(async move {
+                if hangs {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
         }
         fn abort(&mut self) -> BoxFuture<'_, Result<()>> {
             self.aborts.fetch_add(1, Ordering::SeqCst);
@@ -814,6 +903,23 @@ mod tests {
         delay: Duration,
         abort_hangs: bool,
     ) -> (Runtime, Probe) {
+        build_runtime(base, script, on_abort, delay, abort_hangs, false)
+    }
+
+    fn build_runtime(
+        base: &str,
+        script: Vec<ChatEvent>,
+        on_abort: Vec<ChatEvent>,
+        delay: Duration,
+        abort_hangs: bool,
+        send_hangs: bool,
+    ) -> (Runtime, Probe) {
+        static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "threadit-test-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::SeqCst)
+        ));
         let (tx, rx) = mpsc::channel(256);
         let sent = SentLog::default();
         let aborts = Arc::new(AtomicUsize::new(0));
@@ -826,6 +932,7 @@ mod tests {
             sent: sent.clone(),
             aborts: aborts.clone(),
             abort_hangs,
+            send_hangs,
         };
         let opener = MockOpener {
             queue: Mutex::new(vec![ChatConn {
@@ -847,7 +954,7 @@ mod tests {
             board,
             Box::new(opener),
             me,
-            PathBuf::from("/tmp/threadit-test/sessions"),
+            root.join("sessions"),
             Duration::from_millis(20),
             Duration::from_secs(3600),
             ShutdownToken::new(shutdown_rx),
@@ -985,10 +1092,8 @@ mod tests {
         let sent = probe.sent.lock().unwrap();
         assert!(sent[0].1.is_none());
         assert!(sent[0].0.contains("[TARGET MESSAGE]") && sent[0].0.contains("Be brief"));
-        assert_eq!(
-            probe.dirs.lock().unwrap()[0],
-            PathBuf::from("/tmp/threadit-test/sessions/thread-9")
-        );
+        let dir = probe.dirs.lock().unwrap()[0].clone();
+        assert!(dir.ends_with("sessions/thread-9"), "{dir:?}");
     }
 
     #[tokio::test]
@@ -1454,6 +1559,66 @@ mod tests {
         assert_eq!(emojis(&server), ["👀", "✅"]);
     }
 
+    #[tokio::test]
+    async fn autonomous_question_does_not_end_the_item() {
+        let server = MockServer::start(base_handler(SESSION_OK, ITEM)).await;
+        let script = vec![
+            started(TurnOrigin::Autonomous),
+            ChatEvent::QuestionAsked {
+                request_id: "q".into(),
+                questions: vec![],
+            },
+            tool("read", r#"{"path":"/x"}"#),
+            finished_ok(),
+            started(TurnOrigin::Submitted),
+            assistant("Real answer"),
+            finished_ok(),
+        ];
+        let (mut rt, probe) = make_runtime(&server.base, script, vec![], Duration::ZERO);
+        rt.handle_item(item(), false).await;
+        assert_eq!(probe.aborts.load(Ordering::SeqCst), 0);
+        assert!(activities(&server)
+            .iter()
+            .all(|(kind, _, _)| kind != "elicitation" && kind != "action"));
+        assert_eq!(replies(&server)[0]["body"], "Real answer");
+    }
+
+    #[tokio::test]
+    async fn autonomous_start_consumed_before_abort_keeps_drain_waiting() {
+        let handler: Handler =
+            Arc::new(
+                |req: &Req, _| match (req.method.as_str(), req.path.as_str()) {
+                    ("GET", "/api/messages/7") => (200, ITEM_STOPPED.into()),
+                    ("GET", "/api/messages/7/context") => (200, CONTEXT.into()),
+                    ("POST", "/api/messages/7/agent-activities") => (201, SESSION_OK.into()),
+                    ("POST", "/api/messages/7/reactions") => (200, ITEM.into()),
+                    ("POST", "/api/threads/9/messages") => (201, ITEM.into()),
+                    _ => (404, "{}".into()),
+                },
+            );
+        let server = MockServer::start(handler).await;
+        let script = vec![started(TurnOrigin::Autonomous)];
+        let (rt, _probe) = make_runtime(&server.base, script, vec![finished_ok()], Duration::ZERO);
+        let mut rt = with_bounds(rt, 60_000, 150);
+        rt.handle_item(item(), false).await;
+        assert!(rt.sessions.is_empty());
+        assert_eq!(replies(&server)[0]["body"], STOPPED_REPLY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_send_hits_the_deadline_and_closes_the_session() {
+        let server = MockServer::start(base_handler(SESSION_OK, ITEM)).await;
+        let (rt, _probe) = build_runtime(&server.base, vec![], vec![], Duration::ZERO, false, true);
+        let mut rt = with_bounds(rt, 100, 100);
+        rt.handle_item(item(), false).await;
+        assert!(rt.sessions.is_empty());
+        assert_eq!(
+            activities(&server).last().unwrap().1,
+            "Run failed: timed out"
+        );
+        assert_eq!(replies(&server)[0]["body"], FAILURE_REPLY);
+    }
+
     #[derive(Clone, Default)]
     struct LogBuf(Arc<Mutex<Vec<u8>>>);
 
@@ -1525,6 +1690,14 @@ mod tests {
 
     /// Run `resume_processing` for one item. Returns (turns started, replies, emojis).
     async fn resume_case(state: &str, reply_id: &str) -> (usize, Vec<String>, Vec<String>) {
+        resume_case_marked(state, reply_id, false).await
+    }
+
+    async fn resume_case_marked(
+        state: &str,
+        reply_id: &str,
+        marker: bool,
+    ) -> (usize, Vec<String>, Vec<String>) {
         let page = format!(
             r#"{{"items":[{}],"has_more":false}}"#,
             item_json(state, reply_id)
@@ -1546,7 +1719,11 @@ mod tests {
             vec![],
             Duration::ZERO,
         );
+        if marker {
+            rt.shared.write_marker(7).unwrap();
+        }
         rt.resume_processing().await;
+        assert_eq!(rt.shared.has_marker(7), marker && reply_id == "null");
         let turns = probe.sent.lock().unwrap().len();
         let bodies = replies(&server)
             .iter()
@@ -1589,6 +1766,34 @@ mod tests {
                 "{state}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn resume_with_delivery_marker_never_runs_or_replies() {
+        let (turns, bodies, emojis) = resume_case_marked("working", "null", true).await;
+        assert_eq!(turns, 0);
+        assert!(bodies.is_empty());
+        assert!(emojis.is_empty(), "item stays at working");
+        let (turns, bodies, emojis) = resume_case_marked("working", "31", true).await;
+        assert_eq!(turns, 0);
+        assert!(bodies.is_empty());
+        assert_eq!(emojis, ["✅"]);
+    }
+
+    #[tokio::test]
+    async fn uncertain_reply_leaves_marker_and_done_removes_it() {
+        let handler = uncertain_reply_handler(item_json("working", "null"));
+        let server = MockServer::start(handler).await;
+        let (mut rt, _probe) = make_runtime(
+            &server.base,
+            vec![assistant("answer"), finished_ok()],
+            vec![],
+            Duration::ZERO,
+        );
+        rt.handle_item(item(), false).await;
+        assert!(rt.shared.has_marker(7));
+        rt.shared.mark_done(&item()).await;
+        assert!(!rt.shared.has_marker(7));
     }
 
     fn uncertain_reply_handler(read_back: String) -> Handler {
