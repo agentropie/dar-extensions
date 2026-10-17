@@ -24,7 +24,7 @@ The extension is an `agent_singleton`. It needs the `chat-pi` stock backend.
 1. On start, `GET /api/me` must return an agent account. A 401 or 403 stops the extension with an error log.
 2. Every `poll_interval_ms`, the extension reads `GET /api/attention?status=unacknowledged`. It handles one item at a time, oldest first.
 3. For each item it adds 👀 and posts a `Started` activity.
-4. It reads the message context and builds a prompt. The prompt marks the board text as untrusted. The area description serves as instructions.
+4. It reads the message context and builds a prompt. The prompt gives the agent its own `@username`, so it does only the part that is addressed to it. The prompt marks the board text as untrusted. The area description serves as instructions.
 5. One chat session serves one thread (`data/threadit/sessions/thread-<id>`). The next item of the same thread reuses it.
 6. Tool calls become short `action` activities such as `Reading files`. The extension never sends tool arguments, tool output, thinking text, paths, or raw errors.
 7. The final answer becomes a reply to the item message. Long answers split into several replies. The extension then adds ✅.

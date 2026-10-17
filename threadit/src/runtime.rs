@@ -657,7 +657,11 @@ impl Runtime {
                 return;
             }
         };
-        let prompt = build_prompt(self.shared.board.base_url(), &context);
+        let prompt = build_prompt(
+            self.shared.board.base_url(),
+            &self.shared.me.username,
+            &context,
+        );
 
         let key = format!("thread:{}", item.thread_id);
         let conn = match self.sessions.remove(&key) {
