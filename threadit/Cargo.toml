@@ -12,6 +12,7 @@ requires_stock = ["chat-pi"]
 anyhow = "1"
 async-trait = "0.1"
 dar-extension-sdk = "0.6"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }

@@ -1537,6 +1537,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dar-extension-sdk",
+ "regex",
  "reqwest",
  "rustls",
  "serde",

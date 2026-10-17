@@ -7,6 +7,7 @@ mod api;
 mod config;
 mod labels;
 mod prompt;
+mod redact;
 mod runtime;
 
 use std::path::Path;
@@ -91,6 +92,7 @@ impl Extension for ThreaditExtension {
                 session_root,
                 poll,
                 turn_timeout,
+                cfg.activity == config::ActivityMode::Detailed,
                 shutdown,
             ));
             Ok(())

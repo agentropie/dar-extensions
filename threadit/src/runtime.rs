@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::api::{split_answer, Account, Board, BoardError, Message, MAX_BODY_CHARS};
-use crate::labels::tool_label;
+use crate::labels::{detailed_tool_label, tool_label};
 use crate::prompt::build_prompt;
 
 const WORKING: &str = "👀";
@@ -163,6 +163,8 @@ pub struct TurnParams {
     pub timeout: Duration,
     /// Longest time an abort and drain may take.
     pub stop_wait: Duration,
+    /// Add a redacted target to tool labels.
+    pub detailed: bool,
 }
 
 /// Send the prompt and map chat events to board activities until the turn ends.
@@ -282,8 +284,13 @@ pub async fn drive_turn(
                 }
                 ChatEvent::ToolCall { .. } | ChatEvent::QuestionAsked { .. }
                     if origin == Some(TurnOrigin::Autonomous) => {}
-                ChatEvent::ToolCall { name, .. } => {
-                    let Some(label) = tool_label(&name) else {
+                ChatEvent::ToolCall { name, args, .. } => {
+                    let label = if params.detailed {
+                        detailed_tool_label(&name, &args)
+                    } else {
+                        tool_label(&name)
+                    };
+                    let Some(label) = label else {
                         continue;
                     };
                     if last_label.as_deref() == Some(label.as_str()) {
@@ -487,6 +494,7 @@ pub struct Runtime {
     heartbeat: Duration,
     turn_timeout: Duration,
     stop_wait: Duration,
+    detailed: bool,
     sessions: HashMap<String, ChatConn>,
     handled: HashSet<i64>,
     shutdown: ShutdownToken,
@@ -517,10 +525,17 @@ impl Runtime {
             heartbeat: HEARTBEAT,
             turn_timeout,
             stop_wait: STOP_WAIT,
+            detailed: false,
             sessions: HashMap::new(),
             handled: HashSet::new(),
             shutdown,
         }
+    }
+
+    /// Show redacted tool targets in activity labels.
+    pub fn with_detailed(mut self, detailed: bool) -> Self {
+        self.detailed = detailed;
+        self
     }
 
     #[cfg(test)]
@@ -701,6 +716,7 @@ impl Runtime {
             heartbeat: self.heartbeat,
             timeout: self.turn_timeout,
             stop_wait: self.stop_wait,
+            detailed: self.detailed,
         };
         let report = drive_turn(
             &self.shared.board,
@@ -747,6 +763,7 @@ pub async fn run(
     session_root: PathBuf,
     poll: Duration,
     turn_timeout: Duration,
+    detailed: bool,
     mut shutdown: ShutdownToken,
 ) {
     dar_extension_sdk::log::event(
@@ -808,7 +825,8 @@ pub async fn run(
         poll,
         turn_timeout,
         shutdown.clone(),
-    );
+    )
+    .with_detailed(detailed);
     rt.resume_processing().await;
     while !shutdown.is_cancelled() {
         rt.poll_once().await;
@@ -1087,6 +1105,52 @@ mod tests {
             id: "t".into(),
             name: name.into(),
             args: args.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn detailed_mode_adds_redacted_targets_only() {
+        let server = MockServer::start(base_handler(SESSION_OK, ITEM)).await;
+        let script = vec![
+            tool("read", r#"{"path":"/a/b/c/d/notes.md"}"#),
+            tool("read", r#"{"path":"/a/b/c/d/notes.md"}"#),
+            ChatEvent::ToolOutput {
+                id: "t".into(),
+                text: "TOP-SECRET-OUTPUT".into(),
+                is_error: false,
+                done: true,
+            },
+            ChatEvent::Delta {
+                role: ChatRole::Thinking,
+                text: "private thoughts".into(),
+            },
+            tool(
+                "bash",
+                r#"{"command":"cd /x && curl -u alice:hunter2 host"}"#,
+            ),
+            tool("bash", "unparsable"),
+            tool("task.checkpoint", r#"{"id":"x"}"#),
+            assistant("Done."),
+            finished_ok(),
+        ];
+        let (rt, _probe) = make_runtime(&server.base, script, vec![], Duration::ZERO);
+        let mut rt = rt.with_detailed(true);
+        rt.handle_item(item(), false).await;
+
+        let acts = activities(&server);
+        let bodies: Vec<&str> = acts.iter().map(|a| a.1.as_str()).collect();
+        assert_eq!(
+            bodies,
+            [
+                "Started",
+                "Reading …/c/d/notes.md",
+                "Running: curl …",
+                "Running commands"
+            ]
+        );
+        let all: String = server.requests().iter().map(|r| r.body.clone()).collect();
+        for leak in ["hunter2", "alice", "TOP-SECRET", "private thoughts"] {
+            assert!(!all.contains(leak), "leaked {leak}");
         }
     }
 
@@ -1525,6 +1589,7 @@ mod tests {
                     PathBuf::from("/tmp/x"),
                     Duration::from_millis(20),
                     Duration::from_secs(3600),
+                    false,
                     ShutdownToken::new(rx),
                 ),
             )
@@ -1555,6 +1620,7 @@ mod tests {
             PathBuf::from("/tmp/x"),
             Duration::from_millis(10),
             Duration::from_secs(3600),
+            false,
             ShutdownToken::new(rx),
         );
         let stopper = async {

@@ -13,6 +13,7 @@ extensions:
     poll_interval_ms: 5000            # default 5000, minimum 1000
     backend: pi                       # optional chat backend id
     turn_timeout_minutes: 60          # default 60, minimum 1
+    activity: safe                    # safe (default) | detailed
 ```
 
 Token: set `THREADIT_TOKEN` in the agent `.env` file. It is required. The extension never logs it. Register an agent account first and get it approved. See `<base_url>/skill.md`.
@@ -26,7 +27,7 @@ The extension is an `agent_singleton`. It needs the `chat-pi` stock backend.
 3. For each item it adds 👀 and posts a `Started` activity.
 4. It reads the message context and builds a prompt. The prompt gives the agent its own `@username`, so it does only the part that is addressed to it. The prompt marks the board text as untrusted. It explains that the extension posts the reply in a mention run, so the agent does not post it a second time. The agent can still use the board API for other actions, for example in a side chat. The area description serves as instructions.
 5. One chat session serves one thread (`data/threadit/sessions/thread-<id>`). The next item of the same thread reuses it.
-6. Tool calls become short `action` activities such as `Reading files`. The extension never sends tool arguments, tool output, thinking text, paths, or raw errors.
+6. Tool calls become short `action` activities such as `Reading files`. With `activity: safe` (default), the extension never sends tool arguments, tool output, thinking text, paths, or raw errors. With `activity: detailed`, labels add a redacted target from the tool arguments: `Reading …/b/c/d.md` (last 3 path segments), `Running: git log …` (only the program and its leading plain words, no flags, env assignments, or quoted parts), or one short identifying argument such as `Using get issue: ALG-1` (URLs as host and path only, at most 60 characters). Secrets are masked. Arguments that are not a JSON object fall back to the safe label. Tool output, thinking text, and raw errors are never sent in either mode. The setting is read at start; restart to change it. Any other value is a config error.
 7. The final answer becomes a reply to the item message. Long answers split into several replies. The extension then adds ✅.
 8. An answer of exactly `NO_REPLY` posts nothing. It only adds ✅.
 9. A stop request from a human aborts the turn. Any activity response can carry it. If it arrives before the turn starts, the backend does not start. The extension replies `Stopped on request.` and adds ✅.

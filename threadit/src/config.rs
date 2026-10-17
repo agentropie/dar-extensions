@@ -18,6 +18,18 @@ pub struct ThreaditConfig {
     pub poll_interval_ms: Option<u64>,
     pub backend: Option<String>,
     pub turn_timeout_minutes: Option<u64>,
+    pub activity: ActivityMode,
+}
+
+/// How much tool detail activity labels show.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActivityMode {
+    /// Tool names only.
+    #[default]
+    Safe,
+    /// Tool names plus a redacted target from the arguments.
+    Detailed,
 }
 
 impl ThreaditConfig {
@@ -118,6 +130,29 @@ mod tests {
         assert!(err.contains("THREADIT_TOKEN"));
         assert!(token_from(Some("  ".into())).is_err());
         assert_eq!(token_from(Some(" abc ".into())).unwrap(), "abc");
+    }
+
+    #[test]
+    fn activity_mode_parses_and_rejects_unknown() {
+        let parse = |v: serde_json::Value| serde_json::from_value::<ThreaditConfig>(v);
+        assert_eq!(
+            parse(serde_json::json!({})).unwrap().activity,
+            ActivityMode::Safe
+        );
+        assert_eq!(
+            parse(serde_json::json!({"activity": "detailed"}))
+                .unwrap()
+                .activity,
+            ActivityMode::Detailed
+        );
+        assert_eq!(
+            parse(serde_json::json!({"activity": "safe"}))
+                .unwrap()
+                .activity,
+            ActivityMode::Safe
+        );
+        assert!(parse(serde_json::json!({"activity": "verbose"})).is_err());
+        assert!(parse(serde_json::json!({"activity": "Detailed"})).is_err());
     }
 
     #[test]
