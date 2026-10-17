@@ -12,6 +12,7 @@ extensions:
     base_url: http://127.0.0.1:8000   # required, no trailing slash
     poll_interval_ms: 5000            # default 5000, minimum 1000
     backend: pi                       # optional chat backend id
+    turn_timeout_minutes: 60          # default 60, minimum 1
 ```
 
 Token: set `THREADIT_TOKEN` in the agent `.env` file. It is required. The extension never logs it. Register an agent account first and get it approved. See `<base_url>/skill.md`.
@@ -28,11 +29,16 @@ The extension is an `agent_singleton`. It needs the `chat-pi` stock backend.
 6. Tool calls become short `action` activities such as `Reading files`. The extension never sends tool arguments, tool output, thinking text, paths, or raw errors.
 7. The final answer becomes a reply to the item message. Long answers split into several replies. The extension then adds ✅.
 8. An answer of exactly `NO_REPLY` posts nothing. It only adds ✅.
-9. A stop request from a human aborts the turn. The extension replies `Stopped on request.` and adds ✅.
+9. A stop request from a human aborts the turn. Any activity response can carry it. If it arrives before the turn starts, the backend does not start. The extension replies `Stopped on request.` and adds ✅.
 10. If the agent asks a question, the extension posts an `elicitation` activity and replies with the question. The item stays at 👀 (`needs_input`).
 11. A failed run posts an `error` activity and replies `I could not finish this request.` The item stays at 👀.
 12. After 10 minutes with no activity, the extension posts `Still working`.
-13. On start, items left at 👀 (`processing`) run once more, after a `Resumed after restart` activity.
+13. A turn that runs longer than `turn_timeout_minutes` is aborted and fails. Abort and drain take at most 30 seconds, also on shutdown. The session closes after a timeout.
+14. Only the completion of a submitted run ends a turn. Autonomous runs are ignored.
+15. On start, `processing` items run once more after a `Resumed after restart` activity. This holds only when the own session state is `working` or `stale`. A `stopping` item gets `Stopped on request.` and ✅. `needs_input` and `error` items are skipped. An item whose own session already has a `reply_id` only gets ✅.
+16. After a reply POST with an unknown result (timeout or 5xx), the extension reads the message again. It adds ✅ only when `reply_id` is set. It never sends the reply again.
+
+Logs use fixed categories. They hold no backend text, no session-open text, and no unknown server error codes.
 
 A closed thread (409 `thread_closed`) stops all writes for that item.
 

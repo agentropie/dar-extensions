@@ -79,6 +79,7 @@ impl Extension for ThreaditExtension {
             std::fs::create_dir_all(&session_root)?;
 
             let poll = cfg.poll_interval();
+            let turn_timeout = cfg.turn_timeout();
             let shutdown = ctx.shutdown.clone();
             let opener = DarOpener {
                 ctx,
@@ -89,6 +90,7 @@ impl Extension for ThreaditExtension {
                 Box::new(opener),
                 session_root,
                 poll,
+                turn_timeout,
                 shutdown,
             ));
             Ok(())

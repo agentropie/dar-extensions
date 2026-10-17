@@ -9,6 +9,7 @@ use serde::Deserialize;
 pub const TOKEN_ENV: &str = "THREADIT_TOKEN";
 const DEFAULT_POLL_MS: u64 = 5000;
 const MIN_POLL_MS: u64 = 1000;
+const DEFAULT_TURN_TIMEOUT_MINUTES: u64 = 60;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -16,6 +17,7 @@ pub struct ThreaditConfig {
     pub base_url: Option<String>,
     pub poll_interval_ms: Option<u64>,
     pub backend: Option<String>,
+    pub turn_timeout_minutes: Option<u64>,
 }
 
 impl ThreaditConfig {
@@ -36,6 +38,16 @@ impl ThreaditConfig {
             self.poll_interval_ms
                 .unwrap_or(DEFAULT_POLL_MS)
                 .max(MIN_POLL_MS),
+        )
+    }
+
+    /// Longest time one turn may run. At least one minute.
+    pub fn turn_timeout(&self) -> Duration {
+        Duration::from_secs(
+            60 * self
+                .turn_timeout_minutes
+                .unwrap_or(DEFAULT_TURN_TIMEOUT_MINUTES)
+                .max(1),
         )
     }
 
@@ -88,6 +100,16 @@ mod tests {
         assert_eq!(cfg.poll_interval(), Duration::from_millis(1000));
         cfg.poll_interval_ms = Some(2500);
         assert_eq!(cfg.poll_interval(), Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn turn_timeout_has_default_and_floor() {
+        let mut cfg = ThreaditConfig::default();
+        assert_eq!(cfg.turn_timeout(), Duration::from_secs(3600));
+        cfg.turn_timeout_minutes = Some(0);
+        assert_eq!(cfg.turn_timeout(), Duration::from_secs(60));
+        cfg.turn_timeout_minutes = Some(5);
+        assert_eq!(cfg.turn_timeout(), Duration::from_secs(300));
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub const MAX_BODY_CHARS: usize = 19_000;
 #[derive(Debug)]
 pub enum BoardError {
     ThreadClosed,
-    Status { status: u16, code: String },
+    Status { status: u16, code: &'static str },
     Network(&'static str),
     Decode,
 }
@@ -33,6 +33,46 @@ impl fmt::Display for BoardError {
 }
 
 impl std::error::Error for BoardError {}
+
+impl BoardError {
+    /// True when the request may have reached the server, so the effect is unknown.
+    pub fn is_uncertain(&self) -> bool {
+        match self {
+            BoardError::ThreadClosed => false,
+            BoardError::Network(kind) => *kind != "connect",
+            BoardError::Status { status, .. } => *status >= 500,
+            BoardError::Decode => true,
+        }
+    }
+}
+
+/// Server error codes that may appear in logs. Any other code logs as `other`.
+const KNOWN_CODES: &[&str] = &[
+    "invalid_token",
+    "forbidden",
+    "not_owner",
+    "not_author",
+    "not_found",
+    "thread_not_found",
+    "message_not_found",
+    "area_not_found",
+    "user_not_found",
+    "attachment_not_found",
+    "invalid_input",
+    "already_finished",
+    "not_closed",
+    "thread_closed",
+    "area_exists",
+    "username_taken",
+];
+
+fn known_code(code: &str) -> &'static str {
+    KNOWN_CODES
+        .iter()
+        .find(|known| **known == code)
+        .copied()
+        .unwrap_or("other")
+}
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Account {
@@ -56,6 +96,12 @@ pub struct Session {
     pub agent: Account,
     #[serde(default)]
     pub stop_requested: Option<Value>,
+    /// Server-derived state: `working`, `stale`, `needs_input`, `error`, `stopping`, and others.
+    #[serde(default)]
+    pub state: String,
+    /// Id of the newest reply by this agent to the message.
+    #[serde(default)]
+    pub reply_id: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -76,6 +122,11 @@ pub struct Message {
 }
 
 impl Message {
+    /// The session of `agent_id` on this message.
+    pub fn session_of(&self, agent_id: i64) -> Option<&Session> {
+        self.agent_sessions.iter().find(|s| s.agent.id == agent_id)
+    }
+
     /// True when the session of `agent_id` on this message has a stop request.
     pub fn stop_requested_for(&self, agent_id: i64) -> bool {
         self.agent_sessions
@@ -205,10 +256,13 @@ impl Board {
                     serde_json::from_str(&text).map_err(|_| BoardError::Decode)
                 };
             }
-            let code = serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|v| v["error"]["code"].as_str().map(str::to_string))
-                .unwrap_or_default();
+            let code = known_code(
+                serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .as_ref()
+                    .and_then(|v| v["error"]["code"].as_str())
+                    .unwrap_or(""),
+            );
             if status.as_u16() == 409 && code == "thread_closed" {
                 return Err(BoardError::ThreadClosed);
             }
@@ -515,6 +569,25 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, BoardError::ThreadClosed));
+    }
+
+    #[tokio::test]
+    async fn unknown_server_code_is_not_kept() {
+        let server = MockServer::start(Arc::new(|_, _| {
+            (
+                400,
+                r#"{"error":{"code":"leak /secret/path tok-123","message":"x"}}"#.into(),
+            )
+        }))
+        .await;
+        let err = board(&server.base).me().await.unwrap_err();
+        assert_eq!(err.to_string(), "board returned 400 other");
+        let server = MockServer::start(Arc::new(|_, _| {
+            (404, r#"{"error":{"code":"message_not_found"}}"#.into())
+        }))
+        .await;
+        let err = board(&server.base).me().await.unwrap_err();
+        assert_eq!(err.to_string(), "board returned 404 message_not_found");
     }
 
     #[test]

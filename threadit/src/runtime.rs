@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use dar_extension_sdk::chat::{is_no_reply, AgentSender, ChatEvent, ChatRole, ChatSession};
+use dar_extension_sdk::chat::{
+    is_no_reply, AgentSender, ChatEvent, ChatRole, ChatSession, TurnOrigin,
+};
 use dar_extension_sdk::ShutdownToken;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -76,30 +78,41 @@ async fn post_activity(
     }
 }
 
-/// Abort the turn and wait for its `TurnFinished`. True when the session is still usable.
-async fn abort_and_drain(conn: &mut ChatConn) -> bool {
-    if conn.session.abort().await.is_err() {
-        return false;
-    }
-    let wait = async {
+/// Abort the turn and wait for the `TurnFinished` of the submitted run.
+/// The `wait` limit covers the `abort()` call and the drain. True when the session is still usable.
+async fn abort_and_drain(conn: &mut ChatConn, wait: Duration) -> bool {
+    let work = async {
+        if conn.session.abort().await.is_err() {
+            return false;
+        }
+        let mut origin: Option<TurnOrigin> = None;
         loop {
             match conn.rx.recv().await {
-                Some(ChatEvent::TurnFinished { .. }) => return true,
+                Some(ChatEvent::TurnStarted { origin: started }) => origin = Some(started),
+                Some(ChatEvent::TurnFinished { .. }) => {
+                    if origin.take() != Some(TurnOrigin::Autonomous) {
+                        return true;
+                    }
+                }
                 Some(ChatEvent::SessionClosed { .. }) | None => return false,
                 Some(_) => {}
             }
         }
     };
-    tokio::time::timeout(STOP_WAIT, wait).await.unwrap_or(false)
+    tokio::time::timeout(wait, work).await.unwrap_or(false)
 }
 
-async fn end_for_posted(posted: Posted, conn: &mut ChatConn) -> Option<TurnReport> {
+async fn end_for_posted(
+    posted: Posted,
+    conn: &mut ChatConn,
+    stop_wait: Duration,
+) -> Option<TurnReport> {
     let end = match posted {
         Posted::Closed => TurnEnd::ThreadClosed,
         Posted::Ok { stop: true } => TurnEnd::Stopped,
         _ => return None,
     };
-    let usable = abort_and_drain(conn).await;
+    let usable = abort_and_drain(conn, stop_wait).await;
     Some(TurnReport {
         end,
         drop_session: !usable,
@@ -132,6 +145,10 @@ pub struct TurnParams {
     pub me_id: i64,
     pub poll: Duration,
     pub heartbeat: Duration,
+    /// Longest time the turn may run.
+    pub timeout: Duration,
+    /// Longest time an abort and drain may take.
+    pub stop_wait: Duration,
 }
 
 /// Send the prompt and map chat events to board activities until the turn ends.
@@ -157,6 +174,9 @@ pub async fn drive_turn(
     let item_id = params.item_id;
     let mut answer = String::new();
     let mut silent = false;
+    let mut origin: Option<TurnOrigin> = None;
+    let deadline = tokio::time::sleep(params.timeout);
+    tokio::pin!(deadline);
     let mut last_label: Option<String> = None;
     let mut last_post = Instant::now();
     let mut ticker = tokio::time::interval(params.poll);
@@ -166,19 +186,28 @@ pub async fn drive_turn(
     loop {
         enum Step {
             Shutdown,
+            Timeout,
             Tick,
             Event(Option<ChatEvent>),
         }
         let step = tokio::select! {
             _ = shutdown.cancelled() => Step::Shutdown,
+            _ = &mut deadline => Step::Timeout,
             _ = ticker.tick() => Step::Tick,
             event = conn.rx.recv() => Step::Event(event),
         };
         match step {
             Step::Shutdown => {
-                let _ = conn.session.abort().await;
+                let _ = abort_and_drain(conn, params.stop_wait).await;
                 return TurnReport {
                     end: TurnEnd::Shutdown,
+                    drop_session: true,
+                };
+            }
+            Step::Timeout => {
+                let _ = abort_and_drain(conn, params.stop_wait).await;
+                return TurnReport {
+                    end: TurnEnd::Failed("timed out"),
                     drop_session: true,
                 };
             }
@@ -186,7 +215,7 @@ pub async fn drive_turn(
                 if let Ok(message) = board.message(item_id).await {
                     if message.stop_requested_for(params.me_id) {
                         let posted = Posted::Ok { stop: true };
-                        if let Some(report) = end_for_posted(posted, conn).await {
+                        if let Some(report) = end_for_posted(posted, conn, params.stop_wait).await {
                             return report;
                         }
                     }
@@ -195,7 +224,7 @@ pub async fn drive_turn(
                     let posted =
                         post_activity(board, item_id, "thought", "Still working", true).await;
                     last_post = Instant::now();
-                    if let Some(report) = end_for_posted(posted, conn).await {
+                    if let Some(report) = end_for_posted(posted, conn, params.stop_wait).await {
                         return report;
                     }
                 }
@@ -207,11 +236,20 @@ pub async fn drive_turn(
                 }
             }
             Step::Event(Some(event)) => match event {
+                ChatEvent::TurnStarted { origin: started } => origin = Some(started),
                 ChatEvent::Delta {
                     role: ChatRole::Assistant,
                     text,
-                } => answer.push_str(&text),
-                ChatEvent::Silent { .. } => silent = true,
+                } => {
+                    if origin != Some(TurnOrigin::Autonomous) {
+                        answer.push_str(&text);
+                    }
+                }
+                ChatEvent::Silent { .. } => {
+                    if origin != Some(TurnOrigin::Autonomous) {
+                        silent = true;
+                    }
+                }
                 ChatEvent::ToolCall { name, .. } => {
                     let Some(label) = tool_label(&name) else {
                         continue;
@@ -222,26 +260,26 @@ pub async fn drive_turn(
                     let posted = post_activity(board, item_id, "action", &label, true).await;
                     last_label = Some(label);
                     last_post = Instant::now();
-                    if let Some(report) = end_for_posted(posted, conn).await {
+                    if let Some(report) = end_for_posted(posted, conn, params.stop_wait).await {
                         return report;
                     }
                 }
                 ChatEvent::QuestionAsked { questions, .. } => {
                     let text = question_text(&questions);
                     let posted = post_activity(board, item_id, "elicitation", &text, false).await;
-                    if matches!(posted, Posted::Closed) {
-                        if let Some(report) = end_for_posted(posted, conn).await {
-                            return report;
-                        }
+                    if let Some(report) = end_for_posted(posted, conn, params.stop_wait).await {
+                        return report;
                     }
-                    let usable = abort_and_drain(conn).await;
+                    let usable = abort_and_drain(conn, params.stop_wait).await;
                     return TurnReport {
                         end: TurnEnd::Question(text),
                         drop_session: !usable,
                     };
                 }
-                ChatEvent::Error(text) => {
-                    tracing::warn!(item = item_id, error = %text, "threadit backend error");
+                ChatEvent::Error(_) => {
+                    tracing::warn!(item = item_id, "threadit backend reported an error");
+                }
+                ChatEvent::TurnFinished { .. } if origin.take() == Some(TurnOrigin::Autonomous) => {
                 }
                 ChatEvent::TurnFinished { ok: true, .. } => {
                     let text = std::mem::take(&mut answer);
@@ -281,7 +319,10 @@ pub async fn drive_turn(
 enum Replied {
     Ok,
     Closed,
+    /// The request failed before it reached the server.
     Failed,
+    /// The request may have reached the server. Never send it again.
+    Uncertain,
 }
 
 /// State the helpers read. It is `Sync`, so helper futures stay `Send`.
@@ -298,7 +339,11 @@ impl Shared {
                 Err(BoardError::ThreadClosed) => return Replied::Closed,
                 Err(err) => {
                     tracing::warn!(item = item.id, error = %err, "threadit reply failed");
-                    return Replied::Failed;
+                    return if err.is_uncertain() {
+                        Replied::Uncertain
+                    } else {
+                        Replied::Failed
+                    };
                 }
             }
         }
@@ -313,8 +358,47 @@ impl Shared {
 
     async fn fail_item(&self, item: &Message, reason: &str) {
         let body = format!("Run failed: {reason}");
-        let _ = post_activity(&self.board, item.id, "error", &body, false).await;
+        if matches!(
+            post_activity(&self.board, item.id, "error", &body, false).await,
+            Posted::Closed
+        ) {
+            return;
+        }
         let _ = self.reply_all(item, FAILURE_REPLY).await;
+    }
+
+    /// Reply that the run stopped and add ✅. A reply that exists already is not repeated.
+    async fn finish_stopped(&self, item: &Message) {
+        let replied = item
+            .session_of(self.me.id)
+            .is_some_and(|s| s.reply_id.is_some());
+        if replied {
+            self.mark_done(item).await;
+        } else {
+            self.reply_and_finish(item, STOPPED_REPLY).await;
+        }
+    }
+
+    /// Reply, then add ✅ when the reply is known to exist.
+    /// After an uncertain send, read the message back. Never send again.
+    async fn reply_and_finish(&self, item: &Message, text: &str) {
+        match self.reply_all(item, text).await {
+            Replied::Ok => self.mark_done(item).await,
+            Replied::Uncertain => match self.board.message(item.id).await {
+                Ok(message)
+                    if message
+                        .session_of(self.me.id)
+                        .is_some_and(|s| s.reply_id.is_some()) =>
+                {
+                    self.mark_done(item).await
+                }
+                _ => tracing::warn!(
+                    item = item.id,
+                    "threadit could not confirm the reply, item stays at working"
+                ),
+            },
+            Replied::Closed | Replied::Failed => {}
+        }
     }
 }
 
@@ -324,6 +408,8 @@ pub struct Runtime {
     session_root: PathBuf,
     poll: Duration,
     heartbeat: Duration,
+    turn_timeout: Duration,
+    stop_wait: Duration,
     sessions: HashMap<String, ChatConn>,
     handled: HashSet<i64>,
     shutdown: ShutdownToken,
@@ -336,6 +422,7 @@ impl Runtime {
         me: Account,
         session_root: PathBuf,
         poll: Duration,
+        turn_timeout: Duration,
         shutdown: ShutdownToken,
     ) -> Self {
         Self {
@@ -344,6 +431,8 @@ impl Runtime {
             session_root,
             poll,
             heartbeat: HEARTBEAT,
+            turn_timeout,
+            stop_wait: STOP_WAIT,
             sessions: HashMap::new(),
             handled: HashSet::new(),
             shutdown,
@@ -353,6 +442,18 @@ impl Runtime {
     #[cfg(test)]
     pub fn with_heartbeat(mut self, heartbeat: Duration) -> Self {
         self.heartbeat = heartbeat;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_turn_timeout(mut self, timeout: Duration) -> Self {
+        self.turn_timeout = timeout;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_stop_wait(mut self, stop_wait: Duration) -> Self {
+        self.stop_wait = stop_wait;
         self
     }
 
@@ -385,8 +486,20 @@ impl Runtime {
             if self.shutdown.is_cancelled() {
                 return;
             }
-            if !self.handled.contains(&item.id) {
-                self.handle_item(item, true).await;
+            if self.handled.contains(&item.id) {
+                continue;
+            }
+            let state = item
+                .session_of(self.shared.me.id)
+                .map(|s| s.state.as_str())
+                .unwrap_or("");
+            match state {
+                "working" | "stale" => self.handle_item(item, true).await,
+                "stopping" => {
+                    self.handled.insert(item.id);
+                    self.shared.finish_stopped(&item).await;
+                }
+                _ => {}
             }
         }
     }
@@ -416,6 +529,16 @@ impl Runtime {
             self.shared.mark_done(&item).await;
             return;
         }
+        // A reply exists already: the earlier run finished. Add ✅ and do not run again.
+        if resumed
+            && item
+                .session_of(self.shared.me.id)
+                .is_some_and(|s| s.reply_id.is_some())
+        {
+            self.handled.insert(item.id);
+            self.shared.mark_done(&item).await;
+            return;
+        }
         match self.shared.board.react(item.id, WORKING).await {
             Ok(()) => {}
             Err(BoardError::ThreadClosed) => {
@@ -437,15 +560,23 @@ impl Runtime {
                 false,
             )
             .await;
-            if matches!(posted, Posted::Closed) {
-                return;
+            match posted {
+                Posted::Closed => return,
+                Posted::Ok { stop: true } => {
+                    self.shared.finish_stopped(&item).await;
+                    return;
+                }
+                _ => {}
             }
         }
-        if matches!(
-            post_activity(&self.shared.board, item.id, "thought", "Started", false).await,
-            Posted::Closed
-        ) {
-            return;
+        let posted = post_activity(&self.shared.board, item.id, "thought", "Started", false).await;
+        match posted {
+            Posted::Closed => return,
+            Posted::Ok { stop: true } => {
+                self.shared.finish_stopped(&item).await;
+                return;
+            }
+            _ => {}
         }
 
         let context = match self.shared.board.context(item.id).await {
@@ -465,8 +596,8 @@ impl Runtime {
                 let dir = self.session_root.join(format!("thread-{}", item.thread_id));
                 match self.opener.open(&dir).await {
                     Ok(conn) => conn,
-                    Err(err) => {
-                        tracing::warn!(item = item.id, error = %err, "threadit could not open a chat session");
+                    Err(_) => {
+                        tracing::warn!(item = item.id, "threadit could not open a chat session");
                         self.shared.fail_item(&item, "backend unavailable").await;
                         return;
                     }
@@ -484,6 +615,8 @@ impl Runtime {
             me_id: self.shared.me.id,
             poll: self.poll,
             heartbeat: self.heartbeat,
+            timeout: self.turn_timeout,
+            stop_wait: self.stop_wait,
         };
         let report = drive_turn(
             &self.shared.board,
@@ -507,22 +640,13 @@ impl Runtime {
                 } else {
                     text
                 };
-                if matches!(self.shared.reply_all(&item, &text).await, Replied::Ok) {
-                    self.shared.mark_done(&item).await;
-                }
+                self.shared.reply_and_finish(&item, &text).await;
             }
             TurnEnd::Silent => self.shared.mark_done(&item).await,
             TurnEnd::Question(text) => {
                 let _ = self.shared.reply_all(&item, &text).await;
             }
-            TurnEnd::Stopped => {
-                if matches!(
-                    self.shared.reply_all(&item, STOPPED_REPLY).await,
-                    Replied::Ok
-                ) {
-                    self.shared.mark_done(&item).await;
-                }
-            }
+            TurnEnd::Stopped => self.shared.reply_and_finish(&item, STOPPED_REPLY).await,
             TurnEnd::Failed(reason) => self.shared.fail_item(&item, reason).await,
             TurnEnd::ThreadClosed => {
                 tracing::info!(item = item.id, "threadit thread closed, writes stopped");
@@ -538,6 +662,7 @@ pub async fn run(
     opener: Box<dyn SessionOpener>,
     session_root: PathBuf,
     poll: Duration,
+    turn_timeout: Duration,
     mut shutdown: ShutdownToken,
 ) {
     let me = loop {
@@ -564,7 +689,15 @@ pub async fn run(
     }
     tracing::info!(agent = %me.username, "threadit connected");
 
-    let mut rt = Runtime::new(board, opener, me, session_root, poll, shutdown.clone());
+    let mut rt = Runtime::new(
+        board,
+        opener,
+        me,
+        session_root,
+        poll,
+        turn_timeout,
+        shutdown.clone(),
+    );
     rt.resume_processing().await;
     while !shutdown.is_cancelled() {
         rt.poll_once().await;
@@ -603,6 +736,7 @@ mod tests {
         delay: Duration,
         sent: SentLog,
         aborts: Arc<AtomicUsize>,
+        abort_hangs: bool,
     }
 
     impl MockSession {
@@ -637,7 +771,11 @@ mod tests {
             self.aborts.fetch_add(1, Ordering::SeqCst);
             let tx = self.tx.clone();
             let events = self.on_abort.clone();
+            let hangs = self.abort_hangs;
             Box::pin(async move {
+                if hangs {
+                    std::future::pending::<()>().await;
+                }
                 for event in events {
                     let _ = tx.send(event).await;
                 }
@@ -662,7 +800,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop()
-                .ok_or_else(|| anyhow::anyhow!("no session"))
+                .ok_or_else(|| anyhow::anyhow!("no session /secret/open-path"))
         }
     }
 
@@ -670,7 +808,7 @@ mod tests {
         sent: SentLog,
         aborts: Arc<AtomicUsize>,
         dirs: Arc<Mutex<Vec<PathBuf>>>,
-        _shutdown: watch::Sender<bool>,
+        shutdown: watch::Sender<bool>,
     }
 
     fn make_runtime(
@@ -678,6 +816,16 @@ mod tests {
         script: Vec<ChatEvent>,
         on_abort: Vec<ChatEvent>,
         delay: Duration,
+    ) -> (Runtime, Probe) {
+        make_runtime_with(base, script, on_abort, delay, false)
+    }
+
+    fn make_runtime_with(
+        base: &str,
+        script: Vec<ChatEvent>,
+        on_abort: Vec<ChatEvent>,
+        delay: Duration,
+        abort_hangs: bool,
     ) -> (Runtime, Probe) {
         let (tx, rx) = mpsc::channel(256);
         let sent = SentLog::default();
@@ -690,6 +838,7 @@ mod tests {
             delay,
             sent: sent.clone(),
             aborts: aborts.clone(),
+            abort_hangs,
         };
         let opener = MockOpener {
             queue: Mutex::new(vec![ChatConn {
@@ -713,6 +862,7 @@ mod tests {
             me,
             PathBuf::from("/tmp/threadit-test/sessions"),
             Duration::from_millis(20),
+            Duration::from_secs(3600),
             ShutdownToken::new(shutdown_rx),
         );
         (
@@ -721,7 +871,7 @@ mod tests {
                 sent,
                 aborts,
                 dirs,
-                _shutdown: shutdown_tx,
+                shutdown: shutdown_tx,
             },
         )
     }
@@ -926,19 +1076,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_request_in_activity_response_aborts_replies_and_marks_done() {
+    async fn stop_in_started_response_replies_and_never_starts_backend() {
         let server = MockServer::start(base_handler(SESSION_STOP, ITEM)).await;
-        let on_abort = vec![ChatEvent::TurnFinished {
-            ok: false,
-            error: Some("aborted".into()),
-        }];
         let (mut rt, probe) = make_runtime(
             &server.base,
             vec![tool("bash", "{}")],
-            on_abort,
+            vec![],
             Duration::ZERO,
         );
-        // "Started" already returns a stop request, so the item stops before the run.
+        rt.handle_item(item(), false).await;
+        assert!(probe.sent.lock().unwrap().is_empty());
+        assert_eq!(probe.aborts.load(Ordering::SeqCst), 0);
+        assert_eq!(replies(&server)[0]["body"], STOPPED_REPLY);
+        assert_eq!(emojis(&server), ["👀", "✅"]);
+    }
+
+    #[tokio::test]
+    async fn stop_in_resumed_response_replies_and_never_starts_backend() {
+        let server = MockServer::start(base_handler(SESSION_STOP, ITEM)).await;
+        let (mut rt, probe) =
+            make_runtime(&server.base, vec![finished_ok()], vec![], Duration::ZERO);
+        rt.handle_item(item(), true).await;
+        assert!(probe.sent.lock().unwrap().is_empty());
+        assert_eq!(activities(&server).len(), 1);
+        assert_eq!(replies(&server)[0]["body"], STOPPED_REPLY);
+        assert_eq!(emojis(&server), ["👀", "✅"]);
+    }
+
+    /// Activity handler that answers with a stop only for one activity kind.
+    fn stop_on_kind(kind: &'static str) -> Handler {
+        Arc::new(
+            move |req: &Req, _| match (req.method.as_str(), req.path.as_str()) {
+                ("GET", "/api/messages/7/context") => (200, CONTEXT.into()),
+                ("GET", "/api/messages/7") => (200, ITEM.into()),
+                ("POST", "/api/messages/7/agent-activities") => {
+                    let hit = req.body.contains(&format!("\"kind\":\"{kind}\""));
+                    (201, if hit { SESSION_STOP } else { SESSION_OK }.into())
+                }
+                ("POST", "/api/messages/7/reactions") => (200, ITEM.into()),
+                ("POST", "/api/threads/9/messages") => (201, ITEM.into()),
+                _ => (404, "{}".into()),
+            },
+        )
+    }
+
+    fn aborted() -> Vec<ChatEvent> {
+        vec![ChatEvent::TurnFinished {
+            ok: false,
+            error: Some("aborted".into()),
+        }]
+    }
+
+    #[tokio::test]
+    async fn stop_in_question_response_stops_the_item() {
+        let server = MockServer::start(stop_on_kind("elicitation")).await;
+        let script = vec![ChatEvent::QuestionAsked {
+            request_id: "q".into(),
+            questions: vec![],
+        }];
+        let (mut rt, probe) = make_runtime(&server.base, script, aborted(), Duration::ZERO);
+        rt.handle_item(item(), false).await;
+        assert_eq!(probe.aborts.load(Ordering::SeqCst), 1);
+        let reps = replies(&server);
+        assert_eq!(reps.len(), 1);
+        assert_eq!(reps[0]["body"], STOPPED_REPLY);
+        assert_eq!(emojis(&server), ["👀", "✅"]);
+    }
+
+    #[tokio::test]
+    async fn stop_in_tool_response_stops_the_item() {
+        let server = MockServer::start(stop_on_kind("action")).await;
+        let (mut rt, probe) = make_runtime(
+            &server.base,
+            vec![tool("bash", "{}")],
+            aborted(),
+            Duration::ZERO,
+        );
+        rt.handle_item(item(), false).await;
+        assert_eq!(probe.aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(replies(&server)[0]["body"], STOPPED_REPLY);
+        assert_eq!(emojis(&server), ["👀", "✅"]);
+    }
+
+    #[tokio::test]
+    async fn stop_in_heartbeat_response_stops_the_item() {
+        // "Started" is a thought too, so stop only on the heartbeat text.
+        let handler: Handler =
+            Arc::new(
+                |req: &Req, _| match (req.method.as_str(), req.path.as_str()) {
+                    ("GET", "/api/messages/7/context") => (200, CONTEXT.into()),
+                    ("GET", "/api/messages/7") => (200, ITEM.into()),
+                    ("POST", "/api/messages/7/agent-activities") => {
+                        let beat = req.body.contains("Still working");
+                        (201, if beat { SESSION_STOP } else { SESSION_OK }.into())
+                    }
+                    ("POST", "/api/messages/7/reactions") => (200, ITEM.into()),
+                    ("POST", "/api/threads/9/messages") => (201, ITEM.into()),
+                    _ => (404, "{}".into()),
+                },
+            );
+        let server = MockServer::start(handler).await;
+        let (rt, probe) = make_runtime(&server.base, vec![], aborted(), Duration::ZERO);
+        let mut rt = rt.with_heartbeat(Duration::from_millis(40));
         rt.handle_item(item(), false).await;
         assert_eq!(probe.aborts.load(Ordering::SeqCst), 1);
         assert_eq!(replies(&server)[0]["body"], STOPPED_REPLY);
@@ -1135,12 +1374,292 @@ mod tests {
                     Box::new(opener),
                     PathBuf::from("/tmp/x"),
                     Duration::from_millis(20),
+                    Duration::from_secs(3600),
                     ShutdownToken::new(rx),
                 ),
             )
             .await
             .expect("run must return");
         }
+    }
+
+    fn with_bounds(rt: Runtime, timeout_ms: u64, stop_ms: u64) -> Runtime {
+        rt.with_turn_timeout(Duration::from_millis(timeout_ms))
+            .with_stop_wait(Duration::from_millis(stop_ms))
+    }
+
+    #[tokio::test]
+    async fn missing_completion_hits_deadline_and_drops_session() {
+        let server = MockServer::start(base_handler(SESSION_OK, ITEM)).await;
+        let (rt, probe) = make_runtime_with(&server.base, vec![], vec![], Duration::ZERO, true);
+        let mut rt = with_bounds(rt, 100, 100);
+        tokio::time::timeout(Duration::from_secs(5), rt.handle_item(item(), false))
+            .await
+            .expect("the item must end");
+        assert_eq!(probe.aborts.load(Ordering::SeqCst), 1);
+        assert!(rt.sessions.is_empty());
+        assert_eq!(
+            activities(&server).last().unwrap().1,
+            "Run failed: timed out"
+        );
+        assert_eq!(replies(&server)[0]["body"], FAILURE_REPLY);
+        assert_eq!(emojis(&server), ["👀"]);
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_wait_on_a_hung_abort() {
+        let server = MockServer::start(base_handler(SESSION_OK, ITEM)).await;
+        let (rt, probe) = make_runtime_with(&server.base, vec![], vec![], Duration::ZERO, true);
+        let mut rt = with_bounds(rt, 60_000, 100);
+        probe.shutdown.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), rt.handle_item(item(), false))
+            .await
+            .expect("shutdown must end the item");
+        assert_eq!(probe.aborts.load(Ordering::SeqCst), 1);
+        assert!(rt.sessions.is_empty());
+        assert!(replies(&server).is_empty());
+    }
+
+    fn started(origin: TurnOrigin) -> ChatEvent {
+        ChatEvent::TurnStarted { origin }
+    }
+
+    #[tokio::test]
+    async fn autonomous_completion_does_not_finish_the_item() {
+        let server = MockServer::start(base_handler(SESSION_OK, ITEM)).await;
+        let script = vec![
+            started(TurnOrigin::Autonomous),
+            assistant("AUTONOMOUS"),
+            finished_ok(),
+            started(TurnOrigin::Submitted),
+            assistant("Real answer"),
+            finished_ok(),
+        ];
+        let (mut rt, _probe) = make_runtime(&server.base, script, vec![], Duration::ZERO);
+        rt.handle_item(item(), false).await;
+        let reps = replies(&server);
+        assert_eq!(reps.len(), 1);
+        assert_eq!(reps[0]["body"], "Real answer");
+    }
+
+    #[tokio::test]
+    async fn autonomous_completion_does_not_satisfy_the_abort_drain() {
+        let handler: Handler =
+            Arc::new(
+                |req: &Req, _| match (req.method.as_str(), req.path.as_str()) {
+                    ("GET", "/api/messages/7") => (200, ITEM_STOPPED.into()),
+                    ("GET", "/api/messages/7/context") => (200, CONTEXT.into()),
+                    ("POST", "/api/messages/7/agent-activities") => (201, SESSION_OK.into()),
+                    ("POST", "/api/messages/7/reactions") => (200, ITEM.into()),
+                    ("POST", "/api/threads/9/messages") => (201, ITEM.into()),
+                    _ => (404, "{}".into()),
+                },
+            );
+        let server = MockServer::start(handler).await;
+        let on_abort = vec![started(TurnOrigin::Autonomous), finished_ok()];
+        let (rt, _probe) = make_runtime(&server.base, vec![], on_abort, Duration::ZERO);
+        let mut rt = with_bounds(rt, 60_000, 150);
+        rt.handle_item(item(), false).await;
+        // The drain saw only an autonomous finish, so the session is not usable.
+        assert!(rt.sessions.is_empty());
+        assert_eq!(replies(&server)[0]["body"], STOPPED_REPLY);
+        assert_eq!(emojis(&server), ["👀", "✅"]);
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_hold_no_raw_backend_open_or_server_text() {
+        let buf = LogBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let handler: Handler =
+            Arc::new(
+                |req: &Req, _| match (req.method.as_str(), req.path.as_str()) {
+                    ("GET", "/api/messages/7/context") => (200, CONTEXT.into()),
+                    ("POST", "/api/messages/7/agent-activities") => (201, SESSION_OK.into()),
+                    ("POST", "/api/messages/7/reactions") => (200, ITEM.into()),
+                    ("POST", "/api/threads/9/messages") => (
+                        400,
+                        r#"{"error":{"code":"leak-/secret/server-code","message":"x"}}"#.into(),
+                    ),
+                    _ => (404, "{}".into()),
+                },
+            );
+        let server = MockServer::start(handler).await;
+        let script = vec![
+            ChatEvent::Error("raw /home/user/backend-failure".into()),
+            assistant("answer"),
+            finished_ok(),
+        ];
+        let (mut rt, _probe) = make_runtime(&server.base, script, vec![], Duration::ZERO);
+        rt.handle_item(item(), false).await;
+        // The session stays cached. Clear it so the next item hits the open error.
+        rt.close_all().await;
+        rt.handle_item(item(), false).await;
+
+        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("threadit backend reported an error"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("threadit could not open a chat session"),
+            "{logs}"
+        );
+        assert!(logs.contains("board returned 400 other"), "{logs}");
+        for leak in ["/home/user", "backend-failure", "/secret", "leak-"] {
+            assert!(!logs.contains(leak), "log leaked {leak}: {logs}");
+        }
+    }
+
+    fn item_json(state: &str, reply_id: &str) -> String {
+        format!(
+            r#"{{"id":7,"thread_id":9,"author":{{"id":2,"username":"alice","account_type":"human"}},"body":"x","created_at":"t","agent_sessions":[{{"agent":{{"id":5,"username":"bot","account_type":"agent"}},"stop_requested":null,"state":"{state}","reply_id":{reply_id}}}]}}"#
+        )
+    }
+
+    /// Run `resume_processing` for one item. Returns (turns started, replies, emojis).
+    async fn resume_case(state: &str, reply_id: &str) -> (usize, Vec<String>, Vec<String>) {
+        let page = format!(
+            r#"{{"items":[{}],"has_more":false}}"#,
+            item_json(state, reply_id)
+        );
+        let handler: Handler = Arc::new(move |req: &Req, _| {
+            match (req.method.as_str(), req.path.split('?').next().unwrap()) {
+                ("GET", "/api/attention") => (200, page.clone()),
+                ("GET", "/api/messages/7/context") => (200, CONTEXT.into()),
+                ("POST", "/api/messages/7/agent-activities") => (201, SESSION_OK.into()),
+                ("POST", "/api/messages/7/reactions") => (200, ITEM.into()),
+                ("POST", "/api/threads/9/messages") => (201, ITEM.into()),
+                _ => (404, "{}".into()),
+            }
+        });
+        let server = MockServer::start(handler).await;
+        let (mut rt, probe) = make_runtime(
+            &server.base,
+            vec![assistant("fresh"), finished_ok()],
+            vec![],
+            Duration::ZERO,
+        );
+        rt.resume_processing().await;
+        let turns = probe.sent.lock().unwrap().len();
+        let bodies = replies(&server)
+            .iter()
+            .map(|v| v["body"].as_str().unwrap().to_string())
+            .collect();
+        (turns, bodies, emojis(&server))
+    }
+
+    #[tokio::test]
+    async fn resume_runs_only_working_and_stale_items() {
+        for state in ["working", "stale"] {
+            let (turns, bodies, emojis) = resume_case(state, "null").await;
+            assert_eq!(turns, 1, "{state}");
+            assert_eq!(bodies, ["fresh"]);
+            assert_eq!(emojis, ["👀", "✅"]);
+        }
+        for state in ["needs_input", "error", "queued", "done"] {
+            let (turns, bodies, emojis) = resume_case(state, "null").await;
+            assert_eq!(turns, 0, "{state}");
+            assert!(bodies.is_empty() && emojis.is_empty(), "{state}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_finishes_stopping_items_without_a_turn() {
+        let (turns, bodies, emojis) = resume_case("stopping", "null").await;
+        assert_eq!(turns, 0);
+        assert_eq!(bodies, [STOPPED_REPLY]);
+        assert_eq!(emojis, ["✅"]);
+    }
+
+    #[tokio::test]
+    async fn resume_with_existing_reply_only_adds_done() {
+        for state in ["working", "stale", "stopping"] {
+            let (turns, bodies, emojis) = resume_case(state, "31").await;
+            assert_eq!(turns, 0, "{state}");
+            assert!(bodies.is_empty(), "{state}");
+            assert!(
+                emojis.iter().all(|e| e == "✅") && !emojis.is_empty(),
+                "{state}"
+            );
+        }
+    }
+
+    fn uncertain_reply_handler(read_back: String) -> Handler {
+        Arc::new(
+            move |req: &Req, _| match (req.method.as_str(), req.path.as_str()) {
+                ("GET", "/api/messages/7/context") => (200, CONTEXT.into()),
+                ("GET", "/api/messages/7") => (200, read_back.clone()),
+                ("POST", "/api/messages/7/agent-activities") => (201, SESSION_OK.into()),
+                ("POST", "/api/messages/7/reactions") => (200, ITEM.into()),
+                ("POST", "/api/threads/9/messages") => (500, "{}".into()),
+                _ => (404, "{}".into()),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn uncertain_reply_adds_done_only_when_reply_id_is_set() {
+        for (reply_id, expect) in [("31", vec!["👀", "✅"]), ("null", vec!["👀"])] {
+            let handler = uncertain_reply_handler(item_json("working", reply_id));
+            let server = MockServer::start(handler).await;
+            let (mut rt, _probe) = make_runtime(
+                &server.base,
+                vec![assistant("answer"), finished_ok()],
+                vec![],
+                Duration::ZERO,
+            );
+            rt.handle_item(item(), false).await;
+            assert_eq!(replies(&server).len(), 1, "never resend");
+            assert_eq!(emojis(&server), expect, "reply_id {reply_id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_path_does_not_reply_after_thread_closed() {
+        let handler: Handler =
+            Arc::new(
+                |req: &Req, _| match (req.method.as_str(), req.path.as_str()) {
+                    ("GET", "/api/messages/7/context") => (500, "{}".into()),
+                    ("POST", "/api/messages/7/agent-activities") => {
+                        if req.body.contains(r#""kind":"error""#) {
+                            (
+                                409,
+                                r#"{"error":{"code":"thread_closed","message":"x"}}"#.into(),
+                            )
+                        } else {
+                            (201, SESSION_OK.into())
+                        }
+                    }
+                    ("POST", "/api/messages/7/reactions") => (200, ITEM.into()),
+                    ("POST", "/api/threads/9/messages") => (201, ITEM.into()),
+                    _ => (404, "{}".into()),
+                },
+            );
+        let server = MockServer::start(handler).await;
+        let (mut rt, _probe) =
+            make_runtime(&server.base, vec![finished_ok()], vec![], Duration::ZERO);
+        rt.handle_item(item(), false).await;
+        assert!(replies(&server).is_empty());
+        assert!(activities(&server).iter().any(|a| a.0 == "error"));
     }
 
     #[test]
