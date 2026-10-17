@@ -754,16 +754,30 @@ pub async fn run(
         "threadit",
         &format!("extension enabled; connecting to {}", board.base_url()),
     );
+    let mut unreachable_logged = false;
     let me = loop {
         match board.me().await {
             Ok(me) => break me,
             Err(BoardError::Status { status, .. }) if status == 401 || status == 403 => {
-                tracing::error!(
-                    "threadit rejected THREADIT_TOKEN (HTTP {status}); the account may be pending approval"
+                dar_extension_sdk::log::event(
+                    "-",
+                    "threadit",
+                    &format!(
+                        "{} rejected THREADIT_TOKEN (HTTP {status}): check the token or approve the account, then restart",
+                        board.base_url()
+                    ),
                 );
                 return;
             }
             Err(err) => {
+                if !unreachable_logged {
+                    unreachable_logged = true;
+                    dar_extension_sdk::log::event(
+                        "-",
+                        "threadit",
+                        &format!("cannot reach {} ({err}), retrying", board.base_url()),
+                    );
+                }
                 tracing::warn!(error = %err, "threadit could not reach the board");
                 tokio::select! {
                     _ = shutdown.cancelled() => return,
@@ -773,7 +787,11 @@ pub async fn run(
         }
     };
     if me.account_type != "agent" {
-        tracing::error!("threadit account {} is not an agent account", me.username);
+        dar_extension_sdk::log::event(
+            "-",
+            "threadit",
+            &format!("@{} is not an agent account, stopped", me.username),
+        );
         return;
     }
     dar_extension_sdk::log::event(
@@ -1478,10 +1496,19 @@ mod tests {
 
     #[tokio::test]
     async fn run_exits_on_rejected_token_and_non_agent() {
-        for (status, body) in [
-            (401, r#"{"error":{"code":"invalid_token","message":"x"}}"#),
-            (200, r#"{"id":1,"username":"u","account_type":"human"}"#),
+        for (status, body, expected) in [
+            (
+                401,
+                r#"{"error":{"code":"invalid_token","message":"x"}}"#,
+                "rejected THREADIT_TOKEN (HTTP 401)",
+            ),
+            (
+                200,
+                r#"{"id":1,"username":"u","account_type":"human"}"#,
+                "@u is not an agent account",
+            ),
         ] {
+            capture_logs();
             let handler: Handler = Arc::new(move |_, _| (status, body.into()));
             let server = MockServer::start(handler).await;
             let (_tx, rx) = watch::channel(false);
@@ -1503,7 +1530,48 @@ mod tests {
             )
             .await
             .expect("run must return");
+            let logs = CAPTURED_LOGS.with(|logs| String::from_utf8(logs.borrow().clone()).unwrap());
+            assert!(
+                logs.contains("event=\"threadit\"") || logs.contains("event=threadit"),
+                "{logs}"
+            );
+            assert!(logs.contains(expected), "{logs}");
+            assert!(!logs.contains("tok\""), "{logs}");
         }
+    }
+
+    #[tokio::test]
+    async fn run_logs_an_unreachable_board_once() {
+        capture_logs();
+        let (tx, rx) = watch::channel(false);
+        let board = Board::new("http://127.0.0.1:9", "tok").unwrap();
+        let opener = MockOpener {
+            queue: Mutex::new(vec![]),
+            dirs: Arc::default(),
+        };
+        let task = run(
+            board,
+            Box::new(opener),
+            PathBuf::from("/tmp/x"),
+            Duration::from_millis(10),
+            Duration::from_secs(3600),
+            ShutdownToken::new(rx),
+        );
+        let stopper = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            tx.send(true).unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(task, stopper)
+        })
+        .await
+        .expect("run must stop");
+        let logs = CAPTURED_LOGS.with(|logs| String::from_utf8(logs.borrow().clone()).unwrap());
+        assert_eq!(
+            logs.matches("cannot reach http://127.0.0.1:9").count(),
+            1,
+            "{logs}"
+        );
     }
 
     fn with_bounds(rt: Runtime, timeout_ms: u64, stop_ms: u64) -> Runtime {
