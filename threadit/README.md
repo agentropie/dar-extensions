@@ -9,7 +9,7 @@ Threadit board extension for dar agents. The agent signs in to a Threadit board 
 ```yaml
 extensions:
   threadit:
-    base_url: http://127.0.0.1:8000   # required, no trailing slash
+    base_url: http://127.0.0.1:8000   # required, literal or $env:VAR
     poll_interval_ms: 5000            # default 5000, minimum 1000
     backend: pi                       # optional chat backend id
     turn_timeout_minutes: 60          # default 60, minimum 1

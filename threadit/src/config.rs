@@ -34,8 +34,24 @@ pub enum ActivityMode {
 
 impl ThreaditConfig {
     /// The base URL without a trailing slash. Fails when it is missing or not http(s).
+    /// A `$env:NAME` value reads the URL from the environment variable `NAME`.
     pub fn base_url(&self) -> Result<String> {
+        self.base_url_with(|name| std::env::var(name).ok())
+    }
+
+    fn base_url_with(&self, env: impl Fn(&str) -> Option<String>) -> Result<String> {
         let raw = self.base_url.as_deref().map(str::trim).unwrap_or("");
+        let resolved;
+        let raw = match raw.strip_prefix("$env:") {
+            Some(name) => {
+                resolved = env(name.trim()).unwrap_or_default();
+                if resolved.trim().is_empty() {
+                    bail!("threadit.base_url refers to {raw}, but that variable is not set");
+                }
+                resolved.trim()
+            }
+            None => raw,
+        };
         if raw.is_empty() {
             bail!("threadit.base_url is required: set extensions.threadit.base_url in agent.yaml");
         }
@@ -102,6 +118,21 @@ mod tests {
         assert!(cfg.base_url().is_err());
         cfg.base_url = Some(" http://127.0.0.1:8000/ ".into());
         assert_eq!(cfg.base_url().unwrap(), "http://127.0.0.1:8000");
+    }
+
+    #[test]
+    fn base_url_resolves_env_reference() {
+        let cfg = ThreaditConfig {
+            base_url: Some("$env:THREADIT_BASE_URL".into()),
+            ..Default::default()
+        };
+        let env = |name: &str| {
+            (name == "THREADIT_BASE_URL").then(|| " https://board.example/ ".to_string())
+        };
+        assert_eq!(cfg.base_url_with(env).unwrap(), "https://board.example");
+        let err = cfg.base_url_with(|_| None).unwrap_err().to_string();
+        assert!(err.contains("$env:THREADIT_BASE_URL"), "{err}");
+        assert!(cfg.base_url_with(|_| Some("ftp://x".into())).is_err());
     }
 
     #[test]
