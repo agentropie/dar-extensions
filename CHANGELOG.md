@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **whatsapp-web:** unaddressed allowed-group media reaches the next tagged turn with kind and path; addressed replies attach quoted media, including voice notes. (ALG-622)
+
 ### Added
 
 - **whatsapp-web:** assistant text before each tool call is sent as its own message instead of waiting for the turn to end, when `stream_replies: true` (opt-in; default false keeps one reply per turn). (ALG-476)
