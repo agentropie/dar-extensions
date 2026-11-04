@@ -43,6 +43,7 @@ The agent calls:
 30 seconds: the engine uses successive windows and sentence boundaries.
 Names, addresses and amounts can be wrong even with keyword biasing; verify
 important details against the recording. Call keywords augment config keywords.
+Whistle is best suited to short voice notes; accuracy drops on recordings over a few minutes, and names or amounts can be wrong or missing late in long audio.
 Paths must resolve inside the agent root; directories and escaping symlinks are
 rejected. WAV input is passed unchanged to the helper after header validation;
 PCM8/16/24/32 and float32/64 with arbitrary sample rates/channels are accepted.
