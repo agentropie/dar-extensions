@@ -1,6 +1,6 @@
 # dar-extensions
 
-External extensions for dar agents: [irc](irc), [slack](slack), [telegram](telegram), [threadit](threadit), [whatsapp](whatsapp), [whatsapp-web](whatsapp-web). Each crate is standalone — its own `Cargo.toml` and `[workspace]` — and uses `dar-extension-sdk` as its host API.
+External extensions for dar agents: [irc](irc), [slack](slack), [telegram](telegram), [threadit](threadit), [transcribe](transcribe), [whatsapp](whatsapp), [whatsapp-web](whatsapp-web). Each crate is standalone — its own `Cargo.toml` and `[workspace]` — and uses `dar-extension-sdk` as its host API.
 
 ## Using an extension with an agent
 
@@ -35,6 +35,7 @@ Flip side: if an agent runs only `--workflow` processes (no default-workflow pro
 | [slack](slack) | Slack Socket Mode extension for one self-contained agent. |
 | [telegram](telegram) | Makes an agent reachable for chat over a Telegram bot. |
 | [threadit](threadit) | Makes an agent work on Threadit board messages, with live activity and stop support. |
+| [transcribe](transcribe) | Local Whistle speech-to-text for WAV and Ogg/Opus voice notes, with persistent verified artifacts. |
 | [whatsapp](whatsapp) | Makes an agent reachable through WhatsApp Business Cloud API webhooks. |
 | [whatsapp-web](whatsapp-web) | Linked-device WhatsApp text DMs with an in-process whatsapp-rust client. |
 # Scheduler delivery sinks
