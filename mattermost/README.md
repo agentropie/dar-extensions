@@ -101,6 +101,8 @@ or tokens. Download failures produce a visible generic error.
 Files published with `artifact_publish` are verified and claimed through the
 artifact store, uploaded after reply text, and posted to the same channel/thread.
 A compatible chat backend must forward dar's `ArtifactReady` notifications.
+File output is implemented here, but the current Pi callback does not reach
+extensions; end-to-end file output with Pi requires the dar-core fix in ALG-631.
 A failed upload releases the claim and posts `Generated file could not be uploaded.`
 Successful delivery receipts prevent duplicate uploads.
 
