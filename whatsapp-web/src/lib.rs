@@ -304,6 +304,10 @@ struct Inbound {
 }
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 struct Attachment {
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    quoted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -554,12 +558,14 @@ fn bot_users(message: &MessageContext) -> Vec<String> {
         .collect()
 }
 fn attachment_from(
+    kind: &str,
     name: Option<&String>,
     mime: Option<&String>,
     caption: Option<&String>,
     media: &dyn Downloadable,
 ) -> Attachment {
     Attachment {
+        kind: Some(kind.into()),
         name: name.cloned(),
         mime: mime.cloned(),
         caption: caption.filter(|c| !c.is_empty()).cloned(),
@@ -573,21 +579,31 @@ fn media_items(message: &wa::Message) -> Vec<(&'static str, Attachment, &dyn Dow
     if let Some(m) = base.image_message.as_option() {
         items.push((
             "image",
-            attachment_from(None, m.mimetype.as_ref(), m.caption.as_ref(), m),
+            attachment_from("image", None, m.mimetype.as_ref(), m.caption.as_ref(), m),
             m,
         ));
     }
     if let Some(m) = base.video_message.as_option() {
         items.push((
             "video",
-            attachment_from(None, m.mimetype.as_ref(), m.caption.as_ref(), m),
+            attachment_from("video", None, m.mimetype.as_ref(), m.caption.as_ref(), m),
             m,
         ));
     }
     if let Some(m) = base.audio_message.as_option() {
         items.push((
             "audio",
-            attachment_from(None, m.mimetype.as_ref(), None, m),
+            attachment_from(
+                if m.ptt == Some(true) {
+                    "voice note"
+                } else {
+                    "audio"
+                },
+                None,
+                m.mimetype.as_ref(),
+                None,
+                m,
+            ),
             m,
         ));
     }
@@ -595,6 +611,7 @@ fn media_items(message: &wa::Message) -> Vec<(&'static str, Attachment, &dyn Dow
         items.push((
             "document",
             attachment_from(
+                "document",
                 m.file_name.as_ref(),
                 m.mimetype.as_ref(),
                 m.caption.as_ref(),
@@ -606,7 +623,7 @@ fn media_items(message: &wa::Message) -> Vec<(&'static str, Attachment, &dyn Dow
     if let Some(m) = base.sticker_message.as_option() {
         items.push((
             "sticker",
-            attachment_from(None, m.mimetype.as_ref(), None, m),
+            attachment_from("sticker", None, m.mimetype.as_ref(), None, m),
             m,
         ));
     }
@@ -718,9 +735,18 @@ fn reply_of(message: &wa::Message, bot: &[String]) -> Option<Reply> {
             .participant
             .as_deref()
             .map(|p| describe_participant(p, bot)),
-        text: quoted
-            .and_then(|q| q.text_content().or_else(|| q.get_caption()))
-            .map(str::to_owned),
+        text: quoted.and_then(|q| {
+            q.text_content()
+                .or_else(|| q.get_caption())
+                .filter(|text| !text.trim().is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    media_items(q)
+                        .first()
+                        .and_then(|(_, attachment, _)| attachment.kind.as_deref())
+                        .map(|kind| format!("[{kind}]"))
+                })
+        }),
     })
 }
 async fn from_message(message: &MessageContext, cfg: &Config) -> Option<Inbound> {
@@ -817,6 +843,13 @@ fn sends_as_image(mime: Option<&str>) -> bool {
     matches!(mime, Some("image/jpeg" | "image/png" | "image/webp"))
 }
 trait Transport: Clone + Send + Sync + 'static {
+    /// Downloads at most `limit` quoted media items; failures become skipped entries.
+    fn quoted_attachments(
+        &self,
+        uploads: &Path,
+        message_id: &str,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Vec<Attachment>> + Send;
     fn read(&self) -> impl std::future::Future<Output = Result<()>> + Send;
     fn typing(&self, active: bool) -> impl std::future::Future<Output = Result<()>> + Send;
     /// Sends a reply quoting the inbound message and returns the sent message id.
@@ -834,6 +867,31 @@ trait Transport: Clone + Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Vec<Attachment>> + Send;
 }
 impl Transport for MessageContext {
+    async fn quoted_attachments(
+        &self,
+        uploads: &Path,
+        message_id: &str,
+        limit: usize,
+    ) -> Vec<Attachment> {
+        let Some(context) = self.message.context_info() else {
+            return Vec::new();
+        };
+        let Some(quoted) = context.quoted_message.as_option() else {
+            return Vec::new();
+        };
+        let fallback_id = format!("quoted-{message_id}");
+        let id = context
+            .stanza_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty() && safe_filename(id).is_some())
+            .unwrap_or(&fallback_id);
+        let mut saved = Vec::new();
+        for (kind, mut attachment, media) in media_items(quoted).into_iter().take(limit) {
+            attachment.quoted = true;
+            saved.push(save_media(&self.client, media, kind, attachment, uploads, id).await);
+        }
+        saved
+    }
     async fn read(&self) -> Result<()> {
         self.client.mark_message_read(&self.message_ref()?).await?;
         Ok(())
@@ -1547,17 +1605,24 @@ async fn process<T: Transport>(
             return Ok(());
         }
         Kind::Unaddressed => {
-            chat.notes.remember(&inbound.message_id, &inbound.text);
-            let text = if inbound.text.is_empty() {
-                "[media]"
-            } else {
-                &inbound.text
-            };
-            let line = format!(
-                "{} {label}: {}",
-                inbound.header.time,
-                snippet(text, MAX_SNIPPET)
-            );
+            let session_dir = generation_dir(&root.join(&chat.key))?;
+            let mut attachments = transport
+                .attachments(&session_dir.join("uploads"), &inbound.message_id)
+                .await;
+            agent_relative_paths(&mut attachments, root, &session_dir);
+            let mut body = snippet(&inbound.text, MAX_SNIPPET);
+            for attachment in attachments {
+                if !body.is_empty() {
+                    body.push(' ');
+                }
+                body.push_str(&format!(
+                    "[{}: {}]",
+                    attachment.kind.as_deref().unwrap_or("attachment"),
+                    attachment.path.as_deref().unwrap_or("not downloaded")
+                ));
+            }
+            chat.notes.remember(&inbound.message_id, &body);
+            let line = format!("{} {label}: {body}", inbound.header.time);
             chat.notes.push(&inbound.session_key, line);
             return Ok(());
         }
@@ -1607,6 +1672,19 @@ async fn process<T: Transport>(
     let mut attachments = transport
         .attachments(&session_dir.join("uploads"), &inbound.message_id)
         .await;
+    let remaining = MAX_ATTACHMENTS.saturating_sub(attachments.len());
+    let quoted_by_agent = inbound
+        .header
+        .reply
+        .as_ref()
+        .is_some_and(|reply| reply.who.as_deref() == Some("you"));
+    if remaining > 0 && !quoted_by_agent {
+        attachments.extend(
+            transport
+                .quoted_attachments(&session_dir.join("uploads"), &inbound.message_id, remaining)
+                .await,
+        );
+    }
     // The agent's file tools resolve paths from the agent root
     // (`<root>/.whatsapp-web/sessions`); report paths relative to it.
     agent_relative_paths(&mut attachments, root, &session_dir);
@@ -2245,6 +2323,35 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeTransport(Arc<Mutex<Vec<String>>>);
     impl Transport for FakeTransport {
+        async fn quoted_attachments(&self, _: &Path, id: &str, limit: usize) -> Vec<Attachment> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("quoted_attachments:{id}:{limit}"));
+            if id == "quote-skipped" {
+                return vec![Attachment {
+                    kind: Some("voice note".into()),
+                    quoted: true,
+                    skipped: Some("download failed".into()),
+                    ..Default::default()
+                }]
+                .into_iter()
+                .take(limit)
+                .collect();
+            }
+            if !matches!(id, "quote" | "many" | "full") {
+                return Vec::new();
+            }
+            vec![Attachment {
+                kind: Some("voice note".into()),
+                quoted: true,
+                path: Some("uploads/earlier-voice-audio.ogg".into()),
+                ..Default::default()
+            }]
+            .into_iter()
+            .take(limit)
+            .collect()
+        }
         fn chat_id(&self) -> String {
             "chat@g.us".into()
         }
@@ -2277,6 +2384,31 @@ mod tests {
             Some("Family".into())
         }
         async fn attachments(&self, _: &Path, id: &str) -> Vec<Attachment> {
+            self.0.lock().unwrap().push(format!("attachments:{id}"));
+            if matches!(id, "many" | "full") {
+                return vec![
+                    Attachment {
+                        kind: Some("image".into()),
+                        skipped: Some("larger than 25 MiB".into()),
+                        ..Default::default()
+                    };
+                    if id == "many" { 9 } else { 10 }
+                ];
+            }
+            if id == "voice" {
+                return vec![Attachment {
+                    kind: Some("voice note".into()),
+                    path: Some("uploads/voice-audio.ogg".into()),
+                    ..Default::default()
+                }];
+            }
+            if id == "voice-skipped" {
+                return vec![Attachment {
+                    kind: Some("voice note".into()),
+                    skipped: Some("download timed out".into()),
+                    ..Default::default()
+                }];
+            }
             if id != "photo" {
                 return Vec::new();
             }
@@ -2289,6 +2421,9 @@ mod tests {
     #[derive(Clone, Default)]
     struct HungReadTransport(FakeTransport);
     impl Transport for HungReadTransport {
+        async fn quoted_attachments(&self, _: &Path, _: &str, _: usize) -> Vec<Attachment> {
+            Vec::new()
+        }
         fn chat_id(&self) -> String {
             self.0.chat_id()
         }
@@ -2314,6 +2449,9 @@ mod tests {
     #[derive(Clone, Default)]
     struct HungSendTransport(FakeTransport);
     impl Transport for HungSendTransport {
+        async fn quoted_attachments(&self, _: &Path, _: &str, _: usize) -> Vec<Attachment> {
+            Vec::new()
+        }
         fn chat_id(&self) -> String {
             self.0.chat_id()
         }
@@ -2363,6 +2501,9 @@ mod tests {
         }
     }
     impl Transport for PlanTransport {
+        async fn quoted_attachments(&self, _: &Path, _: &str, _: usize) -> Vec<Attachment> {
+            Vec::new()
+        }
         fn chat_id(&self) -> String {
             self.inner.chat_id()
         }
@@ -2496,6 +2637,393 @@ mod tests {
             .iter()
             .any(|a| a.starts_with("send:") && a.ends_with("hello"))
     }
+    fn group_media(id: &str) -> Inbound {
+        let mut message = inbound("group-7001".into(), Some("15550001".into()), String::new());
+        message.group = Some("7001".into());
+        message.header.group = Some("7001".into());
+        message.header.name = "Mira".into();
+        message.message_id = id.into();
+        message.kind = Kind::Unaddressed;
+        message
+    }
+    #[test]
+    fn media_labels_distinguish_voice_notes_from_audio() {
+        for (ptt, label) in [
+            (Some(true), "voice note"),
+            (Some(false), "audio"),
+            (None, "audio"),
+        ] {
+            let mut message = wa::Message::default();
+            message.audio_message.get_or_insert_default().ptt = ptt;
+            let metadata: serde_json::Value =
+                serde_json::from_str(&serde_json::to_string(&media_items(&message)[0].1).unwrap())
+                    .unwrap();
+            assert_eq!(metadata["kind"], label);
+        }
+        for label in ["image", "video", "document", "sticker"] {
+            let mut message = wa::Message::default();
+            match label {
+                "image" => {
+                    message.image_message.get_or_insert_default();
+                }
+                "video" => {
+                    message.video_message.get_or_insert_default();
+                }
+                "document" => {
+                    message.document_message.get_or_insert_default();
+                }
+                "sticker" => {
+                    message.sticker_message.get_or_insert_default();
+                }
+                _ => unreachable!(),
+            }
+            let metadata: serde_json::Value =
+                serde_json::from_str(&serde_json::to_string(&media_items(&message)[0].1).unwrap())
+                    .unwrap();
+            assert_eq!(metadata["kind"], label);
+        }
+    }
+    fn voice_quote(author: &str) -> wa::Message {
+        let mut message = wa::Message::default();
+        let context = message
+            .extended_text_message
+            .get_or_insert_default()
+            .context_info
+            .get_or_insert_default();
+        context.participant = Some(author.into());
+        context.stanza_id = Some("earlier-voice".into());
+        context
+            .quoted_message
+            .get_or_insert_default()
+            .audio_message
+            .get_or_insert_default()
+            .ptt = Some(true);
+        message
+    }
+    #[test]
+    fn quoted_media_header_uses_kind_when_text_is_empty() {
+        let bot = vec!["15550009".into()];
+        let message = voice_quote("15550002@s.whatsapp.net");
+        let header = Header {
+            reply: reply_of(&message, &bot),
+            ..Default::default()
+        };
+        assert!(header_text(&header, None).contains("↪ replying to +15550002: \"[voice note]\""));
+        let mut message = message;
+        let quoted = message
+            .extended_text_message
+            .get_or_insert_default()
+            .context_info
+            .get_or_insert_default()
+            .quoted_message
+            .get_or_insert_default();
+        quoted.audio_message = Default::default();
+        quoted.image_message.get_or_insert_default().caption = Some("".into());
+        let header = Header {
+            reply: reply_of(&message, &bot),
+            ..Default::default()
+        };
+        assert!(header_text(&header, None).contains("\"[image]\""));
+        message
+            .extended_text_message
+            .get_or_insert_default()
+            .context_info
+            .get_or_insert_default()
+            .quoted_message
+            .get_or_insert_default()
+            .image_message
+            .get_or_insert_default()
+            .caption = Some("a map".into());
+        let header = Header {
+            reply: reply_of(&message, &bot),
+            ..Default::default()
+        };
+        assert!(header_text(&header, None).contains("\"a map\""));
+    }
+    #[tokio::test]
+    async fn addressed_quote_attaches_media_with_quoted_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(".whatsapp-web/sessions");
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("group-7001");
+        let mut message = group_media("quote");
+        message.kind = Kind::Turn;
+        message.text = "@bot explain".into();
+        message.header.reply = reply_of(
+            &voice_quote("15550002@s.whatsapp.net"),
+            &["15550009".into()],
+        );
+        process(
+            &mut chat,
+            &ctx,
+            &Config::default(),
+            &root,
+            message,
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        let sent = sends(&transport);
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("↪ replying to +15550002: \"[voice note]\""));
+        assert!(sent[0].contains("\"quoted\":true"));
+        assert!(sent[0].contains(
+            "\"path\":\".whatsapp-web/sessions/group-7001/1/uploads/earlier-voice-audio.ogg\""
+        ));
+    }
+    #[tokio::test]
+    async fn agent_authored_quote_is_shown_without_downloading_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = FakeTransport::default();
+        let mut message = group_media("quote");
+        message.kind = Kind::Turn;
+        message.text = "@bot explain".into();
+        message.header.reply = reply_of(
+            &voice_quote("15550009:7@s.whatsapp.net"),
+            &["15550009".into()],
+        );
+        process(
+            &mut new_chat("group-7001"),
+            &ctx,
+            &Config::default(),
+            temp.path(),
+            message,
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(sends(&transport)[0].contains("↪ replying to you: \"[voice note]\""));
+        assert!(!transport
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|action| action.starts_with("quoted_attachments:")));
+    }
+    #[tokio::test]
+    async fn own_and_quoted_media_share_the_attachment_limit_including_skips() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        for id in ["many", "full"] {
+            let transport = FakeTransport::default();
+            let mut message = group_media(id);
+            message.kind = Kind::Turn;
+            message.header.reply = reply_of(&voice_quote("15550002@s.whatsapp.net"), &[]);
+            process(
+                &mut new_chat("group-7001"),
+                &ctx,
+                &Config::default(),
+                temp.path(),
+                message,
+                transport.clone(),
+            )
+            .await
+            .unwrap();
+            let sent = sends(&transport);
+            assert_eq!(sent[0].matches("Attachment metadata").count(), 10);
+            let calls: Vec<_> = transport
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|action| action.starts_with("quoted_attachments:"))
+                .cloned()
+                .collect();
+            if id == "many" {
+                assert_eq!(calls, vec!["quoted_attachments:many:1"]);
+                assert!(sent[0].contains("\"quoted\":true"));
+            } else {
+                assert!(calls.is_empty());
+                assert!(!sent[0].contains("\"quoted\":true"));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn failed_quoted_download_keeps_the_turn_and_header() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = FakeTransport::default();
+        let mut message = group_media("quote-skipped");
+        message.kind = Kind::Turn;
+        message.header.reply = reply_of(&voice_quote("15550002@s.whatsapp.net"), &[]);
+        process(
+            &mut new_chat("group-7001"),
+            &ctx,
+            &Config::default(),
+            temp.path(),
+            message,
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        let sent = sends(&transport);
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("↪ replying to +15550002: \"[voice note]\""));
+        assert!(sent[0].contains("\"quoted\":true"));
+        assert!(sent[0].contains("\"skipped\":\"download failed\""));
+        assert!(!sent[0].contains("(turn failed)"));
+    }
+    #[tokio::test]
+    async fn group_voice_note_reaches_next_tagged_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(".whatsapp-web/sessions");
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("group-7001");
+        let cfg = Config::default();
+        process(
+            &mut chat,
+            &ctx,
+            &cfg,
+            &root,
+            group_media("voice"),
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(sends(&transport).is_empty());
+        let mut tagged = group_media("tagged");
+        tagged.kind = Kind::Turn;
+        tagged.text = "@bot explain".into();
+        process(&mut chat, &ctx, &cfg, &root, tagged, transport.clone())
+            .await
+            .unwrap();
+        let sent = sends(&transport);
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("(since your last reply)"));
+        assert!(sent[0].contains(
+            "Mira: [voice note: .whatsapp-web/sessions/group-7001/1/uploads/voice-audio.ogg]"
+        ));
+        assert!(!sent[0].contains("[media]"));
+    }
+    #[tokio::test]
+    async fn skipped_group_voice_note_is_readable_in_context_and_reactions() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("group-7001");
+        let cfg = Config::default();
+        process(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            group_media("voice-skipped"),
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        let mut reaction = group_media("reaction");
+        reaction.kind = Kind::Reaction {
+            emoji: "👍".into(),
+            target: "voice-skipped".into(),
+        };
+        process(
+            &mut chat,
+            &ctx,
+            &cfg,
+            temp.path(),
+            reaction,
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        let notes = chat.notes.render("group-7001").unwrap();
+        assert!(notes.contains("Mira: [voice note: not downloaded]"));
+        assert!(notes.contains("Mira reacted 👍 to \"[voice note: not downloaded]\""));
+        assert!(sends(&transport).is_empty());
+    }
+    #[tokio::test]
+    async fn unaddressed_media_respects_group_and_phone_allowlists() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _shutdown) = context(temp.path());
+        for cfg in [
+            Config {
+                allowed_groups: vec!["7002".into()],
+                ..Default::default()
+            },
+            Config {
+                allowed_users: vec!["15550002".into()],
+                ..Default::default()
+            },
+        ] {
+            let transport = FakeTransport::default();
+            let mut chat = new_chat("group-7001");
+            process(
+                &mut chat,
+                &ctx,
+                &cfg,
+                temp.path(),
+                group_media("voice"),
+                transport.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(transport.0.lock().unwrap().is_empty());
+            assert!(chat.notes.render("group-7001").is_none());
+        }
+        assert!(!temp.path().join("group-7001").exists());
+    }
+    #[tokio::test]
+    async fn unaddressed_media_keeps_current_generation_and_idle_activity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(".whatsapp-web/sessions");
+        let chat_dir = root.join("group-7001");
+        let (ctx, _shutdown) = context(temp.path());
+        let probe = Probe::default();
+        let (ctx_with_probe, _probe_shutdown) = context_with(temp.path(), probe.clone());
+        let transport = FakeTransport::default();
+        let mut chat = new_chat("group-7001");
+        let cfg = Config {
+            sessions: Sessions {
+                idle_minutes: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        process(
+            &mut chat,
+            &ctx,
+            &cfg,
+            &root,
+            group_media("voice"),
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!chat_dir.join("last_activity").exists());
+        std::fs::create_dir_all(chat_dir.join("3")).unwrap();
+        std::fs::write(chat_dir.join("current"), "3").unwrap();
+        std::fs::write(chat_dir.join("last_activity"), "1").unwrap();
+        process(
+            &mut chat,
+            &ctx_with_probe,
+            &cfg,
+            &root,
+            group_media("voice"),
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(chat_dir.join("last_activity")).unwrap(),
+            "1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(chat_dir.join("current")).unwrap(),
+            "3"
+        );
+        assert!(!chat_dir.join("4").exists());
+        assert!(chat
+            .notes
+            .render("group-7001")
+            .unwrap()
+            .contains(".whatsapp-web/sessions/group-7001/3/uploads/voice-audio.ogg"));
+        assert!(probe.opens().is_empty());
+        assert!(sends(&transport).is_empty());
+    }
     #[tokio::test]
     async fn group_turn_uses_group_session_header_and_pending_context() {
         let temp = tempfile::tempdir().unwrap();
@@ -2508,7 +3036,12 @@ mod tests {
             i.header.group = Some("1203".into());
             i.header.name = "Thinh".into();
             i.kind = kind;
-            i.message_id = "photo".into();
+            i.message_id = if i.kind == Kind::Turn {
+                "photo"
+            } else {
+                "lunch"
+            }
+            .into();
             i
         };
         let cfg = Config {
@@ -2520,7 +3053,7 @@ mod tests {
             group(
                 Kind::Reaction {
                     emoji: "👍".into(),
-                    target: "photo".into(),
+                    target: "lunch".into(),
                 },
                 "",
             ),
