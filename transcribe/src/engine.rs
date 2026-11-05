@@ -384,8 +384,7 @@ printf '%s\n' '{"text":"Conversion réussie.","language":null}'
         let (dir, engine) = helper(
             r#"
 echo $$ > "$2.pid"
-i=0
-while [ "$i" -lt 1000000 ]; do i=$((i + 1)); done
+while :; do :; done
 printf '%s\n' '{"text":"Trop tard.","language":"fr"}'
 "#,
         );
