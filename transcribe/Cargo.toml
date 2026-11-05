@@ -1,0 +1,32 @@
+[package]
+name = "transcribe"
+version = "0.6.3"
+edition = "2021"
+
+[package.metadata.dar]
+factory = "transcribe::extension"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+dar-extension-sdk = "0.6"
+fs2 = "0.4"
+hound = "3.5"
+libc = "0.2"
+ogg = "0.9.2"
+opus = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+dar-host-api = "0.6"
+dar-tool-registry = "0.6"
+
+[workspace]
