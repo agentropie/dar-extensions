@@ -1,6 +1,6 @@
 # dar-extensions
 
-External extensions for dar agents: [irc](irc), [slack](slack), [telegram](telegram), [threadit](threadit), [whatsapp](whatsapp), [whatsapp-web](whatsapp-web). Each crate is standalone — its own `Cargo.toml` and `[workspace]` — and uses `dar-extension-sdk` as its host API.
+External extensions for dar agents: [irc](irc), [mattermost](mattermost), [slack](slack), [telegram](telegram), [threadit](threadit), [whatsapp](whatsapp), [whatsapp-web](whatsapp-web). Each crate is standalone — its own `Cargo.toml` and `[workspace]` — and uses `dar-extension-sdk` as its host API.
 
 ## Using an extension with an agent
 
@@ -32,6 +32,7 @@ Flip side: if an agent runs only `--workflow` processes (no default-workflow pro
 | extension | what it does |
 |-----------|---------------|
 | [irc](irc) | Makes an agent reachable over IRC — shared team channels holding both humans and multiple agents, and private DMs. |
+| [mattermost](mattermost) | Mattermost DMs, channels and threads, with files, tools and scheduler delivery. |
 | [slack](slack) | Slack Socket Mode extension for one self-contained agent. |
 | [telegram](telegram) | Makes an agent reachable for chat over a Telegram bot. |
 | [threadit](threadit) | Makes an agent work on Threadit board messages, with live activity and stop support. |
@@ -39,10 +40,11 @@ Flip side: if an agent runs only `--workflow` processes (no default-workflow pro
 | [whatsapp-web](whatsapp-web) | Linked-device WhatsApp text DMs with an in-process whatsapp-rust client. |
 # Scheduler delivery sinks
 
-The IRC, Slack, Telegram, and Discord extensions register runtime delivery
-sinks under `irc`, `slack`, `telegram`, and `discord`:
+The IRC, Mattermost, Slack, Telegram, and Discord extensions register runtime delivery
+sinks under `irc`, `mattermost`, `slack`, `telegram`, and `discord`:
 
 - Slack: `{ "target": "slack", "channel": "#alerts" }` (`channel` is required).
 - Telegram: `{ "target": "telegram", "user": "12345" }` (`user` maps to numeric `chat_id`).
 - IRC: `{ "target": "irc", "channel": "#ops" }` (`channel` or `user` maps to the PRIVMSG target).
 - Discord: `{ "target": "discord", "channel": "ops" }` (`channel` or `user` maps to Discord's destination).
+- Mattermost: `{ "target": "mattermost", "channel": "ops" }` or `{ "target": "mattermost", "user": "alex" }` (exactly one destination; the inbound allowlists apply).

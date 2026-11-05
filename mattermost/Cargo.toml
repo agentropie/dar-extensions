@@ -1,0 +1,31 @@
+[package]
+name = "mattermost"
+version = "0.6.3"
+edition = "2021"
+rust-version = "1.83"
+
+[package.metadata.dar]
+factory = "mattermost::extension"
+requires_stock = ["chat-pi"]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+dar-cap-chat = "0.6"
+dar-extension-sdk = "0.6"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.43", features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-util = "0.7"
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1.43", features = ["test-util"] }
+dar-host-api = "0.6"
+
+[workspace]
