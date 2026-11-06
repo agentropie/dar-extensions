@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  crates:
+    name: list crates
+    runs-on: ubuntu-latest
+    outputs:
+      crates: ${{ steps.list.outputs.crates }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: |
+          crates=$(printf '%s\n' */Cargo.toml | jq -Rsc 'split("\n")[:-1] | map(rtrimstr("/Cargo.toml"))')
+          echo "$crates"
+          echo "crates=$crates" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: test (${{ matrix.crate }})
+    needs: crates
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: ${{ fromJson(needs.crates.outputs.crates) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.crate }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.crate }}
+          key: ${{ matrix.crate }}
+      - name: Build
+        run: |
+          args=()
+          if [[ -f Cargo.lock ]]; then
+            args+=(--locked)
+          fi
+          cargo build "${args[@]}"
+      - name: Test
+        run: |
+          args=()
+          if [[ -f Cargo.lock ]]; then
+            args+=(--locked)
+          fi
+          cargo test "${args[@]}"
